@@ -7,7 +7,7 @@ echo ""
 echo "📡 检查 PostgreSQL..."
 if ! docker ps | grep -q smart-router-db; then
     echo "⚠️  PostgreSQL 未运行，正在启动..."
-    docker-compose up -d postgres
+    docker compose -p smart-router up -d postgres
     echo "⏳ 等待数据库启动（5秒）..."
     sleep 5
 else
@@ -18,7 +18,7 @@ fi
 echo "📡 检查 Redis..."
 if ! docker ps | grep -q smart-router-redis; then
     echo "⚠️  Redis 未运行，正在启动..."
-    docker-compose up -d redis
+    docker compose -p smart-router up -d redis
     echo "⏳ 等待 Redis 启动（3秒）..."
     sleep 3
 else
@@ -28,7 +28,7 @@ fi
 # 停止 Docker 中的 Gateway（如果在运行）
 echo "🛑 停止 Docker 中的 Gateway..."
 if docker ps | grep -q smart-router-gateway; then
-    docker-compose stop gateway
+    docker compose -p smart-router stop gateway
     echo "✅ Docker Gateway 已停止"
 else
     echo "✅ Docker Gateway 未运行"

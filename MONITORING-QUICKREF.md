@@ -2,10 +2,16 @@
 
 ## 🚀 快速启动
 
+监控是可选 add-on。主栈（含 Gateway 和 Checker）先用 Compose 启动：
+
 ```bash
-# 前提：Gateway 已运行（暴露 :8080/metrics）
+docker compose -p smart-router up -d --build
+
+# 确认 Gateway 已暴露 /metrics 后，再启动 Prometheus + Grafana
 ./start-monitoring.sh
 ```
+
+`start-monitoring.sh` 是 Bash 脚本。Windows 请在 Git Bash 或 WSL 中执行；也可以按脚本内容使用 Docker Desktop 手工启动两个监控容器。脚本会停止并删除同名的 Prometheus/Grafana 容器后重建，但不会触碰 Smart Router 数据卷。
 
 | 服务 | URL | 凭证 |
 |-----|-----|------|
@@ -31,9 +37,9 @@
 
 ## 🚨 告警规则（14 条）
 
-- **可用性**：Gateway 宕机、数据库连接失败
-- **成功率**：全局 < 95%、单渠道 < 80%（持续 5 分钟）
-- **延迟**：P95 > 2s、路由决策 P95 > 200ms
+- **可用性**：Gateway 或指标抓取不可达、没有健康上游
+- **成功率**：全局 < 95%、单渠道 < 90%（严重阈值 < 50%）
+- **延迟**：P95 > 5s、P99 > 10s、路由决策 P95 > 100ms
 - **熔断**：渠道进入 open 状态
 - **故障切换**：短时间切换次数激增
 
@@ -56,5 +62,7 @@ smart_router_circuit_breaker_state == 1                                  # 当�
 ## 🧪 验证脚本
 
 ```bash
-./test-metrics.sh    # 自动发测试请求并校验指标采集
+./test-metrics.sh    # Bash + curl；自动发测试请求并校验指标采集
 ```
+
+测试脚本默认使用本地开发 Key `test-caller-key`；可通过 `CALLER_API_KEY` 环境变量覆盖。

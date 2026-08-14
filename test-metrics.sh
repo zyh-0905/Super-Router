@@ -28,12 +28,12 @@ test_step() {
 
 test_pass() {
     echo -e "${GREEN}✓${NC} $1"
-    ((PASSED++))
+    PASSED=$((PASSED + 1))
 }
 
 test_fail() {
     echo -e "${RED}✗${NC} $1"
-    ((FAILED++))
+    FAILED=$((FAILED + 1))
 }
 
 # 1. 检查 Gateway 是否运行
@@ -85,11 +85,9 @@ echo ""
 # 4. 发送测试请求
 test_step "Sending test requests..."
 
-# 检查是否有 API Key
-echo "   Note: Using API key 'test-key-123'"
-echo "   If this fails, create the key first:"
-echo "   docker exec -it smart-router-db psql -U gateway -d smart_router -c \\"
-echo "   \"INSERT INTO api_keys (key_hash, user_id, role, is_active) VALUES (encode(sha256('test-key-123'), 'hex'), 'test-user', 'user', true) ON CONFLICT DO NOTHING;\""
+# 使用首次初始化时创建的本地开发 caller Key；可通过环境变量覆盖
+CALLER_API_KEY="${CALLER_API_KEY:-test-caller-key}"
+echo "   Using caller API key prefix: ${CALLER_API_KEY:0:8}"
 echo ""
 
 REQUEST_PAYLOAD='{
@@ -103,13 +101,13 @@ SUCCESS_COUNT=0
 for i in {1..5}; do
     RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API_ENDPOINT" \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer test-key-123" \
+        -H "Authorization: Bearer $CALLER_API_KEY" \
         -d "$REQUEST_PAYLOAD")
 
     HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
 
     if [ "$HTTP_CODE" -eq 200 ]; then
-        ((SUCCESS_COUNT++))
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
         echo -e "   ${GREEN}✓${NC} Request $i succeeded (HTTP $HTTP_CODE)"
     else
         echo -e "   ${YELLOW}⚠${NC} Request $i failed (HTTP $HTTP_CODE)"

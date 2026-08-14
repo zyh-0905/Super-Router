@@ -11,24 +11,17 @@
 ## ⚡ 一分钟启动
 
 ```bash
-# 1. 基础设施（PostgreSQL + Redis，首次自动迁移建表）
-docker-compose up -d
+# 完整栈：PostgreSQL + Redis + Gateway + Checker
+docker compose -p smart-router up -d --build
+docker compose -p smart-router ps
 
-# 2. 前端构建（首次）
-cd web && npm install && npm run build && cd ..
-
-# 3. 编译并启动（本地开发）
-go build -o bin/gateway ./cmd/gateway
-go build -o bin/checker ./cmd/checker
-./bin/gateway -config configs/config.local.yaml -web-dir web
-./bin/checker -config configs/config.local.yaml
-
-# 4. 打开 Web 控制台
-open http://localhost:8080/
-
-# 前端开发模式（热更新）
-cd web && npm run dev   # http://localhost:5173/
+# 查看 Gateway/Checker 日志
+docker compose -p smart-router logs -f gateway checker
 ```
+
+打开 <http://localhost:8080/>。Checker 没有宿主机端口，启动后会按配置自动执行存活、价格、推理探针和余额检测；失败的推理探针默认退避 6 小时后重试。
+
+本地源码开发（可选）：安装 Go 1.26+ 和 Node.js 24+ 后，使用 `npm ci && npm run build`、`go build`，再按 README 的本地开发命令启动。
 
 ## 📍 访问地址
 
@@ -37,7 +30,7 @@ cd web && npm run dev   # http://localhost:5173/
 | Web 控制台 | http://localhost:8080/ | Gateway 同端口托管 |
 | Gateway Health | http://localhost:8080/health | 健康检查（无认证） |
 | Metrics | http://localhost:8080/metrics | Prometheus 指标 |
-| Admin API | http://localhost:8080/admin/* | 管理接口（admin Key） |
+| Admin API | http://localhost:8080/admin/* | 管理接口（`Authorization: Bearer test-admin-key`） |
 | Prometheus | http://localhost:9090 | 监控（`./start-monitoring.sh`） |
 | Grafana | http://localhost:3000 | 仪表板 |
 
@@ -49,6 +42,8 @@ cd web && npm run dev   # http://localhost:5173/
 | 调用方 API Key | `test-caller-key` |
 | PostgreSQL | gateway / gateway_pass · db: smart_router |
 | Grafana | admin / admin |
+
+默认凭证只适用于本地开发；共享或生产环境请替换并停用默认 Key。
 
 ## 🧪 调用网关
 
@@ -102,8 +97,15 @@ go build -o bin/replay ./cmd/replay
 # 数据库直连
 docker exec -it smart-router-db psql -U gateway -d smart_router
 
-# 查看运行日志
-tail -f /tmp/sr-gateway.log   # 若用 start-gateway.sh 则为前台输出
+# Compose 日志
+docker compose -p smart-router logs -f gateway checker
+
+# 查看 Checker 最近余额结果
+docker exec smart-router-db psql -U gateway -d smart_router -c "SELECT channel_id, balance, currency, source, error, checked_at FROM balance_checks ORDER BY checked_at DESC LIMIT 20;"
+
+# 停止服务（保留数据卷）
+docker compose -p smart-router down
+# 不要随意使用 down -v，它会删除 PostgreSQL/Redis 数据卷
 ```
 
 ## 📚 文档
@@ -113,4 +115,5 @@ tail -f /tmp/sr-gateway.log   # 若用 start-gateway.sh 则为前台输出
 | `README.md` | 总览 + 快速开始 + 完整 API 表 |
 | `web/README.md` | 前端开发（页面/组件/接口对照/设计要点） |
 | `MONITORING-QUICKREF.md` | Prometheus/Grafana 速查 |
-| `docs-archive/` | 历史开发文档归档（可删除） |
+| `docs/superpowers/specs/` | 功能与文档规格记录 |
+| `docs/superpowers/plans/` | 工程计划记录 |

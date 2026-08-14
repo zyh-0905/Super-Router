@@ -7,7 +7,25 @@ import (
 	"time"
 
 	"smart-router/internal/store"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+type channelSuccessRateSample struct {
+	channelID   int
+	model       string
+	successRate float64
+}
+
+func replaceChannelSuccessRates(gauge *prometheus.GaugeVec, samples []channelSuccessRateSample) {
+	gauge.Reset()
+	for _, sample := range samples {
+		gauge.WithLabelValues(
+			fmt.Sprintf("%d", sample.channelID),
+			sample.model,
+		).Set(sample.successRate)
+	}
+}
 
 // StartCollector 启动后台指标收集器
 func StartCollector(db *store.DB, interval time.Duration) {
@@ -52,31 +70,26 @@ func updateChannelSuccessRate(ctx context.Context, db *store.DB) error {
 	}
 	defer rows.Close()
 
-	count := 0
+	samples := make([]channelSuccessRateSample, 0)
 	for rows.Next() {
-		var channelID int
-		var model string
-		var successRate float64
+		var sample channelSuccessRateSample
 
-		if err := rows.Scan(&channelID, &model, &successRate); err != nil {
-			log.Printf("[Metrics] Failed to scan row: %v", err)
-			continue
+		if err := rows.Scan(&sample.channelID, &sample.model, &sample.successRate); err != nil {
+			return fmt.Errorf("scan row: %w", err)
 		}
-
-		// 更新 Prometheus Gauge
-		ChannelSuccessRate.WithLabelValues(
-			fmt.Sprintf("%d", channelID),
-			model,
-		).Set(successRate)
-
-		count++
+		samples = append(samples, sample)
 	}
 
-	if count > 0 {
-		log.Printf("[Metrics] Updated %d channel success rate metrics", count)
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
 	}
 
-	return rows.Err()
+	replaceChannelSuccessRates(ChannelSuccessRate, samples)
+	if len(samples) > 0 {
+		log.Printf("[Metrics] Updated %d channel success rate metrics", len(samples))
+	}
+
+	return nil
 }
 
 // updateCircuitBreakerState 更新熔断状态指标

@@ -38,6 +38,6 @@ scrape_configs:
         regex: '([^:]+)(:[0-9]+)?'
         replacement: '${1}'
 
-# 规则文件（可选）
-# rule_files:
-#   - "alerts/*.yml"
+# 告警规则
+rule_files:
+  - /etc/prometheus/alerts.yml

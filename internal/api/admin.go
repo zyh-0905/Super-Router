@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"smart-router/internal/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 )
 
@@ -23,6 +25,34 @@ type AdminHandler struct {
 	db     *store.DB
 	cfg    *config.Config
 	logger *zap.Logger
+}
+
+type channelUpdateRequest struct {
+	Name             *string           `json:"name"`
+	BaseURL          *string           `json:"base_url"`
+	AccessToken      *string           `json:"access_token"`
+	APIKey           *string           `json:"api_key"`
+	Enabled          *bool             `json:"enabled"`
+	Role             *string           `json:"role"`
+	UserPriority     *int              `json:"user_priority"`
+	Weight           *int              `json:"weight"`
+	ModelMapping     map[string]string `json:"model_mapping"`
+	Capabilities     []string          `json:"capabilities"`
+	DailyProbeBudget *float64          `json:"daily_probe_budget"`
+	BalanceAPIURL    *string           `json:"balance_api_url"`
+	BalanceAPIToken  *string           `json:"balance_api_token"`
+	GroupIDs         *[]int            `json:"group_ids"`
+}
+
+type keyUpdateRequest struct {
+	Enabled  *bool  `json:"enabled"`
+	GroupIDs *[]int `json:"group_ids"`
+}
+
+var errAPIKeyNotFound = errors.New("api key not found")
+
+func apiKeyUpdateFound(rowsAffected int64) bool {
+	return rowsAffected > 0
 }
 
 func NewAdminHandler(db *store.DB, cfg *config.Config, logger *zap.Logger) *AdminHandler {
@@ -288,22 +318,7 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 	id := c.Param("id")
 
-	var req struct {
-		Name             *string           `json:"name"`
-		BaseURL          *string           `json:"base_url"`
-		AccessToken      *string           `json:"access_token"`
-		APIKey           *string           `json:"api_key"`
-		Enabled          *bool             `json:"enabled"`
-		Role             *string           `json:"role"`
-		UserPriority     *int              `json:"user_priority"`
-		Weight           *int              `json:"weight"`
-		ModelMapping     map[string]string `json:"model_mapping"`
-		Capabilities     []string          `json:"capabilities"`
-		DailyProbeBudget *float64          `json:"daily_probe_budget"`
-		BalanceAPIURL    *string           `json:"balance_api_url"`
-		BalanceAPIToken  *string           `json:"balance_api_token"`
-		GroupIDs         []int             `json:"group_ids"`
-	}
+	var req channelUpdateRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -378,7 +393,7 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 		args = append(args, *req.BalanceAPIToken)
 	}
 
-	if len(updates) == 0 && len(req.GroupIDs) == 0 {
+	if len(updates) == 0 && req.GroupIDs == nil {
 		c.JSON(400, gin.H{"error": "no fields to update"})
 		return
 	}
@@ -399,8 +414,8 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 	}
 
 	// 同步分组归属
-	if len(req.GroupIDs) > 0 {
-		if err := h.syncChannelGroups(ctx, mustAtoi(id), req.GroupIDs); err != nil {
+	if req.GroupIDs != nil {
+		if err := h.syncChannelGroups(ctx, mustAtoi(id), *req.GroupIDs); err != nil {
 			h.logger.Error("Failed to sync channel groups", zap.Error(err))
 			c.JSON(500, gin.H{"error": "failed to update channel groups"})
 			return
@@ -1735,6 +1750,14 @@ func (h *AdminHandler) syncKeyGroups(ctx context.Context, keyID int, groupIDs []
 	}
 	defer tx.Rollback(ctx)
 
+	var existingID int
+	if err := tx.QueryRow(ctx, `SELECT id FROM api_keys WHERE id = $1 FOR UPDATE`, keyID).Scan(&existingID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errAPIKeyNotFound
+		}
+		return err
+	}
+
 	if _, err := tx.Exec(ctx, `DELETE FROM api_key_groups WHERE api_key_id = $1`, keyID); err != nil {
 		return err
 	}
@@ -1803,10 +1826,7 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 // UpdateKey PATCH /admin/keys/:id - 启用/禁用 Key、更新分组绑定
 func (h *AdminHandler) UpdateKey(c *gin.Context) {
 	id := c.Param("id")
-	var req struct {
-		Enabled  *bool `json:"enabled"`
-		GroupIDs []int `json:"group_ids"`
-	}
+	var req keyUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -1820,14 +1840,18 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 			c.JSON(500, gin.H{"error": "failed to update api key"})
 			return
 		}
-		if ct.RowsAffected() == 0 {
+		if !apiKeyUpdateFound(ct.RowsAffected()) {
 			c.JSON(404, gin.H{"error": "api key not found"})
 			return
 		}
 	}
 
-	if len(req.GroupIDs) > 0 {
-		if err := h.syncKeyGroups(ctx, mustAtoi(id), req.GroupIDs); err != nil {
+	if req.GroupIDs != nil {
+		if err := h.syncKeyGroups(ctx, mustAtoi(id), *req.GroupIDs); err != nil {
+			if errors.Is(err, errAPIKeyNotFound) {
+				c.JSON(404, gin.H{"error": "api key not found"})
+				return
+			}
 			c.JSON(500, gin.H{"error": "failed to update key groups"})
 			return
 		}

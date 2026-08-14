@@ -145,14 +145,15 @@ groups:
       # 没有可用的上游渠道
       - alert: NoHealthyUpstream
         expr: |
-          sum(smart_router_channel_success_rate > 0.5) by (model) == 0
+          (max by (model) (smart_router_channel_success_rate) <= 0.5)
+          or on() (vector(1) unless on() smart_router_channel_success_rate)
         for: 1m
         labels:
           severity: critical
           component: upstream
         annotations:
-          summary: "No healthy upstream available for model {{ $labels.model }}"
-          description: "All channels for {{ $labels.model }} are degraded or down"
+          summary: "No healthy upstream available"
+          description: "No channel has a success rate above 50%"
 
       # 上游调用失败率过高
       - alert: HighUpstreamErrorRate

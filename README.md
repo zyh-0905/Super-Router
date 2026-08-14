@@ -52,36 +52,80 @@
 
 ## 快速开始
 
-### 1. 启动基础服务
+### 1. 准备环境
+
+完整 Compose 启动需要：
+
+- Docker Desktop（Windows/macOS）或 Docker Engine（Linux）
+- Docker Compose v2（`docker compose` 子命令）
+- 可访问 Docker Hub 的网络；首次构建会下载 Go、Node、PostgreSQL、Redis 镜像和依赖
+
+建议先确认环境：
 
 ```bash
-docker-compose up -d        # PostgreSQL 16 + Redis 7
+docker version
+docker compose version
 ```
 
-首次启动自动执行迁移脚本（含分组/余额表）并创建默认 API Key：
+### 2. 一键启动完整栈（推荐）
+
+```bash
+docker compose -p smart-router up -d --build
+docker compose -p smart-router ps
+```
+
+该命令会启动四个服务：PostgreSQL 16、Redis 7、Gateway 和 Checker。Gateway 对外提供 API/Web，Checker 在后台执行存活、价格、推理探针和余额检测，不占用宿主机端口。首次初始化数据库时会执行 `migrations/` 中的脚本，并创建默认 API Key：
+
 - 管理员：`test-admin-key`（全部权限）
 - 调用方：`test-caller-key`（仅调用 API）
 
-### 2. 构建并启动服务
+查看状态和日志：
+
+```bash
+docker compose -p smart-router ps
+docker compose -p smart-router logs -f gateway checker
+docker compose -p smart-router restart checker
+```
+
+访问地址：
+
+- Web 控制台：<http://localhost:8080/>
+- Gateway 健康检查：<http://localhost:8080/health>
+- Prometheus 指标：<http://localhost:8080/metrics>
+
+Checker 默认周期为存活 30 秒、价格 10 分钟、余额 10 分钟、推理探针 1 小时；失败的推理探针默认退避 6 小时后重试。推理探针会调用真实上游并可能产生费用，全局每日预算默认为 `$5`。如不希望产生探针费用，可在 `configs/config.yaml` 或分组设置中调整探针周期/预算。
+
+PostgreSQL 和 Redis 使用命名数据卷持久化。不要使用 `docker compose down -v`，除非确认要删除全部本地数据。`/docker-entrypoint-initdb.d` 只会在 PostgreSQL 数据卷首次初始化时自动执行；已有数据卷不会因为新增迁移文件而自动补跑，需要按迁移顺序手工执行未应用的 SQL。
+
+### 3. 管理 API 认证
+
+`/health` 和 `/metrics` 无需认证；所有 `/admin/*` 接口必须携带管理员 Bearer Key：
+
+```bash
+curl -H "Authorization: Bearer test-admin-key" http://localhost:8080/admin/groups
+```
+
+默认 Key 仅适用于本地开发。部署到共享或生产环境前，请在 Web 控制台创建新 Key，并停用默认 Key，同时通过环境变量或安全配置替换数据库凭据。
+
+### 4. 本地 Go/Vite 开发（可选）
+
+适用于需要调试源码的场景；日常运行优先使用上面的 Compose 栈。先启动 PostgreSQL/Redis，再在本机安装 Go 1.26+ 和 Node.js 24+：
 
 ```bash
 # 前端（首次）
-cd web && npm install && npm run build && cd ..
+cd web && npm ci && npm run build && cd ..
 
 # 编译
 go build -o bin/gateway ./cmd/gateway
 go build -o bin/checker ./cmd/checker
+go build -o bin/replay ./cmd/replay
 
-# 启动（本地开发用 config.local.yaml，连 localhost 数据库）
+# 启动（本地开发配置连接 localhost 上的数据库）
 ./bin/gateway -config configs/config.local.yaml -web-dir web
 ./bin/checker -config configs/config.local.yaml
 ```
 
-### 3. 打开 Web 控制台
-
-浏览器访问 **http://localhost:8080/**（Gateway 同端口静态托管，无跨域问题）。
-
-开发模式：`cd web && npm run dev` → http://localhost:5173/（API 自动代理到 :8080）。
+开发模式可另开终端运行 `cd web && npm run dev`，访问 <http://localhost:5173/>；Vite 会把 API 代理到 Gateway 的 8080 端口。
 
 ## 使用网关（调用方视角）
 
@@ -167,8 +211,6 @@ smart-router/
 ├── migrations/           # SQL 迁移（001 基础 / 002 分组 / 003 余额 / 004-005 余额接口扩展）
 ├── configs/              # 配置文件
 ├── web/                  # 前端（Vue 3 + Vite，构建产物 dist/ 由 Gateway 托管）
-├── web-legacy/           # 旧版单文件前端（历史备份）
-├── docs-archive/         # 历史开发文档归档（可安全删除）
 ├── prometheus.yml / prometheus-alerts.yml / grafana-dashboard.json
 ├── docker-compose.yml
 └── Dockerfile            # 三阶段构建（前端 → Go → 运行时）
@@ -189,7 +231,8 @@ smart-router/
 | `web/README.md` | 前端开发文档（页面/组件/接口对照） |
 | `QUICKREF.md` | 快速参考卡（常用命令/分组/余额速查） |
 | `MONITORING-QUICKREF.md` | Prometheus/Grafana 监控速查 |
-| `docs-archive/` | 历史阶段文档归档，可安全删除 |
+| `docs/superpowers/specs/` | 已确认的功能与文档规格记录 |
+| `docs/superpowers/plans/` | 已执行或待执行的工程计划记录 |
 
 ## License
 

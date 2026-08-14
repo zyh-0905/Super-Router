@@ -2,7 +2,7 @@
 FROM node:24-alpine AS webbuilder
 WORKDIR /web
 COPY web/package.json web/package-lock.json ./
-RUN npm ci || npm install
+RUN npm ci
 COPY web/ ./
 RUN npm run build
 
@@ -17,8 +17,8 @@ RUN apk add --no-cache git make
 # 复制 go.mod 和 go.sum
 COPY go.mod go.sum ./
 
-# 下载依赖（如果网络可用）
-RUN go mod download || true
+# 下载依赖
+RUN go mod download
 
 # 复制源代码
 COPY . .

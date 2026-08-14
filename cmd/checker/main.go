@@ -95,6 +95,37 @@ type scheduler struct {
 	epoch   int64
 }
 
+func probeDue(now time.Time, lastRun map[string]time.Time, interval, failedBackoff time.Duration) bool {
+	lastProbe := lastRun["probe"]
+	if lastProbe.IsZero() {
+		return true
+	}
+
+	wait := interval
+	if failedAt := lastRun["probe_failed"]; failedBackoff > 0 && failedAt.Equal(lastProbe) {
+		wait = failedBackoff
+	}
+	return now.Sub(lastProbe) >= wait
+}
+
+func remainingProbeBudget(current, cost float64) float64 {
+	if cost <= 0 {
+		return current
+	}
+	return current - cost
+}
+
+func probeBudgetLeft(budget, spent float64, err error) (float64, bool) {
+	if err != nil {
+		return 0, false
+	}
+	return budget - spent, true
+}
+
+func accountProbeResult(current, cost float64, err error) (float64, bool) {
+	return remainingProbeBudget(current, cost), err != nil
+}
+
 func newScheduler(db *store.DB, logger *zap.Logger, cfg *config.Config,
 	alive *checker.AliveChecker, pricing *checker.PricingChecker,
 	probe *checker.ProbeChecker, balance *checker.BalanceChecker) *scheduler {
@@ -174,10 +205,10 @@ func (s *scheduler) tick(ctx context.Context) {
 
 	// 全局探针预算检查
 	globalSpent, err := s.probe.TodaySpent(ctx)
-	if err != nil {
-		globalSpent = 0
+	globalBudgetLeft, globalBudgetAvailable := probeBudgetLeft(s.cfg.Checker.DailyProbeBudget, globalSpent, err)
+	if !globalBudgetAvailable {
+		s.logger.Error("Failed to read global probe spending; paid probes disabled for this tick", zap.Error(err))
 	}
-	globalBudgetLeft := s.cfg.Checker.DailyProbeBudget - globalSpent
 
 	for _, sch := range schedules {
 		last := s.lastRun[sch.ID]
@@ -208,19 +239,23 @@ func (s *scheduler) tick(ctx context.Context) {
 		}
 
 		// 推理探针（预算控制：全局 + 渠道/分组有效预算）
-		if globalBudgetLeft > 0 && now.Sub(last["probe"]) >= sch.ProbeInterval {
+		if globalBudgetLeft > 0 && probeDue(now, last, sch.ProbeInterval, s.cfg.Checker.ProbeFailedBackoff) {
 			upstreamSpent, err := s.probe.UpstreamTodaySpent(ctx, sch.ID)
 			if err != nil {
-				upstreamSpent = 0
-			}
-			if upstreamSpent < sch.EffectiveBudget {
-				if _, err := s.probe.ProbeChannel(ctx, sch.Upstream, s.epoch); err != nil {
+				s.logger.Error("Failed to read channel probe spending; paid probe skipped",
+					zap.String("channel", sch.Name), zap.Error(err))
+			} else if upstreamSpent < sch.EffectiveBudget {
+				cost, err := s.probe.ProbeChannel(ctx, sch.Upstream, s.epoch)
+				var failed bool
+				globalBudgetLeft, failed = accountProbeResult(globalBudgetLeft, cost, err)
+				if failed {
+					last["probe_failed"] = now
 					s.logger.Debug("Probe failed", zap.String("channel", sch.Name), zap.Error(err))
 				} else {
-					globalBudgetLeft -= 0.01 // 粗略记账，精确值由下次 tick 的数据库查询更新
+					delete(last, "probe_failed")
 				}
+				last["probe"] = now
 			}
-			last["probe"] = now
 		}
 
 		// 余额检测（轻量 GET，不花钱）

@@ -1,0 +1,46 @@
+rule_files:
+  - prometheus-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: no success-rate series means no healthy upstream
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: NoHealthyUpstream
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: upstream
+            exp_annotations:
+              summary: "No healthy upstream available"
+              description: "No channel has a success rate above 50%"
+
+  - name: all reported upstreams are unhealthy
+    input_series:
+      - series: 'smart_router_channel_success_rate{channel="1",model="gpt-test"}'
+        values: '0.4 0.4'
+      - series: 'smart_router_channel_success_rate{channel="2",model="gpt-test"}'
+        values: '0.5 0.5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: NoHealthyUpstream
+        exp_alerts:
+          - exp_labels:
+              model: gpt-test
+              severity: critical
+              component: upstream
+            exp_annotations:
+              summary: "No healthy upstream available"
+              description: "No channel has a success rate above 50%"
+
+  - name: one healthy upstream suppresses the alert
+    input_series:
+      - series: 'smart_router_channel_success_rate{channel="1",model="gpt-test"}'
+        values: '0.4 0.4'
+      - series: 'smart_router_channel_success_rate{channel="2",model="gpt-test"}'
+        values: '0.9 0.9'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: NoHealthyUpstream
+        exp_alerts: []
