@@ -1,0 +1,146 @@
+/* ============================================================
+   Smart Router · 苹果风设计系统 — 设计令牌
+   明暗主题：跟随系统 (prefers-color-scheme)，可用 [data-theme] 强制覆盖
+   ============================================================ */
+
+:root {
+  /* 字体 */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+    "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* 圆角 */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --radius-full: 9999px;
+
+  /* 动效 */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur: 0.28s;
+
+  /* 层级 */
+  --z-sidebar: 100;
+  --z-banner: 200;
+  --z-overlay: 900;
+  --z-modal: 1000;
+  --z-toast: 1100;
+}
+
+/* ---------- 浅色（默认，Apple 标志性的通透灰） ---------- */
+:root,
+:root[data-theme="light"] {
+  --bg: #f5f5f7;                 /* Apple 官网灰 */
+  --bg-gradient-top: rgba(245, 245, 247, 0.92);
+  --surface: rgba(255, 255, 255, 0.78);   /* 毛玻璃卡片 */
+  --surface-solid: #ffffff;
+  --surface-raised: rgba(255, 255, 255, 0.92);
+  --surface-hover: rgba(255, 255, 255, 0.95);
+
+  --text-1: #1d1d1f;             /* 主文字 */
+  --text-2: #49494f;             /* 次级 */
+  --text-3: #86868b;             /* 三级 */
+
+  --border: rgba(0, 0, 0, 0.09);
+  --border-strong: rgba(0, 0, 0, 0.15);
+
+  --blue: #0071e3;
+  --blue-hover: #0077ed;
+  --blue-soft: rgba(0, 113, 227, 0.10);
+  --green: #248a3d;
+  --green-soft: rgba(36, 138, 61, 0.12);
+  --orange: #c93400;
+  --orange-soft: rgba(201, 52, 0, 0.10);
+  --red: #d70015;
+  --red-soft: rgba(215, 0, 21, 0.09);
+  --purple: #8944ab;
+  --purple-soft: rgba(137, 68, 171, 0.12);
+  --teal: #008299;
+  --teal-soft: rgba(0, 130, 153, 0.10);
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 20px rgba(0, 0, 0, 0.05);
+  --shadow-raised: 0 2px 6px rgba(0, 0, 0, 0.06), 0 16px 40px rgba(0, 0, 0, 0.10);
+  --shadow-modal: 0 4px 12px rgba(0, 0, 0, 0.10), 0 24px 64px rgba(0, 0, 0, 0.18);
+
+  --scroll-thumb: rgba(0, 0, 0, 0.16);
+  --skeleton: linear-gradient(100deg, rgba(0,0,0,0.05) 40%, rgba(0,0,0,0.10) 50%, rgba(0,0,0,0.05) 60%);
+}
+
+/* ---------- 深色 ---------- */
+:root[data-theme="dark"] {
+  --bg: #161617;
+  --bg-gradient-top: rgba(22, 22, 23, 0.92);
+  --surface: rgba(38, 38, 40, 0.72);
+  --surface-solid: #1e1e20;
+  --surface-raised: rgba(44, 44, 46, 0.92);
+  --surface-hover: rgba(48, 48, 50, 0.95);
+
+  --text-1: #f5f5f7;
+  --text-2: #c7c7cc;
+  --text-3: #8e8e93;
+
+  --border: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.18);
+
+  --blue: #0a84ff;
+  --blue-hover: #409cff;
+  --blue-soft: rgba(10, 132, 255, 0.16);
+  --green: #30d158;
+  --green-soft: rgba(48, 209, 88, 0.14);
+  --orange: #ff9f0a;
+  --orange-soft: rgba(255, 159, 10, 0.14);
+  --red: #ff453a;
+  --red-soft: rgba(255, 69, 58, 0.14);
+  --purple: #bf5af2;
+  --purple-soft: rgba(191, 90, 242, 0.14);
+  --teal: #64d2ff;
+  --teal-soft: rgba(100, 210, 255, 0.14);
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.25);
+  --shadow-raised: 0 2px 8px rgba(0, 0, 0, 0.3), 0 18px 48px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 4px 16px rgba(0, 0, 0, 0.4), 0 28px 80px rgba(0, 0, 0, 0.55);
+
+  --scroll-thumb: rgba(255, 255, 255, 0.2);
+  --skeleton: linear-gradient(100deg, rgba(255,255,255,0.06) 40%, rgba(255,255,255,0.12) 50%, rgba(255,255,255,0.06) 60%);
+}
+
+/* 跟随系统（无显式偏好时） */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161617;
+    --bg-gradient-top: rgba(22, 22, 23, 0.92);
+    --surface: rgba(38, 38, 40, 0.72);
+    --surface-solid: #1e1e20;
+    --surface-raised: rgba(44, 44, 46, 0.92);
+    --surface-hover: rgba(48, 48, 50, 0.95);
+
+    --text-1: #f5f5f7;
+    --text-2: #c7c7cc;
+    --text-3: #8e8e93;
+
+    --border: rgba(255, 255, 255, 0.10);
+    --border-strong: rgba(255, 255, 255, 0.18);
+
+    --blue: #0a84ff;
+    --blue-hover: #409cff;
+    --blue-soft: rgba(10, 132, 255, 0.16);
+    --green: #30d158;
+    --green-soft: rgba(48, 209, 88, 0.14);
+    --orange: #ff9f0a;
+    --orange-soft: rgba(255, 159, 10, 0.14);
+    --red: #ff453a;
+    --red-soft: rgba(255, 69, 58, 0.14);
+    --purple: #bf5af2;
+    --purple-soft: rgba(191, 90, 242, 0.14);
+    --teal: #64d2ff;
+    --teal-soft: rgba(100, 210, 255, 0.14);
+
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.25);
+    --shadow-raised: 0 2px 8px rgba(0, 0, 0, 0.3), 0 18px 48px rgba(0, 0, 0, 0.4);
+    --shadow-modal: 0 4px 16px rgba(0, 0, 0, 0.4), 0 28px 80px rgba(0, 0, 0, 0.55);
+
+    --scroll-thumb: rgba(255, 255, 255, 0.2);
+    --skeleton: linear-gradient(100deg, rgba(255,255,255,0.06) 40%, rgba(255,255,255,0.12) 50%, rgba(255,255,255,0.06) 60%);
+  }
+}

@@ -1,0 +1,58 @@
+server:
+  port: 8080
+  read_timeout: 30s
+  write_timeout: 30s
+
+database:
+  postgres:
+    host: localhost  # 本地开发使用 localhost
+    port: 5432
+    user: gateway
+    password: gateway_pass
+    dbname: smart_router
+  redis:
+    host: localhost  # 本地开发使用 localhost
+    port: 6379
+    password: ""
+    db: 0
+
+checker:
+  alive_interval: 30s
+  pricing_interval: 10m
+  probe_interval: 1h
+  balance_interval: 10m
+  daily_probe_budget: 5.00
+  probe_failed_backoff: 6h
+
+routing:
+  default_strategy: custom_priority
+  max_attempts: 3
+  total_budget_ms: 15000
+  retry_before_first_byte_only: true
+  allow_emergency_pool: false
+  tie_breaker: stable
+
+  filter:
+    max_price_cap: 100.0
+    max_ttft_ms: 5000
+
+  circuit_breaker:
+    min_samples: 20
+    open_failure_rate: 0.50
+    open_min_failures: 5
+    auth_failure_threshold: 3
+    initial_cooling_seconds: 30
+    max_cooling_seconds: 600
+    cooling_backoff: [30, 60, 120, 300, 600]
+    half_open_probe_count: 1
+    recovery_success_threshold: 3
+
+  balanced_weights:
+    cost: 0.35
+    reliability: 0.30
+    latency: 0.25
+    load: 0.10
+
+logging:
+  level: info
+  format: json

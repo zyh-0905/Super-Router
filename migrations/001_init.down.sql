@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS decision_logs;
+DROP TABLE IF EXISTS routing_policies;
+DROP TABLE IF EXISTS request_history;
+DROP TABLE IF EXISTS circuit_states;
+DROP TABLE IF EXISTS probe_results;
+DROP TABLE IF EXISTS declared_prices;
+DROP TABLE IF EXISTS health_checks;
+DROP TABLE IF EXISTS api_keys;
+DROP TABLE IF EXISTS upstreams;
+DROP TABLE IF EXISTS epoch_counter;

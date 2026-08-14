@@ -1,0 +1,194 @@
+# Smart Router Prometheus 告警规则
+groups:
+  - name: smart_router_alerts
+    interval: 30s
+    rules:
+      # 成功率低于 95%
+      - alert: LowSuccessRate
+        expr: |
+          (
+            sum(rate(smart_router_requests_total{status="success"}[5m]))
+            /
+            sum(rate(smart_router_requests_total[5m]))
+          ) < 0.95
+        for: 2m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "Smart Router success rate below 95%"
+          description: "Success rate is {{ $value | humanizePercentage }} (threshold: 95%)"
+          runbook: "Check /admin/circuit endpoint for circuit breaker status"
+
+      # P95 延迟超过 5 秒
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(smart_router_request_duration_seconds_bucket[5m])) by (le)
+          ) > 5
+        for: 3m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "High P95 latency detected"
+          description: "P95 latency is {{ $value | humanizeDuration }}"
+          runbook: "Check upstream channel health and network connectivity"
+
+      # P99 延迟超过 10 秒
+      - alert: CriticalLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(smart_router_request_duration_seconds_bucket[5m])) by (le)
+          ) > 10
+        for: 2m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "Critical P99 latency detected"
+          description: "P99 latency is {{ $value | humanizeDuration }}"
+
+      # 熔断器打开
+      - alert: CircuitBreakerOpen
+        expr: smart_router_circuit_breaker_state == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: upstream
+        annotations:
+          summary: "Circuit breaker opened for channel {{ $labels.channel }}"
+          description: "Model: {{ $labels.model }}, Channel: {{ $labels.channel }}"
+          runbook: "Check channel health status and recent error logs"
+
+      # 渠道成功率低于 90%
+      - alert: ChannelDegraded
+        expr: smart_router_channel_success_rate < 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: upstream
+        annotations:
+          summary: "Channel {{ $labels.channel }} success rate below 90%"
+          description: "Channel {{ $labels.channel }} (Model: {{ $labels.model }}) success rate: {{ $value | humanizePercentage }}"
+          runbook: "Check channel configuration and upstream API status"
+
+      # 渠道完全不可用（成功率 < 50%）
+      - alert: ChannelDown
+        expr: smart_router_channel_success_rate < 0.5
+        for: 2m
+        labels:
+          severity: critical
+          component: upstream
+        annotations:
+          summary: "Channel {{ $labels.channel }} appears to be down"
+          description: "Success rate: {{ $value | humanizePercentage }}"
+
+      # 路由决策耗时过长（P95 > 100ms）
+      - alert: SlowRoutingDecision
+        expr: |
+          histogram_quantile(0.95,
+            rate(smart_router_routing_duration_seconds_bucket[5m])
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: router
+        annotations:
+          summary: "Routing decision taking too long"
+          description: "P95 routing duration: {{ $value | humanizeDuration }}"
+          runbook: "Check database/Redis latency and snapshot size"
+
+      # 快照加载耗时过长（P95 > 50ms）
+      - alert: SlowSnapshotLoad
+        expr: |
+          histogram_quantile(0.95,
+            rate(smart_router_snapshot_load_duration_seconds_bucket[5m])
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: router
+        annotations:
+          summary: "Snapshot loading taking too long"
+          description: "P95 snapshot load duration: {{ $value | humanizeDuration }}"
+          runbook: "Check Redis connection and cache hit rate"
+
+      # 频繁故障切换
+      - alert: FrequentFailover
+        expr: rate(smart_router_failover_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          component: proxy
+        annotations:
+          summary: "Frequent failover detected"
+          description: "Failover rate: {{ $value | humanize }} per second. From: {{ $labels.from_channel }}, To: {{ $labels.to_channel }}"
+          runbook: "Check primary channel health and consider adjusting retry policy"
+
+      # QPS 异常下降（与 1 小时前相比下降 50%）
+      - alert: TrafficDrop
+        expr: |
+          (
+            sum(rate(smart_router_requests_total[1m]))
+            /
+            sum(rate(smart_router_requests_total[1m] offset 1h))
+          ) < 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: gateway
+        annotations:
+          summary: "Significant traffic drop detected"
+          description: "Current QPS is {{ $value | humanizePercentage }} of 1 hour ago"
+
+      # 没有可用的上游渠道
+      - alert: NoHealthyUpstream
+        expr: |
+          sum(smart_router_channel_success_rate > 0.5) by (model) == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: upstream
+        annotations:
+          summary: "No healthy upstream available for model {{ $labels.model }}"
+          description: "All channels for {{ $labels.model }} are degraded or down"
+
+      # 上游调用失败率过高
+      - alert: HighUpstreamErrorRate
+        expr: |
+          (
+            sum(rate(smart_router_proxy_requests_total{status="error"}[5m]))
+            /
+            sum(rate(smart_router_proxy_requests_total[5m]))
+          ) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          component: proxy
+        annotations:
+          summary: "High upstream error rate"
+          description: "Upstream error rate: {{ $value | humanizePercentage }}"
+
+      # Gateway 实例不可达
+      - alert: GatewayDown
+        expr: up{job="smart-router-gateway"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: gateway
+        annotations:
+          summary: "Smart Router Gateway instance is down"
+          description: "Instance {{ $labels.instance }} is not responding to Prometheus scrapes"
+          runbook: "Check Gateway process status and system resources"
+
+      # Metrics 抓取失败
+      - alert: MetricsScrapeFailure
+        expr: up{job="smart-router-gateway"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: monitoring
+        annotations:
+          summary: "Cannot scrape metrics from Gateway"
+          description: "Prometheus cannot reach {{ $labels.instance }}"

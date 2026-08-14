@@ -1,0 +1,69 @@
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: smart-router-db
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway_pass
+      POSTGRES_DB: smart_router
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - router_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: smart-router-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - router_net
+
+  gateway:
+    build: .
+    container_name: smart-router-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_USER=gateway
+      - DATABASE_PASSWORD=gateway_pass
+      - DATABASE_NAME=smart_router
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./configs:/app/configs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - router_net
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  router_net:
+    driver: bridge
