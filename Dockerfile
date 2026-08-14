@@ -25,6 +25,7 @@ COPY . .
 
 # 编译
 RUN CGO_ENABLED=0 GOOS=linux go build -o gateway ./cmd/gateway
+RUN CGO_ENABLED=0 GOOS=linux go build -o checker ./cmd/checker
 
 # ===== 阶段 3：运行时 =====
 FROM alpine:latest
@@ -36,6 +37,7 @@ RUN apk --no-cache add ca-certificates tzdata
 
 # 复制编译好的二进制文件
 COPY --from=builder /build/gateway .
+COPY --from=builder /build/checker .
 
 # 复制配置文件
 COPY configs ./configs

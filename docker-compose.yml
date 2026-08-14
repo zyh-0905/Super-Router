@@ -60,6 +60,29 @@ services:
       - router_net
     restart: unless-stopped
 
+  checker:
+    build: .
+    container_name: smart-router-checker
+    command: ["./checker"]
+    environment:
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_USER=gateway
+      - DATABASE_PASSWORD=gateway_pass
+      - DATABASE_NAME=smart_router
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./configs:/app/configs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - router_net
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
