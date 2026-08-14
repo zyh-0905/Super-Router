@@ -79,7 +79,7 @@ func (r *Report) PrintMarkdown() string {
 
 // PrintTable 在控制台打印表格
 func (r *Report) PrintTable() {
-	fmt.Println("\n=== 决策重放报告 ===\n")
+	fmt.Print("\n=== 决策重放报告 ===\n\n")
 	fmt.Printf("总请求数: %d\n", r.TotalRequests)
 	fmt.Printf("成功重放: %d\n", r.SuccessfulReplays)
 	fmt.Printf("失败重放: %d\n", r.FailedReplays)
