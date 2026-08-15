@@ -33,6 +33,7 @@ type ChannelHealth struct {
 	BaseURL      string            `json:"base_url"`
 	Role         string            `json:"role"`
 	Protocol     string            `json:"protocol"` // openai（默认）| anthropic
+	RelayType    string            `json:"relay_type"` // newapi | sub2api | custom
 	Enabled      bool              `json:"enabled"`
 	UserPriority int               `json:"user_priority"`
 	ModelMapping map[string]string `json:"model_mapping"`
@@ -174,7 +175,7 @@ func buildSnapshot(ctx context.Context, db *store.DB) (*HealthSnapshot, error) {
 // loadChannels 读取所有渠道配置及其分组归属
 func loadChannels(ctx context.Context, db *store.DB) ([]*ChannelHealth, error) {
 	rows, err := db.Pool.Query(ctx, `
-		SELECT id, name, base_url, enabled, role, protocol, user_priority,
+		SELECT id, name, base_url, enabled, role, protocol, relay_type, user_priority,
 		       model_mapping, capabilities, weight
 		FROM upstreams
 	`)
@@ -198,7 +199,7 @@ func loadChannels(ctx context.Context, db *store.DB) ([]*ChannelHealth, error) {
 
 		var modelMappingJSON, capabilitiesJSON []byte
 		if err := rows.Scan(
-			&ch.ID, &ch.Name, &ch.BaseURL, &ch.Enabled, &ch.Role, &ch.Protocol, &ch.UserPriority,
+			&ch.ID, &ch.Name, &ch.BaseURL, &ch.Enabled, &ch.Role, &ch.Protocol, &ch.RelayType, &ch.UserPriority,
 			&modelMappingJSON, &capabilitiesJSON, &ch.Weight,
 		); err != nil {
 			return nil, err

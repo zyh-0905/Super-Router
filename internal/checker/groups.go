@@ -85,7 +85,7 @@ func LoadSchedules(ctx context.Context, db *store.DB,
 
 	// 3. 加载启用渠道
 	rows, err = db.Pool.Query(ctx, `
-		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol,
+		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol, relay_type,
 		       daily_probe_budget, balance_api_url, balance_api_token, timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms
 		FROM upstreams
 		WHERE enabled = true
@@ -99,7 +99,7 @@ func LoadSchedules(ctx context.Context, db *store.DB,
 	for rows.Next() {
 		var u Upstream
 		if err := rows.Scan(
-			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol,
+			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol, &u.RelayType,
 			&u.DailyProbeBudget, &u.BalanceAPIURL, &u.BalanceAPIToken, &u.TimeoutConnectMS, &u.TimeoutFirstByteMS, &u.TimeoutTotalMS,
 		); err != nil {
 			continue

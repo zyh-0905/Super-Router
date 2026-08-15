@@ -120,6 +120,7 @@ function emptyForm() {
   return {
     name: '', base_url: '', access_token: '', api_key: '',
     protocol: 'openai',
+    relay_type: 'custom',
     role: 'primary', user_priority: 100, weight: 1,
     daily_probe_budget: 1.0,
     balance_api_url: '',
@@ -128,6 +129,18 @@ function emptyForm() {
     capabilities: ['tools'],
     group_ids: [],
   }
+}
+
+// 中转站类型 → 默认余额接口路径
+const relayTypeDefaults = {
+  newapi: '/api/user/self',
+  sub2api: '/api/v1/auth/me',
+  custom: '',
+}
+// 用户在表单里手动切换中转站类型时，自动填入对应余额接口地址（可手动再改）
+function onRelayTypeChange() {
+  const ep = relayTypeDefaults[form.value.relay_type]
+  if (ep) form.value.balance_api_url = ep
 }
 
 const filtered = computed(() =>
@@ -159,6 +172,11 @@ function circuitBadge(state) {
 
 function roleBadge(role) {
   return { primary: 'badge-blue', backup: 'badge-purple', emergency: 'badge-red' }[role] || 'badge-gray'
+}
+
+function relayTypeBadge(t) {
+  if (!t || t === 'custom') return null
+  return { newapi: 'badge-teal', sub2api: 'badge-blue' }[t] || 'badge-gray'
 }
 
 async function load() {
@@ -466,6 +484,7 @@ function openEdit(ch) {
   form.value = {
     name: ch.name, base_url: ch.base_url, access_token: '', api_key: '',
     protocol: ch.protocol || 'openai',
+    relay_type: ch.relay_type || 'custom',
     role: ch.role, user_priority: ch.user_priority, weight: ch.weight || 1,
     daily_probe_budget: ch.daily_probe_budget || 0,
     balance_api_url: ch.balance_api_url || '',
@@ -504,6 +523,7 @@ async function save() {
     const payload = {
       name: form.value.name, base_url: form.value.base_url,
       protocol: form.value.protocol || 'openai',
+      relay_type: form.value.relay_type || 'custom',
       role: form.value.role, user_priority: form.value.user_priority, weight: form.value.weight,
       daily_probe_budget: form.value.daily_probe_budget, model_mapping: mm, capabilities: form.value.capabilities,
       balance_api_url: form.value.balance_api_url || '',
@@ -678,6 +698,7 @@ onMounted(() => { load(); loadGroups() })
             <span :class="dotClass(ch)" />
             <span class="grow truncate" style="font-size:14px;font-weight:600">{{ ch.name }}</span>
             <span v-if="ch.protocol === 'anthropic'" class="badge badge-purple" title="Claude 原生协议，网关自动转换">anthropic</span>
+            <span v-if="relayTypeBadge(ch.relay_type)" class="badge" :class="relayTypeBadge(ch.relay_type)">{{ ch.relay_type }}</span>
             <span class="badge" :class="roleBadge(ch.role)">{{ ch.role }}</span>
           </div>
           <div class="row gap-2 mt-1">
@@ -709,6 +730,7 @@ onMounted(() => { load(); loadGroups() })
               <span :class="dotClass(selected)" />
               <span style="font-size:17px;font-weight:700">{{ selected.name }}</span>
               <span v-if="selected.protocol === 'anthropic'" class="badge badge-purple">anthropic</span>
+              <span v-if="relayTypeBadge(selected.relay_type)" class="badge" :class="relayTypeBadge(selected.relay_type)">{{ selected.relay_type }}</span>
               <span class="badge" :class="roleBadge(selected.role)">{{ selected.role }}</span>
             </div>
             <div class="row gap-2">
@@ -731,8 +753,10 @@ onMounted(() => { load(); loadGroups() })
             <div v-if="detailTab === 'info'">
               <div class="field"><label class="field-label">Base URL</label><div class="code">{{ selected.base_url }}</div></div>
               <div class="form-grid-2">
+                <div class="field"><label class="field-label">中转站类型</label><div class="code">{{ selected.relay_type === 'newapi' ? 'New API（new-api/one-api 系）' : selected.relay_type === 'sub2api' ? 'Sub2API' : '自定义' }}</div></div>
                 <div class="field"><label class="field-label">接口协议</label><div class="code">{{ selected.protocol === 'anthropic' ? 'anthropic · Claude 原生' : 'openai · OpenAI 兼容' }}</div></div>
                 <div class="field"><label class="field-label">聊天端点</label><div class="code">{{ (selected.base_url || '').replace(/\/+$/, '') + (selected.protocol === 'anthropic' ? '/v1/messages' : '/v1/chat/completions') }}</div></div>
+                <div class="field"><label class="field-label">余额接口</label><div class="code">{{ selected.balance_api_url || '按类型默认' }}</div></div>
                 <div class="field"><label class="field-label">用户优先级</label><div class="code">{{ selected.user_priority }}</div></div>
                 <div class="field"><label class="field-label">权重</label><div class="code">{{ selected.weight || 1 }}</div></div>
                 <div class="field"><label class="field-label">每日探针预算</label><div class="code">${{ selected.daily_probe_budget || 0 }}</div></div>
@@ -1033,16 +1057,25 @@ onMounted(() => { load(); loadGroups() })
       <div class="field"><label class="field-label">Base URL *</label><input v-model="form.base_url" class="input mono" placeholder="https://api.example-relay.com"></div>
       <div class="form-grid-2">
         <div class="field">
+          <label class="field-label">中转站类型</label>
+          <select v-model="form.relay_type" class="select" @change="onRelayTypeChange">
+            <option value="custom">custom · 自定义</option>
+            <option value="newapi">newapi · New API / One API 系</option>
+            <option value="sub2api">sub2api · Sub2API</option>
+          </select>
+          <div class="field-hint">选择类型后自动填入对应的余额接口地址（可手动修改）。</div>
+        </div>
+        <div class="field">
           <label class="field-label">接口协议</label>
           <select v-model="form.protocol" class="select">
             <option value="openai">openai · OpenAI 兼容</option>
             <option value="anthropic">anthropic · Claude 原生</option>
           </select>
         </div>
-        <div class="field">
-          <label class="field-label">聊天端点（自动推导）</label>
-          <div class="code" style="margin-top:6px">{{ form.base_url ? form.base_url.replace(/\/+$/, '') + (form.protocol === 'anthropic' ? '/v1/messages' : '/v1/chat/completions') : '—' }}</div>
-        </div>
+      </div>
+      <div class="field">
+        <label class="field-label">聊天端点（自动推导）</label>
+        <div class="code">{{ form.base_url ? form.base_url.replace(/\/+$/, '') + (form.protocol === 'anthropic' ? '/v1/messages' : '/v1/chat/completions') : '—' }}</div>
       </div>
       <div class="field-hint" style="margin-top:-8px;margin-bottom:8px">anthropic 协议站点使用 x-api-key 认证，网关会自动完成 OpenAI↔Anthropic 请求/响应/流式转换；余额探测与健康检查不受影响。</div>
       <div class="form-grid-2">
@@ -1061,9 +1094,9 @@ onMounted(() => { load(); loadGroups() })
         <div class="field"><label class="field-label">每日探针预算（$）</label><input v-model.number="form.daily_probe_budget" type="number" step="0.1" min="0" class="input"></div>
       </div>
       <div class="field">
-        <label class="field-label">余额接口地址（可选）</label>
-        <input v-model="form.balance_api_url" class="input mono" placeholder="留空自动探测；可填完整 URL 或路径，如 https://admin.xxx.com/api/user/self 或 /api/user/self">
-        <div class="field-hint">部分中转站的管理 API 不在标准路径，可在网页控制台 F12 → Network 抓包找到余额请求的地址后填在这里。</div>
+        <label class="field-label">余额接口地址</label>
+        <input v-model="form.balance_api_url" class="input mono" placeholder="按中转站类型自动填入；也可手动填写完整 URL 或路径">
+        <div class="field-hint">选择「中转站类型」后自动填入默认地址：New API → /api/user/self，Sub2API → /api/v1/auth/me。特殊部署可在网页控制台 F12 → Network 抓包后手动修改。</div>
       </div>
       <div class="field">
         <label class="field-label">余额接口令牌（可选）</label>

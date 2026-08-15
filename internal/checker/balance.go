@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"smart-router/internal/protocol"
 	"smart-router/internal/store"
 
 	"go.uber.org/zap"
@@ -68,29 +69,40 @@ func (b *BalanceChecker) FetchBalance(ctx context.Context, upstream Upstream) (*
 	return b.fetch(ctx, upstream)
 }
 
-// fetch 多协议探测：站点自定义接口 → one-api/new-api → OpenAI 官方
+// fetch 多协议探测：站点自定义接口 → 类型默认接口 → one-api/new-api → OpenAI 官方
 func (b *BalanceChecker) fetch(ctx context.Context, upstream Upstream) (*BalanceResult, error) {
 	var attempts []string
 
-	// 0. 站点自定义余额接口（完整 URL 或相对 base_url 的路径）
+	// 站点余额凭证：独立令牌 > API Key > Access Token
+	cred := upstream.BalanceAPIToken
+	if cred == "" {
+		cred = upstream.APIKey
+	}
+	if cred == "" {
+		cred = upstream.AccessToken
+	}
+
+	// 0a. 站点自定义余额接口（完整 URL 或相对 base_url 的路径）
 	if upstream.BalanceAPIURL != "" {
 		url := upstream.BalanceAPIURL
 		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 			url = strings.TrimRight(upstream.BaseURL, "/") + "/" + strings.TrimLeft(url, "/")
-		}
-		// 认证：余额接口独立令牌 > API Key > Access Token
-		cred := upstream.BalanceAPIToken
-		if cred == "" {
-			cred = upstream.APIKey
-		}
-		if cred == "" {
-			cred = upstream.AccessToken
 		}
 		bal, src, err := b.fetchGeneric(ctx, url, cred)
 		if err == nil {
 			return &BalanceResult{Balance: bal, Currency: "USD", Source: src}, nil
 		}
 		attempts = append(attempts, fmt.Sprintf("自定义接口: %v", err))
+	}
+
+	// 0b. 中转站类型默认余额接口（newapi → /api/user/self，sub2api → /api/v1/auth/me）
+	if ep := protocol.DefaultBalanceEndpoint(upstream.RelayType); ep != "" {
+		url := strings.TrimRight(upstream.BaseURL, "/") + "/" + strings.TrimLeft(ep, "/")
+		bal, src, err := b.fetchGeneric(ctx, url, cred)
+		if err == nil {
+			return &BalanceResult{Balance: bal, Currency: "USD", Source: src}, nil
+		}
+		attempts = append(attempts, fmt.Sprintf("%s默认接口: %v", protocol.RelayTypeLabel(upstream.RelayType), err))
 	}
 
 	// 1. one-api / new-api：GET /api/user/self（Access Token）

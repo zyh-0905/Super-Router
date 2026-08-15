@@ -232,7 +232,7 @@ func (p *ProbeChecker) Run(ctx context.Context, globalDailyBudget float64) error
 
 func (p *ProbeChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	rows, err := p.db.Pool.Query(ctx, `
-		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol,
+		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol, relay_type,
 		       daily_probe_budget, balance_api_url, balance_api_token, timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms
 		FROM upstreams
 		WHERE enabled = true
@@ -246,7 +246,7 @@ func (p *ProbeChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	for rows.Next() {
 		var u Upstream
 		if err := rows.Scan(
-			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol,
+			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol, &u.RelayType,
 			&u.DailyProbeBudget, &u.BalanceAPIURL, &u.BalanceAPIToken, &u.TimeoutConnectMS, &u.TimeoutFirstByteMS, &u.TimeoutTotalMS,
 		); err != nil {
 			return nil, err

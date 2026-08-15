@@ -81,13 +81,13 @@ func (h *RatioHandler) loadUpstream(ctx context.Context, channelID int) (*checke
 	var u checker.Upstream
 	var mmJSON []byte
 	err := h.db.Pool.QueryRow(ctx, `
-		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol,
+		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol, relay_type,
 		       daily_probe_budget, balance_api_url, balance_api_token,
 		       timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms,
 		       COALESCE(model_mapping::text, '{}')
 		FROM upstreams WHERE id = $1
 	`, channelID).Scan(
-		&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol,
+		&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol, &u.RelayType,
 		&u.DailyProbeBudget, &u.BalanceAPIURL, &u.BalanceAPIToken,
 		&u.TimeoutConnectMS, &u.TimeoutFirstByteMS, &u.TimeoutTotalMS,
 		&mmJSON,

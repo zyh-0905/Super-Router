@@ -23,6 +23,7 @@ type Upstream struct {
 	Enabled            bool
 	Role               string
 	Protocol           string // openai（默认）| anthropic
+	RelayType          string // newapi | sub2api | custom（决定默认余额接口）
 	DailyProbeBudget   float64
 	BalanceAPIURL      string
 	BalanceAPIToken    string
@@ -84,7 +85,7 @@ func (a *AliveChecker) Run(ctx context.Context) error {
 
 func (a *AliveChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	rows, err := a.db.Pool.Query(ctx, `
-		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol,
+		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol, relay_type,
 		       daily_probe_budget, balance_api_url, balance_api_token, timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms
 		FROM upstreams
 		WHERE enabled = true
@@ -98,7 +99,7 @@ func (a *AliveChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	for rows.Next() {
 		var u Upstream
 		if err := rows.Scan(
-			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol,
+			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol, &u.RelayType,
 			&u.DailyProbeBudget, &u.BalanceAPIURL, &u.BalanceAPIToken, &u.TimeoutConnectMS, &u.TimeoutFirstByteMS, &u.TimeoutTotalMS,
 		); err != nil {
 			return nil, err
