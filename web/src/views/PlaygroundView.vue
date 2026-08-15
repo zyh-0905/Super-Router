@@ -20,7 +20,6 @@ const req = ref({
 
 const groups = ref([])
 const channels = ref([])
-const selChannelId = ref(null)
 
 async function loadGroups() {
   try { groups.value = (await api.listGroups()).groups || [] } catch { /* 忽略 */ }
@@ -33,18 +32,27 @@ onMounted(() => { loadGroups(); loadChannels() })
 
 const knownModels = ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku']
 
-// 选中站点后：预填该站点的默认测试模型，模型输入的下拉提示切换为该站点已映射模型
-const modelSuggestions = computed(() => {
-  const ch = channels.value.find(c => c.id === selChannelId.value)
-  return ch ? Object.keys(ch.model_mapping || {}) : knownModels
+// 各站点专属默认测试模型：模型名 → [站点名…]（在模型下拉提示中标注）
+const defaultByModel = computed(() => {
+  const m = {}
+  for (const ch of channels.value) {
+    if (ch.test_model) {
+      if (!m[ch.test_model]) m[ch.test_model] = []
+      m[ch.test_model].push(ch.name)
+    }
+  }
+  return m
 })
 
-function onChannelChange() {
-  const ch = channels.value.find(c => c.id === selChannelId.value)
-  if (!ch) return
-  const mapped = Object.keys(ch.model_mapping || {})
-  req.value.model = ch.test_model || mapped[0] || ''
-}
+// 模型下拉提示：所有站点已映射模型的并集 + 通用模型（去重）
+const modelSuggestions = computed(() => {
+  const set = new Set()
+  for (const ch of channels.value) {
+    for (const k of Object.keys(ch.model_mapping || {})) set.add(k)
+  }
+  for (const k of knownModels) set.add(k)
+  return [...set]
+})
 
 const loading = ref(false)
 const streamText = ref('')
@@ -164,11 +172,11 @@ function reset() {
         <div class="play-body">
           <div class="form-grid-2">
             <div class="field">
-              <label class="field-label">站点（自动预填该站点默认测试模型）</label>
-              <select v-model="selChannelId" class="select" @change="onChannelChange">
-                <option :value="null">不选择（手动填写模型）</option>
-                <option v-for="ch in channels" :key="ch.id" :value="ch.id">{{ ch.name }}</option>
-              </select>
+              <label class="field-label">模型</label>
+              <input v-model="req.model" class="input mono" list="known-models" placeholder="如 gpt-4o / claude-sonnet-5">
+              <datalist id="known-models">
+                <option v-for="m in modelSuggestions" :key="m" :value="m">{{ m }}<template v-if="defaultByModel[m]"> · 默认({{ defaultByModel[m].join('、') }})</template></option>
+              </datalist>
             </div>
             <div class="field">
               <label class="field-label">分组（限定路由范围）</label>
@@ -178,14 +186,7 @@ function reset() {
               </select>
             </div>
           </div>
-
-          <div class="field">
-            <label class="field-label">模型</label>
-            <input v-model="req.model" class="input mono" list="known-models" :placeholder="selChannelId ? '选择站点后自动预填' : '如 gpt-4o / claude-sonnet-5'">
-            <datalist id="known-models">
-              <option v-for="m in modelSuggestions" :key="m" :value="m" />
-            </datalist>
-          </div>
+          <div class="field-hint" style="margin-top:-8px;margin-bottom:8px">站点由决策引擎自动路由，无需选择。下拉中标「默认(站点)」的是各站点专属的默认测试模型；也可直接输入任意模型名。</div>
 
           <div class="field">
             <label class="field-label">消息</label>
