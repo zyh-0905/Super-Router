@@ -183,13 +183,3 @@ groups:
           description: "Instance {{ $labels.instance }} is not responding to Prometheus scrapes"
           runbook: "Check Gateway process status and system resources"
 
-      # Metrics 抓取失败
-      - alert: MetricsScrapeFailure
-        expr: up{job="smart-router-gateway"} == 0
-        for: 5m
-        labels:
-          severity: warning
-          component: monitoring
-        annotations:
-          summary: "Cannot scrape metrics from Gateway"
-          description: "Prometheus cannot reach {{ $labels.instance }}"

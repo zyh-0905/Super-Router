@@ -51,6 +51,7 @@ echo "📊 Starting Prometheus..."
 docker run -d \
   --name smart-router-prometheus \
   -p 9090:9090 \
+  --add-host=host.docker.internal:host-gateway \
   -v "$PROJECT_DIR/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
   -v "$PROJECT_DIR/prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro" \
   --restart unless-stopped \
@@ -71,18 +72,18 @@ echo ""
 echo "⏳ Waiting for Prometheus to be ready..."
 sleep 3
 
-# 启动 Grafana
+# 启动 Grafana（3001 端口：避免与本机 3000 端口上其他服务冲突）
 echo "📈 Starting Grafana..."
 docker run -d \
   --name smart-router-grafana \
-  -p 3000:3000 \
+  -p 3001:3000 \
   -e "GF_SECURITY_ADMIN_PASSWORD=admin" \
   -e "GF_USERS_ALLOW_SIGN_UP=false" \
   --restart unless-stopped \
   grafana/grafana-oss
 
 if [ $? -eq 0 ]; then
-    echo -e "${GREEN}✓${NC} Grafana started on http://localhost:3000"
+    echo -e "${GREEN}✓${NC} Grafana started on http://localhost:3001"
     echo -e "   Default credentials: ${YELLOW}admin / admin${NC}"
 else
     echo -e "${RED}❌ Failed to start Grafana${NC}"
@@ -101,7 +102,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "📊 Access URLs:"
 echo "   • Prometheus:     http://localhost:9090"
-echo "   • Grafana:        http://localhost:3000"
+echo "   • Grafana:        http://localhost:3001"
 echo "   • Gateway Metrics: http://localhost:8080/metrics"
 echo ""
 echo "🔧 Next steps:"

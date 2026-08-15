@@ -25,6 +25,7 @@ checker:
   daily_probe_budget: 5.00
   probe_failed_backoff: 6h
   probe_model: "gpt-4o"       # 推理探针使用的模型（按站点实际可用模型调整）
+  retention_days: 30          # 历史数据保留天数（健康/价格/探针/余额/请求/决策日志）
 
 routing:
   default_strategy: custom_priority

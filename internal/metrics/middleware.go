@@ -1,10 +1,42 @@
 package metrics
 
 import (
+	"regexp"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+var modelLabelRe = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,64}$`)
+
+// 模型标签基数防护：只放行合法命名的前 N 个模型，超出归为 "other"，
+// 防止恶意调用方用随机模型名撑爆 Prometheus 标签基数。
+const modelLabelCap = 300
+
+var (
+	modelLabelMu  sync.Mutex
+	modelLabelSet = map[string]struct{}{}
+)
+
+func sanitizeModelLabel(model string) string {
+	if model == "" {
+		return "unknown"
+	}
+	if !modelLabelRe.MatchString(model) {
+		return "invalid"
+	}
+	modelLabelMu.Lock()
+	defer modelLabelMu.Unlock()
+	if _, ok := modelLabelSet[model]; ok {
+		return model
+	}
+	if len(modelLabelSet) >= modelLabelCap {
+		return "other"
+	}
+	modelLabelSet[model] = struct{}{}
+	return model
+}
 
 // PrometheusMiddleware 记录 HTTP 请求指标
 func PrometheusMiddleware() gin.HandlerFunc {
@@ -24,10 +56,7 @@ func PrometheusMiddleware() gin.HandlerFunc {
 		}
 
 		// 从上下文中获取信息（由路由处理器设置）
-		model := c.GetString("model")
-		if model == "" {
-			model = "unknown"
-		}
+		model := sanitizeModelLabel(c.GetString("model"))
 
 		channel := c.GetString("channel")
 		if channel == "" {

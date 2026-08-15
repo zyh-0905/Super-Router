@@ -49,6 +49,7 @@ type CheckerConfig struct {
 	DailyProbeBudget   float64       `mapstructure:"daily_probe_budget"`
 	ProbeFailedBackoff time.Duration `mapstructure:"probe_failed_backoff"`
 	ProbeModel         string        `mapstructure:"probe_model"`
+	RetentionDays      int           `mapstructure:"retention_days"` // 历史数据保留天数（0 = 默认 30）
 }
 
 type RoutingConfig struct {

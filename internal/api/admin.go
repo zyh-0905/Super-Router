@@ -291,16 +291,17 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		enabled                            bool
 		dailyProbeBudget, ratioLimit       float64
 		modelMappingJSON, capabilitiesJSON string
+		balanceAPIURL, balanceAPIToken     string
 		createdAt                          time.Time
 	)
 
 	err := h.db.Pool.QueryRow(ctx, `
 		SELECT id, name, base_url, enabled, role, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
-		       daily_probe_budget, ratio_limit, created_at
+		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at
 		FROM upstreams WHERE id = $1
 	`, id).Scan(&channelID, &name, &baseURL, &enabled, &role, &userPriority, &weight,
-		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &createdAt)
+		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt)
 
 	if err != nil {
 		c.JSON(404, gin.H{"error": "channel not found"})
@@ -324,6 +325,8 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		"capabilities":       capabilities,
 		"daily_probe_budget": dailyProbeBudget,
 		"ratio_limit":        ratioLimit,
+		"balance_api_url":    balanceAPIURL,
+		"balance_api_token":  balanceAPIToken,
 		"created_at":         createdAt.Format(time.RFC3339),
 	})
 }
