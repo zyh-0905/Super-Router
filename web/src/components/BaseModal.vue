@@ -1,5 +1,7 @@
 <script setup>
 // 通用弹窗：毛玻璃遮罩 + 居中卡片
+import Icon from './Icon.vue'
+
 defineProps({
   title: String,
   width: { type: String, default: '520px' },

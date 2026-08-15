@@ -15,14 +15,53 @@ import (
 	"smart-router/internal/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
 const (
-	ratioProbeLockTTL        = 60 * time.Second
+	ratioProbeLockTTL        = 120 * time.Second // 探测最长约 60s，TTL 留余量
 	defaultManualProbeTokens = 64
 	maxManualProbeTokens     = 256
 )
+
+// 手动探测预算原子预留（Redis，按自然日键）：防止并发探测 check-then-act 超支
+var reserveProbeBudgetScript = redis.NewScript(`
+local ch = tonumber(redis.call('get', KEYS[1]) or '0')
+local gl = tonumber(redis.call('get', KEYS[2]) or '0')
+local r = tonumber(ARGV[1])
+if ch + r > tonumber(ARGV[2]) or gl + r > tonumber(ARGV[3]) then
+	return 0
+end
+redis.call('set', KEYS[1], ch + r, 'EX', 172800)
+redis.call('set', KEYS[2], gl + r, 'EX', 172800)
+return 1
+`)
+
+var refundProbeBudgetScript = redis.NewScript(`
+local ch = tonumber(redis.call('get', KEYS[1]) or '0')
+local gl = tonumber(redis.call('get', KEYS[2]) or '0')
+local r = tonumber(ARGV[1])
+ch = math.max(0, ch - r)
+gl = math.max(0, gl - r)
+redis.call('set', KEYS[1], ch, 'EX', 172800)
+redis.call('set', KEYS[2], gl, 'EX', 172800)
+return 1
+`)
+
+// 带所有权的锁释放：仅当 token 匹配才删除，避免误删他方持有的锁
+var releaseOwnedLockScript = redis.NewScript(`
+if redis.call('get', KEYS[1]) == ARGV[1] then
+	return redis.call('del', KEYS[1])
+end
+return 0
+`)
+
+func probeBudgetKeys(channelID int) (string, string) {
+	day := time.Now().Format("2006-01-02")
+	return fmt.Sprintf("ratio:budget:%d:%s", channelID, day),
+		fmt.Sprintf("ratio:budget:global:%s", day)
+}
 
 // RatioHandler 实时倍率：声明/实测查询 + 按需手动实测
 type RatioHandler struct {
@@ -295,6 +334,30 @@ func (h *RatioHandler) GetRatio(c *gin.Context) {
 	})
 }
 
+// modelPriceValues 读取模型官方价格（未收录返回 0,0）
+func (h *RatioHandler) modelPriceValues(ctx context.Context, model string) (float64, float64) {
+	var in, out float64
+	if err := h.db.Pool.QueryRow(ctx, `
+		SELECT input_price_per_m, output_price_per_m FROM model_prices WHERE model = $1
+	`, model).Scan(&in, &out); err != nil {
+		return 0, 0
+	}
+	return in, out
+}
+
+// estimateProbeCost 预估单次探测成本：按 (估算 prompt 5000 + maxTokens) × 输出价/1M，
+// 无官方价时按保守 $30/1M
+func estimateProbeCost(maxTokens int, officialIn, officialOut float64) float64 {
+	perM := 30.0
+	if officialOut > 0 {
+		perM = officialOut
+	} else if officialIn > 0 {
+		perM = officialIn
+	}
+	const promptEst = 5000
+	return float64(promptEst+maxTokens) * perM / 1_000_000
+}
+
 // validGroupModels 校验分组模型：至少一个模型、默认模型必须在组内
 func validGroupModels(models []string, defaultModel string) error {
 	if len(models) == 0 {
@@ -335,7 +398,7 @@ func (h *RatioHandler) ProbeRatio(c *gin.Context) {
 		return
 	}
 
-	resp, status := h.probeChannelModel(context.Background(), channelID, req.Model, clampProbeTokens(req.MaxTokens), req.InputPricePerM, req.OutputPricePerM)
+	resp, status := h.probeChannelModel(c.Request.Context(), channelID, req.Model, clampProbeTokens(req.MaxTokens), req.InputPricePerM, req.OutputPricePerM)
 	c.JSON(status, resp)
 }
 
@@ -368,11 +431,12 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		}
 	}
 
-	// 并发锁：同站点同模型同一时间只允许一个探测
+	// 并发锁：同站点同模型同一时间只允许一个探测（带所有权，超时自动释放且不会误删他人锁）
 	lockKey := fmt.Sprintf("ratio:probe:%d:%s", channelID, model)
+	lockToken := fmt.Sprintf("%d-%d", time.Now().UnixNano(), channelID)
 	locked := false
 	if h.redis != nil && h.redis.Client != nil {
-		ok, lerr := h.redis.Client.SetNX(ctx, lockKey, "1", ratioProbeLockTTL).Result()
+		ok, lerr := h.redis.Client.SetNX(ctx, lockKey, lockToken, ratioProbeLockTTL).Result()
 		if lerr != nil {
 			h.logger.Warn("Ratio probe lock check failed, proceeding without lock", zap.Error(lerr))
 		} else if !ok {
@@ -382,7 +446,9 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		}
 	}
 	if locked {
-		defer h.redis.Client.Del(ctx, lockKey)
+		defer func() {
+			releaseOwnedLockScript.Run(ctx, h.redis.Client, []string{lockKey}, lockToken)
+		}()
 	}
 
 	// 预算检查：全局 + 站点有效预算（失败关闭：读不到花费时拒绝探测）
@@ -391,7 +457,8 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		return gin.H{"error": "无法读取今日探针花费，探测已取消"}, 500
 	}
 	globalBudget := h.cfg.Checker.DailyProbeBudget
-	if globalSpent >= globalBudget {
+	remainingGlobal := globalBudget - globalSpent
+	if remainingGlobal <= 0 {
 		return gin.H{"error": "今日全局探测预算已用完", "remaining_budget": 0.0}, 429
 	}
 	upstreamSpent, err := h.probe.UpstreamTodaySpent(ctx, channelID)
@@ -399,12 +466,44 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		return gin.H{"error": "无法读取站点探针花费，探测已取消"}, 500
 	}
 	effectiveBudget := h.channelEffectiveBudget(ctx, channelID, globalBudget)
-	if upstreamSpent >= effectiveBudget {
+	remainingChannel := effectiveBudget - upstreamSpent
+	if remainingChannel <= 0 {
 		return gin.H{
 			"error":            "该站点今日探测预算已用完",
-			"remaining_budget": round2(effectiveBudget - upstreamSpent),
+			"remaining_budget": round2(remainingChannel),
 		}, 429
 	}
+
+	// 原子预留预算（Redis）：按预估单次成本预留，探测结束后按实际成本退还，
+	// 防止并发探测 check-then-act 导致超支。
+	priceIn, priceOut := h.modelPriceValues(ctx, model)
+	estCost := estimateProbeCost(maxTokens, priceIn, priceOut)
+	reserve := math.Min(estCost, math.Min(remainingGlobal, remainingChannel))
+	if reserve <= 0 {
+		return gin.H{"error": "今日探测预算已用完", "remaining_budget": round2(math.Min(remainingGlobal, remainingChannel))}, 429
+	}
+	budgetKeyCh, budgetKeyGl := probeBudgetKeys(channelID)
+	reserved := false
+	refund := 0.0
+	if h.redis != nil && h.redis.Client != nil {
+		n, rerr := reserveProbeBudgetScript.Run(ctx, h.redis.Client,
+			[]string{budgetKeyCh, budgetKeyGl},
+			reserve, remainingChannel, remainingGlobal).Int()
+		if rerr != nil {
+			return gin.H{"error": "预算预留失败，探测已取消"}, 500
+		}
+		if n == 0 {
+			return gin.H{"error": "今日探测预算已用完（并发探测占用中）", "remaining_budget": round2(math.Min(remainingGlobal, remainingChannel))}, 429
+		}
+		reserved = true
+		refund = reserve
+	}
+	// 探测结束后按实际成本退还（失败全额退还；成功分支会把 refund 改写为 reserve-cost）
+	defer func() {
+		if reserved {
+			refundProbeBudgetScript.Run(ctx, h.redis.Client, []string{budgetKeyCh, budgetKeyGl}, refund)
+		}
+	}()
 
 	epoch, err := h.db.GetCurrentEpoch(ctx)
 	if err != nil {
@@ -427,8 +526,14 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		return gin.H{"error": msg, "stage": res.Stage}, 502
 	}
 
-	// 实测成功：失效快照缓存，让新倍率立即参与路由
+	// 实测成功：失效快照缓存，让新倍率立即参与路由；按实际成本退还预留差额
 	router.InvalidateSnapshotCache(ctx, h.redis)
+	if reserved {
+		refund = reserve - res.Cost
+		if refund < 0 {
+			refund = 0
+		}
+	}
 
 	resp := gin.H{
 		"channel_id":        channelID,
@@ -675,7 +780,7 @@ func (h *RatioHandler) ProbeRatioGroup(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid group id"})
 		return
 	}
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	_, name, defaultModel, _, err := h.loadRatioGroup(ctx, channelID, groupID)
 	if err != nil {

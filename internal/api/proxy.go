@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"smart-router/internal/metrics"
@@ -30,13 +33,36 @@ type ProxyHandler struct {
 
 func NewProxyHandler(r *router.Router, db *store.DB, logger *zap.Logger, circuit *CircuitBreakerManager) *ProxyHandler {
 	return &ProxyHandler{
-		router:  r,
-		db:      db,
-		logger:  logger,
-		client:  &http.Client{Timeout: 60 * time.Second},
+		router: r,
+		db:     db,
+		logger: logger,
+		// 不设整体 Timeout：长流式响应不应被掐断；
+		// 拨号 10s 上限 + 每尝试的 TTFB 预算计时器（见故障切换循环）控制首字节。
+		client: &http.Client{
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+			},
+		},
 		circuit: circuit,
 	}
 }
+
+// firstByteReader 在首次读到数据时触发一次回调（用于首字节后解除 TTFB 预算计时器）
+type firstByteReader struct {
+	rc      io.ReadCloser
+	onFirst func()
+	once    sync.Once
+}
+
+func (f *firstByteReader) Read(p []byte) (int, error) {
+	n, err := f.rc.Read(p)
+	if n > 0 {
+		f.once.Do(f.onFirst)
+	}
+	return n, err
+}
+
+func (f *firstByteReader) Close() error { return f.rc.Close() }
 
 // ChatCompletionRequest OpenAI 格式请求（group 为网关扩展字段，转发上游前移除）
 type ChatCompletionRequest struct {
@@ -249,10 +275,34 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 		}
 
 		attemptStart := time.Now()
-		upstreamBody, err := h.callUpstream(ctx, channel, &req)
+
+		// 单次尝试的 TTFB 预算：剩余总预算内（至少 1s），首字节到达后解除计时器（长流式不被掐断）
+		remainingBudgetMS := totalBudgetMS - int(elapsed)
+		if remainingBudgetMS < 1000 {
+			remainingBudgetMS = 1000
+		}
+		var firstByte atomic.Bool
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		defer cancelAttempt()
+		ttfbTimer := time.AfterFunc(time.Duration(remainingBudgetMS)*time.Millisecond, func() {
+			if !firstByte.Load() {
+				cancelAttempt()
+			}
+		})
+
+		upstreamBody, err := h.callUpstream(attemptCtx, channel, &req)
+		if err == nil {
+			upstreamBody = &firstByteReader{rc: upstreamBody, onFirst: func() {
+				firstByte.Store(true)
+				ttfbTimer.Stop()
+			}}
+		} else {
+			ttfbTimer.Stop()
+			cancelAttempt()
+		}
 		if err != nil {
 			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, err, &attempts, i, false, probeReserved)
-			if !isRetryable(err) {
+			if !isRetryable(err, ctx) {
 				h.logger.Info("Error not retryable", zap.String("error_class", classifyError(err)))
 				c.JSON(502, gin.H{"error": fmt.Sprintf("upstream error: %v", err)})
 				return
@@ -600,8 +650,10 @@ func classifyError(err error) string {
 	return "network_error"
 }
 
-// isRetryable 判断错误是否允许切换到下一个候选渠道
-func isRetryable(err error) bool {
+// isRetryable 判断错误是否允许切换到下一个候选渠道。
+// callerCtx 为调用方请求上下文：DeadlineExceeded 时若调用方仍存活，
+// 说明是本网关的尝试级超时（TTFB 预算），可换渠道重试。
+func isRetryable(err error, callerCtx context.Context) bool {
 	var ue *upstreamError
 	if errors.As(err, &ue) && ue.StatusCode > 0 {
 		// 上游返回了 HTTP 状态码：按状态码判定
@@ -614,8 +666,11 @@ func isRetryable(err error) bool {
 			return false // 4xx（认证/参数错误）：换渠道无意义
 		}
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return false // 调用方超时或断开：重试无意义
+	if errors.Is(err, context.DeadlineExceeded) {
+		return callerCtx.Err() == nil // 尝试级超时可重试；调用方超时则否
+	}
+	if errors.Is(err, context.Canceled) {
+		return false // 调用方断开：重试无意义
 	}
 	return true // 网络错误（含上游未响应）：可切换
 }

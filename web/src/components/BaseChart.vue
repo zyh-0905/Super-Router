@@ -30,24 +30,27 @@ const themePalette = () => {
 function render() {
   if (!chart.value || !props.option) return
   const t = themePalette()
-  // 注入默认文字与轴线配色（组件内部 option 可覆盖）
-  const opt = JSON.parse(JSON.stringify(props.option))
+  // 浅拷贝合并主题：不能用 JSON 克隆（会静默丢弃 tooltip.formatter 等函数）
+  const opt = { ...props.option }
+  const decorateAxis = ax => ({
+    ...ax,
+    axisLine: ax.axisLine || { lineStyle: { color: t.grid } },
+    axisTick: ax.axisTick || { show: false },
+    axisLabel: { ...(ax.axisLabel || {}), color: ax.axisLabel?.color || t.axisLabel },
+  })
   if (opt.xAxis) {
-    for (const ax of (Array.isArray(opt.xAxis) ? opt.xAxis : [opt.xAxis])) {
-      ax.axisLine = ax.axisLine || { lineStyle: { color: t.grid } }
-      ax.axisTick = ax.axisTick || { show: false }
-      ax.axisLabel = ax.axisLabel || {}
-      ax.axisLabel.color = ax.axisLabel.color || t.axisLabel
-    }
+    opt.xAxis = (Array.isArray(opt.xAxis) ? opt.xAxis : [opt.xAxis]).map(ax => decorateAxis(ax))
+    if (!Array.isArray(props.option.xAxis)) opt.xAxis = opt.xAxis[0]
   }
   if (opt.yAxis) {
-    for (const ax of (Array.isArray(opt.yAxis) ? opt.yAxis : [opt.yAxis])) {
-      ax.axisLine = ax.axisLine || { show: false }
-      ax.axisTick = ax.axisTick || { show: false }
-      ax.splitLine = ax.splitLine || { lineStyle: { color: t.splitLine } }
-      ax.axisLabel = ax.axisLabel || {}
-      ax.axisLabel.color = ax.axisLabel.color || t.axisLabel
-    }
+    opt.yAxis = (Array.isArray(opt.yAxis) ? opt.yAxis : [opt.yAxis]).map(ax => {
+      const d = decorateAxis(ax)
+      d.axisLine = d.axisLine || { show: false }
+      d.axisTick = d.axisTick || { show: false }
+      d.splitLine = ax.splitLine || { lineStyle: { color: t.splitLine } }
+      return d
+    })
+    if (!Array.isArray(props.option.yAxis)) opt.yAxis = opt.yAxis[0]
   }
   chart.value.setOption(opt, { notMerge: true })
 }
@@ -69,6 +72,14 @@ onBeforeUnmount(() => {
 
 watch(() => props.option, render, { deep: true })
 watch(resolvedTheme, () => setTimeout(render, 50))
+// events 变化时重挂事件（先卸载旧事件避免重复触发）
+watch(() => props.events, evts => {
+  if (!chart.value) return
+  chart.value.off()
+  for (const [ev, handler] of Object.entries(evts || {})) {
+    if (typeof handler === 'function') chart.value.on(ev, handler)
+  }
+}, { deep: true })
 </script>
 
 <template>

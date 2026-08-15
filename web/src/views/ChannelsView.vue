@@ -212,12 +212,14 @@ function select(ch) {
 
 async function loadHealth() {
   if (!selected.value) return
+  const id = selected.value.id
   healthLoading.value = true
   try {
-    const r = await api.channelHealth(selected.value.id)
+    const r = await api.channelHealth(id)
+    if (selected.value?.id !== id) return // 站点已切换，丢弃过期响应
     health.value = r.health_checks || []
   } catch { health.value = [] }
-  finally { healthLoading.value = false }
+  finally { if (selected.value?.id === id) healthLoading.value = false }
 }
 
 // ===== 余额 =====
@@ -226,11 +228,14 @@ const balanceLoading = ref(false)
 
 async function loadBalance() {
   if (!selected.value) return
+  const id = selected.value.id
   balanceLoading.value = true
   try {
-    balance.value = await api.channelBalance(selected.value.id)
+    const r = await api.channelBalance(id)
+    if (selected.value?.id !== id) return // 站点已切换，丢弃过期响应
+    balance.value = r
   } catch { balance.value = null }
-  finally { balanceLoading.value = false }
+  finally { if (selected.value?.id === id) balanceLoading.value = false }
 }
 
 // ===== 倍率 =====
@@ -270,9 +275,11 @@ async function saveRatioLimit() {
 
 async function loadRatio() {
   if (!selected.value) return
+  const id = selected.value.id
   ratioLoading.value = true
   try {
-    const [r, mp] = await Promise.all([api.channelRatio(selected.value.id), api.listModelPrices()])
+    const [r, mp] = await Promise.all([api.channelRatio(id), api.listModelPrices()])
+    if (selected.value?.id !== id) return // 站点已切换，丢弃过期响应
     ratio.value = r
     modelPrices.value = mp.prices || []
     if (!probeModel.value) {
@@ -280,7 +287,7 @@ async function loadRatio() {
       probeModel.value = keys[0] || ''
     }
   } catch { ratio.value = null }
-  finally { ratioLoading.value = false }
+  finally { if (selected.value?.id === id) ratioLoading.value = false }
 }
 
 async function runProbe() {

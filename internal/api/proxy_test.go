@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestClassifyErrorUpstreamStatuses(t *testing.T) {
@@ -41,6 +42,7 @@ func TestClassifyErrorContext(t *testing.T) {
 }
 
 func TestIsRetryable(t *testing.T) {
+	ctx := context.Background()
 	retryable := []error{
 		&upstreamError{StatusCode: http.StatusTooManyRequests},
 		&upstreamError{StatusCode: http.StatusRequestTimeout},
@@ -48,9 +50,10 @@ func TestIsRetryable(t *testing.T) {
 		&upstreamError{StatusCode: http.StatusBadGateway},
 		&upstreamError{Err: fmt.Errorf("dial tcp: connection refused")}, // 无 HTTP 响应：按网络错误处理
 		fmt.Errorf("dial tcp: connection refused"),
+		context.DeadlineExceeded, // 调用方仍存活：尝试级超时可换渠道
 	}
 	for _, err := range retryable {
-		if !isRetryable(err) {
+		if !isRetryable(err, ctx) {
 			t.Errorf("isRetryable(%v) = false, want true", err)
 		}
 	}
@@ -59,13 +62,20 @@ func TestIsRetryable(t *testing.T) {
 		&upstreamError{StatusCode: http.StatusUnauthorized},
 		&upstreamError{StatusCode: http.StatusBadRequest},
 		&upstreamError{StatusCode: http.StatusNotFound},
-		context.DeadlineExceeded,
 		context.Canceled,
 	}
 	for _, err := range nonRetryable {
-		if isRetryable(err) {
+		if isRetryable(err, ctx) {
 			t.Errorf("isRetryable(%v) = true, want false", err)
 		}
+	}
+
+	// 调用方已超时/断开：deadline 错误不可重试
+	deadCtx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancel()
+	<-deadCtx.Done()
+	if isRetryable(context.DeadlineExceeded, deadCtx) {
+		t.Error("deadline exceeded with dead caller context must not be retryable")
 	}
 }
 
@@ -75,7 +85,7 @@ func TestClassifyErrorNetworkWrappedUpstream(t *testing.T) {
 	if got := classifyError(err); got != "network_error" {
 		t.Errorf("classifyError(wrapped network) = %q, want network_error", got)
 	}
-	if !isRetryable(err) {
+	if !isRetryable(err, context.Background()) {
 		t.Error("isRetryable(wrapped network) = false, want true")
 	}
 }

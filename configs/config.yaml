@@ -1,7 +1,7 @@
 server:
   port: 8080
   read_timeout: 30s
-  write_timeout: 30s
+  write_timeout: 0        # 0 = 不限：SSE 流式与长推理响应不能被 30s 写超时掐断
   bootstrap_default_keys: false  # 生产关闭：空库时生成随机管理员 Key（仅日志打印一次）
 
 database:

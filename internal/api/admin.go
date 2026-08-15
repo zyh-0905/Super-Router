@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"smart-router/internal/config"
+	"smart-router/internal/router"
 	"smart-router/internal/store"
 
 	"github.com/gin-gonic/gin"
@@ -24,6 +25,7 @@ import (
 
 type AdminHandler struct {
 	db     *store.DB
+	redis  *store.RedisClient
 	cfg    *config.Config
 	logger *zap.Logger
 }
@@ -57,12 +59,18 @@ func apiKeyUpdateFound(rowsAffected int64) bool {
 	return rowsAffected > 0
 }
 
-func NewAdminHandler(db *store.DB, cfg *config.Config, logger *zap.Logger) *AdminHandler {
+func NewAdminHandler(db *store.DB, redis *store.RedisClient, cfg *config.Config, logger *zap.Logger) *AdminHandler {
 	return &AdminHandler{
 		db:     db,
+		redis:  redis,
 		cfg:    cfg,
 		logger: logger,
 	}
+}
+
+// invalidateSnapshot 使路由快照缓存失效（站点/分组/Key 变更后立即生效）
+func (h *AdminHandler) invalidateSnapshot(ctx context.Context) {
+	router.InvalidateSnapshotCache(ctx, h.redis)
 }
 
 // ==================== 站点 (Channels) ====================
@@ -132,6 +140,7 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 	if err := h.syncChannelGroups(ctx, id, groupIDs); err != nil {
 		h.logger.Warn("Failed to sync channel groups", zap.Int("channel_id", id), zap.Error(err))
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(201, gin.H{
 		"id":      id,
@@ -430,6 +439,7 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 			return
 		}
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(200, gin.H{"message": "channel updated successfully"})
 }
@@ -455,6 +465,7 @@ func (h *AdminHandler) DeleteChannel(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "channel not found"})
 		return
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(200, gin.H{"message": "channel deleted successfully"})
 }
@@ -824,6 +835,7 @@ func (h *AdminHandler) CreateGroup(c *gin.Context) {
 			ON CONFLICT DO NOTHING
 		`, chID, id)
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(201, gin.H{"id": id, "message": "group created successfully"})
 }
@@ -926,6 +938,7 @@ func (h *AdminHandler) UpdateGroup(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "failed to update group"})
 		return
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(200, gin.H{"message": "group updated successfully"})
 }
@@ -945,6 +958,7 @@ func (h *AdminHandler) DeleteGroup(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "group not found"})
 		return
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(200, gin.H{"message": "group deleted successfully"})
 }
@@ -1285,6 +1299,7 @@ func (h *AdminHandler) ResetCircuit(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "failed to reset circuit"})
 		return
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(200, gin.H{
 		"message": fmt.Sprintf("circuit reset successfully (%d rows)", ct.RowsAffected()),
@@ -2012,6 +2027,7 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 			h.logger.Warn("Failed to bind key groups", zap.Error(err))
 		}
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(201, gin.H{
 		"id":      id,
@@ -2055,6 +2071,7 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 			return
 		}
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(200, gin.H{"message": "api key updated successfully"})
 }
@@ -2073,6 +2090,7 @@ func (h *AdminHandler) DeleteKey(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "api key not found"})
 		return
 	}
+	h.invalidateSnapshot(ctx)
 
 	c.JSON(200, gin.H{"message": "api key deleted successfully"})
 }

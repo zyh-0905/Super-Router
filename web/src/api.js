@@ -183,23 +183,28 @@ export const api = {
       const reader = resp.body.getReader()
       const dec = new TextDecoder()
       let buf = ''
+      const parseLine = (line) => {
+        const t = line.trim()
+        if (!t.startsWith('data:')) return
+        const data = t.slice(5).trim()
+        if (!data || data === '[DONE]') return
+        try {
+          const obj = JSON.parse(data)
+          const delta = obj.choices?.[0]?.delta?.content || obj.choices?.[0]?.text || ''
+          if (delta) onDelta(delta)
+        } catch { /* 非 JSON 行 */ }
+      }
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
         buf += dec.decode(value, { stream: true })
         const lines = buf.split('\n')
         buf = lines.pop()
-        for (const line of lines) {
-          const t = line.trim()
-          if (!t.startsWith('data:')) continue
-          const data = t.slice(5).trim()
-          if (data === '[DONE]') continue
-          try {
-            const obj = JSON.parse(data)
-            const delta = obj.choices?.[0]?.delta?.content || obj.choices?.[0]?.text || ''
-            if (delta) onDelta(delta)
-          } catch { /* 非 JSON 行 */ }
-        }
+        for (const line of lines) parseLine(line)
+      }
+      // 处理流结束前残留的最后一个未换行片段（尾块丢失修复）
+      if (buf.trim()) {
+        for (const line of buf.split('\n')) parseLine(line)
       }
       return { stream: true, meta, text: '' }
     }

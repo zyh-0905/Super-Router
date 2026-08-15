@@ -71,3 +71,21 @@ func TestValidGroupModels(t *testing.T) {
 		t.Errorf("valid group rejected: %v", err)
 	}
 }
+
+func TestEstimateProbeCost(t *testing.T) {
+	// 官方输出价 30/1M：(5000+256)×30/1M ≈ 0.1577
+	cost := estimateProbeCost(256, 5, 30)
+	if cost < 0.15 || cost > 0.16 {
+		t.Fatalf("official cost = %v, want about 0.1577", cost)
+	}
+	// 无官方价：保守 $30/1M
+	cost = estimateProbeCost(64, 0, 0)
+	if cost < 0.15 || cost > 0.16 {
+		t.Fatalf("fallback cost = %v, want about 0.1519", cost)
+	}
+	// 只有输入价：用输入价
+	cost = estimateProbeCost(64, 1.5, 0)
+	if cost < 0.007 || cost > 0.008 {
+		t.Fatalf("input-only cost = %v, want about 0.0076", cost)
+	}
+}

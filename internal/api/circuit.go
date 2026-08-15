@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"smart-router/internal/store"
 
+	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 )
 
@@ -35,25 +37,40 @@ func NewCircuitBreakerManager(db *store.DB, logger *zap.Logger, config CircuitBr
 	}
 }
 
-// UpdateCircuitState 更新熔断状态（每次请求完成后调用）
-// groupID 非空时，分组级熔断参数覆盖全局配置
+// UpdateCircuitState 更新熔断状态（每次请求完成后调用）。
+// 使用事务 + SELECT ... FOR UPDATE 原子化「读-计数-状态转换-写」，
+// 避免并发请求丢失计数（退避档位/恢复阈值失真）。
+// groupID 非空时，分组级熔断参数覆盖全局配置。
 func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelID int, model string, groupID *int, success bool, errorClass string) error {
-	// 读取当前状态
+	// 生效配置：分组覆盖 > 全局（只读，事务外计算）
+	cfg := m.effectiveConfig(ctx, groupID)
+
+	tx, err := m.db.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// 锁定行并读取当前状态（串行化同一 (渠道, 模型) 的并发更新）
 	var currentState string
 	var failureCount, successCount int
 	var coolingUntil time.Time
 
-	err := m.db.Pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT state, failure_count, success_count, COALESCE(cooling_until, '1970-01-01'::timestamp)
 		FROM circuit_states
 		WHERE channel_id = $1 AND model = $2 AND capability = ''
+		FOR UPDATE
 	`, channelID, model).Scan(&currentState, &failureCount, &successCount, &coolingUntil)
 
-	if err != nil {
-		// 没有记录，创建初始状态
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 没有记录：从 closed 开始
 		currentState = "closed"
 		failureCount = 0
 		successCount = 0
+	} else if err != nil {
+		// DB 错误：不 fail-open，避免把已开闸状态误重置
+		return err
 	}
 
 	// 根据结果更新计数
@@ -64,9 +81,6 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 		failureCount++
 		successCount = 0 // 失败后重置成功计数
 	}
-
-	// 生效配置：分组覆盖 > 全局
-	cfg := m.effectiveConfig(ctx, groupID)
 
 	// 应否开闸判定（仅 closed/degraded 需要样本统计）
 	var shouldOpen bool
@@ -92,14 +106,17 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 	}
 
 	// 写入数据库（单一语句：指针为 nil 时写入 NULL）
-	_, err = m.db.Pool.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		INSERT INTO circuit_states (channel_id, model, capability, state, opened_at, cooling_until, failure_count, success_count, updated_at)
 		VALUES ($1, $2, '', $3, $4, $5, $6, $7, NOW())
 		ON CONFLICT (channel_id, model, capability)
 		DO UPDATE SET state = $3, opened_at = $4, cooling_until = $5, failure_count = $6, success_count = $7, updated_at = NOW()
 	`, channelID, model, newState, openedAt, newCoolingUntil, failureCount, successCount)
+	if err != nil {
+		return err
+	}
 
-	return err
+	return tx.Commit(ctx)
 }
 
 // transitionCircuitState 计算熔断状态转换（纯函数，便于测试）。

@@ -16,7 +16,7 @@ type DecisionLog struct {
 	Epoch            int64     `json:"epoch"`
 	SnapshotChecksum string    `json:"snapshot_checksum"`
 	CandidateOrder   []int     `json:"candidate_order"`
-	SelectedChannel  int       `json:"selected_channel"`
+	SelectedChannel  *int      `json:"selected_channel"` // 渠道删除后为 NULL（ON DELETE SET NULL）
 	DecisionReason   string    `json:"decision_reason"`
 	DecidedAt        time.Time `json:"decided_at"`
 }

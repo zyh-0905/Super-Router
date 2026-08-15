@@ -25,6 +25,11 @@ func NewReplayer(db *store.DB, redis *store.RedisClient) *Replayer {
 	}
 }
 
+// SetPolicyDefaults 注入系统级策略默认值（与网关保持一致，重放结果才可比）
+func (r *Replayer) SetPolicyDefaults(d router.PolicyDefaults) {
+	r.router.SetPolicyDefaults(d)
+}
+
 // Replay 执行重放
 func (r *Replayer) Replay(ctx context.Context, req ReplayRequest) (*Report, error) {
 	// 1. 加载历史决策日志
@@ -171,12 +176,14 @@ func (r *Replayer) loadDecisions(ctx context.Context, req ReplayRequest) ([]Deci
 // replayOne 重放单个决策
 func (r *Replayer) replayOne(ctx context.Context, decision DecisionLog, newStrategy string) (*ReplayResult, error) {
 	// 构建路由请求（使用历史数据）
+	// 说明：决策日志只存 token 的 SHA256 哈希，无法还原原始 token，
+	// 因此 Token 级专属策略在重放时查不到（会落到分组/系统默认）——已知限制。
 	routeReq := router.RouteRequest{
-		RequestID: decision.RequestID + "-replay",
-		TokenID:   decision.TokenIDHash, // 注意：这里是哈希值
-		Model:     decision.Model,
-		IsStream:  decision.IsStream,
-		// 其他字段使用默认值，因为决策日志中没有记录
+		RequestID:        decision.RequestID + "-replay",
+		Model:            decision.Model,
+		IsStream:         decision.IsStream,
+		OverrideStrategy: newStrategy,
+		// 其他字段（能力/预算/分组）决策日志未记录，使用默认值
 	}
 
 	// 重新执行路由决策
@@ -191,13 +198,18 @@ func (r *Replayer) replayOne(ctx context.Context, decision DecisionLog, newStrat
 		replayChannel = routeResult.SelectedChannel.ID
 	}
 
+	originalChannel := 0
+	if decision.SelectedChannel != nil {
+		originalChannel = *decision.SelectedChannel
+	}
+
 	result := &ReplayResult{
 		RequestID:       decision.RequestID,
-		OriginalChannel: decision.SelectedChannel,
+		OriginalChannel: originalChannel,
 		OriginalReason:  decision.DecisionReason,
 		ReplayChannel:   replayChannel,
 		ReplayReason:    routeResult.DecisionReason,
-		ChannelChanged:  decision.SelectedChannel != replayChannel,
+		ChannelChanged:  originalChannel != replayChannel,
 		Epoch:           decision.Epoch,
 		Model:           decision.Model,
 		Strategy:        decision.Strategy,

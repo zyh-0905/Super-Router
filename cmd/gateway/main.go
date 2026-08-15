@@ -125,7 +125,7 @@ func main() {
 
 	// 初始化处理器
 	proxyHandler := api.NewProxyHandler(routerEngine, db, zapLogger.Named("proxy"), circuitManager)
-	adminHandler := api.NewAdminHandler(db, cfg, zapLogger.Named("admin"))
+	adminHandler := api.NewAdminHandler(db, redisClient, cfg, zapLogger.Named("admin"))
 
 	// 实时倍率：按需手动实测（复用 checker 探测逻辑，运行在 Gateway 内）
 	ratioProbe := checker.NewProbeChecker(db, zapLogger.Named("ratio-probe"))

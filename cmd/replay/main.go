@@ -10,6 +10,7 @@ import (
 
 	"smart-router/internal/config"
 	"smart-router/internal/replay"
+	"smart-router/internal/router"
 	"smart-router/internal/store"
 )
 
@@ -65,6 +66,22 @@ func main() {
 
 	// 创建重放器
 	replayer := replay.NewReplayer(db, redis)
+
+	// 注入与网关一致的系统级策略默认值（保证重放与生产决策可比）
+	replayer.SetPolicyDefaults(router.PolicyDefaults{
+		DefaultStrategy:    cfg.Routing.DefaultStrategy,
+		MaxAttempts:        cfg.Routing.MaxAttempts,
+		TotalBudgetMS:      cfg.Routing.TotalBudgetMS,
+		MaxPriceCap:        cfg.Routing.Filter.MaxPriceCap,
+		MaxTTFTMS:          cfg.Routing.Filter.MaxTTFTMS,
+		HalfOpenProbeCount: cfg.Routing.CircuitBreaker.HalfOpenProbeCount,
+		BalancedWeights: map[string]float64{
+			"cost":        cfg.Routing.BalancedWeights.Cost,
+			"reliability": cfg.Routing.BalancedWeights.Reliability,
+			"latency":     cfg.Routing.BalancedWeights.Latency,
+			"load":        cfg.Routing.BalancedWeights.Load,
+		},
+	})
 
 	// 执行重放
 	fmt.Println("🔄 开始重放决策...")

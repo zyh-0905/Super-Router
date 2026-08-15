@@ -40,6 +40,8 @@ type RouteRequest struct {
 	TimeoutMS      int
 	GroupID        *int  // 可选：限定在指定分组内路由
 	GroupIDs       []int // 可选：限定在多个分组的并集内路由（Key 绑定组场景）
+	// OverrideStrategy 非空时覆盖策略查找链的结果（决策重放对比用）
+	OverrideStrategy string
 }
 
 // AttemptRecord 请求尝试记录
@@ -122,6 +124,11 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 	policy, err := r.policyLoader.LoadPolicy(ctx, req.TokenID, req.Model, group)
 	if err != nil {
 		return nil, fmt.Errorf("load policy: %w", err)
+	}
+
+	// 重放对比：显式覆盖策略名（保持原策略配置）
+	if req.OverrideStrategy != "" {
+		policy.Strategy = req.OverrideStrategy
 	}
 
 	// 阶段 C：构建手动候选集（从快照读取）
