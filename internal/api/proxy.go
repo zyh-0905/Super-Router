@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"smart-router/internal/metrics"
+	"smart-router/internal/protocol"
 	"smart-router/internal/router"
 	"smart-router/internal/store"
 
@@ -483,7 +484,8 @@ func (h *ProxyHandler) succeedAttempt(ctx context.Context, requestID string, req
 	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, true, true, int(time.Since(attemptStart).Milliseconds()), groupID)
 }
 
-// callUpstream 调用上游站点，返回 200 时的响应体（未读取）
+// callUpstream 调用上游站点，返回 200 时的响应体（未读取）。
+// anthropic 协议站点：自动转换请求/响应/流式格式与认证头，对外仍为 OpenAI 格式。
 func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.ChannelHealth, req *ChatCompletionRequest) (io.ReadCloser, error) {
 	// 映射模型名
 	upstreamModel := channel.ModelMapping[req.Model]
@@ -498,6 +500,10 @@ func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.Channel
 	`, channel.ID).Scan(&apiKey)
 	if err != nil {
 		return nil, &upstreamError{Err: fmt.Errorf("get api_key: %w", err)}
+	}
+
+	if protocol.IsAnthropic(channel.Protocol) {
+		return h.callAnthropic(ctx, channel, req, upstreamModel, apiKey)
 	}
 
 	// 构建上游请求（移除网关扩展字段 group）
@@ -531,6 +537,65 @@ func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.Channel
 	}
 
 	return resp.Body, nil
+}
+
+// callAnthropic 调用 anthropic 协议站点（x-api-key 认证 + /v1/messages + 格式转换）
+func (h *ProxyHandler) callAnthropic(ctx context.Context, channel *router.ChannelHealth, req *ChatCompletionRequest, upstreamModel, apiKey string) (io.ReadCloser, error) {
+	// 构建 OpenAI 格式请求再转换（移除网关扩展字段 group）
+	upstreamReq := *req
+	upstreamReq.Group = ""
+	upstreamReq.Model = upstreamModel
+	body, err := json.Marshal(upstreamReq)
+	if err != nil {
+		return nil, &upstreamError{Err: fmt.Errorf("marshal request: %w", err)}
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, &upstreamError{Err: fmt.Errorf("unmarshal request: %w", err)}
+	}
+	payload, err := json.Marshal(protocol.OpenAIToAnthropic(raw))
+	if err != nil {
+		return nil, &upstreamError{Err: fmt.Errorf("convert request: %w", err)}
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		protocol.ChatEndpoint(channel.BaseURL, channel.Protocol), bytes.NewReader(payload))
+	if err != nil {
+		return nil, &upstreamError{Err: fmt.Errorf("create request: %w", err)}
+	}
+	for k, v := range protocol.AnthropicHeaders(apiKey) {
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := h.client.Do(httpReq)
+	if err != nil {
+		return nil, &upstreamError{Err: fmt.Errorf("http request: %w", err)}
+	}
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		if status, msg, ok := protocol.AnthropicError(body); ok {
+			return nil, &upstreamError{StatusCode: status, Body: msg}
+		}
+		return nil, &upstreamError{StatusCode: resp.StatusCode, Body: string(body)}
+	}
+
+	if req.Stream {
+		return protocol.NewAnthropicStreamTransformer(resp.Body, upstreamModel), nil
+	}
+
+	// 非流式：读全量并转换为 OpenAI 响应
+	defer resp.Body.Close()
+	body, err = io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil, &upstreamError{Err: fmt.Errorf("read response: %w", err)}
+	}
+	converted, err := protocol.AnthropicToOpenAI(body)
+	if err != nil {
+		return nil, &upstreamError{Err: err}
+	}
+	return io.NopCloser(bytes.NewReader(converted)), nil
 }
 
 // streamResponse 边读边转发 SSE 流。

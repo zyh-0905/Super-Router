@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"smart-router/internal/protocol"
 	"smart-router/internal/store"
 
 	"go.uber.org/zap"
@@ -231,7 +232,7 @@ func (p *ProbeChecker) Run(ctx context.Context, globalDailyBudget float64) error
 
 func (p *ProbeChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	rows, err := p.db.Pool.Query(ctx, `
-		SELECT id, name, base_url, access_token, api_key, enabled, role,
+		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol,
 		       daily_probe_budget, balance_api_url, balance_api_token, timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms
 		FROM upstreams
 		WHERE enabled = true
@@ -245,7 +246,7 @@ func (p *ProbeChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	for rows.Next() {
 		var u Upstream
 		if err := rows.Scan(
-			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role,
+			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol,
 			&u.DailyProbeBudget, &u.BalanceAPIURL, &u.BalanceAPIToken, &u.TimeoutConnectMS, &u.TimeoutFirstByteMS, &u.TimeoutTotalMS,
 		); err != nil {
 			return nil, err
@@ -413,19 +414,43 @@ func (p *ProbeChecker) callChatCompletion(ctx context.Context, upstream Upstream
 		Stream:      false,
 	}
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, err
+	var body []byte
+	url := protocol.ChatEndpoint(upstream.BaseURL, upstream.Protocol)
+	if protocol.IsAnthropic(upstream.Protocol) {
+		// anthropic 协议站点：转协议后请求
+		raw, err := json.Marshal(reqBody)
+		if err != nil {
+			return nil, err
+		}
+		var openaiMap map[string]interface{}
+		if err := json.Unmarshal(raw, &openaiMap); err != nil {
+			return nil, err
+		}
+		body, err = json.Marshal(protocol.OpenAIToAnthropic(openaiMap))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		body, err = json.Marshal(reqBody)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	url := fmt.Sprintf("%s/v1/chat/completions", upstream.BaseURL)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+	if protocol.IsAnthropic(upstream.Protocol) {
+		for k, v := range protocol.AnthropicHeaders(upstream.APIKey) {
+			req.Header.Set(k, v)
+		}
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+	}
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -435,6 +460,23 @@ func (p *ProbeChecker) callChatCompletion(ctx context.Context, upstream Upstream
 
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	if protocol.IsAnthropic(upstream.Protocol) {
+		var ar struct {
+			Usage struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
+			return nil, err
+		}
+		return &Usage{
+			PromptTokens:     ar.Usage.InputTokens,
+			CompletionTokens: ar.Usage.OutputTokens,
+			TotalTokens:      ar.Usage.InputTokens + ar.Usage.OutputTokens,
+		}, nil
 	}
 
 	var chatResp ChatCompletionResponse

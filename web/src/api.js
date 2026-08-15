@@ -109,7 +109,7 @@ export const api = {
   updateRatioGroup: (id, gid, p) => api.patch(`/admin/channels/${id}/ratio-groups/${gid}`, p),
   deleteRatioGroup: (id, gid) => api.del(`/admin/channels/${id}/ratio-groups/${gid}`),
   probeRatioGroup: (id, gid) => api.post(`/admin/channels/${id}/ratio-groups/${gid}/probe`, {}),
-  probeUpstreamModels: (base_url, api_key) => api.post('/admin/upstream/models', { base_url, api_key }),
+  probeUpstreamModels: (base_url, api_key, protocol) => api.post('/admin/upstream/models', { base_url, api_key, protocol }),
   getSettings: () => api.get('/admin/settings'),
   updateSettings: (p) => api.patch('/admin/settings', p),
 

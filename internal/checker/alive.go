@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"smart-router/internal/protocol"
 	"smart-router/internal/store"
 
 	"go.uber.org/zap"
@@ -21,6 +22,7 @@ type Upstream struct {
 	APIKey             string
 	Enabled            bool
 	Role               string
+	Protocol           string // openai（默认）| anthropic
 	DailyProbeBudget   float64
 	BalanceAPIURL      string
 	BalanceAPIToken    string
@@ -82,7 +84,7 @@ func (a *AliveChecker) Run(ctx context.Context) error {
 
 func (a *AliveChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	rows, err := a.db.Pool.Query(ctx, `
-		SELECT id, name, base_url, access_token, api_key, enabled, role,
+		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol,
 		       daily_probe_budget, balance_api_url, balance_api_token, timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms
 		FROM upstreams
 		WHERE enabled = true
@@ -96,7 +98,7 @@ func (a *AliveChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	for rows.Next() {
 		var u Upstream
 		if err := rows.Scan(
-			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role,
+			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol,
 			&u.DailyProbeBudget, &u.BalanceAPIURL, &u.BalanceAPIToken, &u.TimeoutConnectMS, &u.TimeoutFirstByteMS, &u.TimeoutTotalMS,
 		); err != nil {
 			return nil, err
@@ -118,14 +120,18 @@ func (a *AliveChecker) checkOne(ctx context.Context, upstream Upstream, epoch in
 	var latencyMS int
 
 	// 尝试 GET /v1/models
-	url := fmt.Sprintf("%s/v1/models", upstream.BaseURL)
+	url := protocol.ModelsEndpoint(upstream.BaseURL)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 
-	// 设置认证头
-	if upstream.APIKey != "" {
+	// 设置认证头（anthropic 用 x-api-key）
+	if protocol.IsAnthropic(upstream.Protocol) {
+		for k, v := range protocol.AnthropicHeaders(upstream.APIKey) {
+			req.Header.Set(k, v)
+		}
+	} else if upstream.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 	}
 

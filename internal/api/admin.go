@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"smart-router/internal/config"
+	"smart-router/internal/protocol"
 	"smart-router/internal/router"
 	"smart-router/internal/store"
 
@@ -35,6 +36,7 @@ type channelUpdateRequest struct {
 	BaseURL          *string           `json:"base_url"`
 	AccessToken      *string           `json:"access_token"`
 	APIKey           *string           `json:"api_key"`
+	Protocol         *string           `json:"protocol"`
 	Enabled          *bool             `json:"enabled"`
 	Role             *string           `json:"role"`
 	UserPriority     *int              `json:"user_priority"`
@@ -82,6 +84,7 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 		BaseURL          string            `json:"base_url" binding:"required"`
 		AccessToken      string            `json:"access_token" binding:"required"`
 		APIKey           string            `json:"api_key" binding:"required"`
+		Protocol         string            `json:"protocol"`
 		Role             string            `json:"role"`
 		UserPriority     int               `json:"user_priority"`
 		Weight           int               `json:"weight"`
@@ -100,6 +103,13 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 	}
 
 	// 默认值
+	if req.Protocol == "" {
+		req.Protocol = protocol.ProtocolOpenAI
+	}
+	if !protocol.ValidProtocol(req.Protocol) {
+		c.JSON(400, gin.H{"error": "protocol must be 'openai' or 'anthropic'"})
+		return
+	}
 	if req.Role == "" {
 		req.Role = "primary"
 	}
@@ -119,10 +129,10 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 
 	var id int
 	err := h.db.Pool.QueryRow(ctx, `
-		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, user_priority, weight, model_mapping, capabilities, daily_probe_budget, ratio_limit, balance_api_url, balance_api_token)
-		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, protocol, user_priority, weight, model_mapping, capabilities, daily_probe_budget, ratio_limit, balance_api_url, balance_api_token)
+		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id
-	`, req.Name, req.BaseURL, req.AccessToken, req.APIKey, req.Role, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, req.BalanceAPIToken).Scan(&id)
+	`, req.Name, req.BaseURL, req.AccessToken, req.APIKey, req.Role, req.Protocol, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, req.BalanceAPIToken).Scan(&id)
 
 	if err != nil {
 		h.logger.Error("Failed to create channel", zap.Error(err))
@@ -216,7 +226,7 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 	ctx := context.Background()
 
 	rows, err := h.db.Pool.Query(ctx, `
-		SELECT id, name, base_url, enabled, role, user_priority, weight,
+		SELECT id, name, base_url, enabled, role, protocol, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
 		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at
 		FROM upstreams
@@ -233,14 +243,14 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 	channels := []map[string]interface{}{}
 	for rows.Next() {
 		var id, userPriority, weight int
-		var name, baseURL, role string
+		var name, baseURL, role, proto string
 		var enabled bool
 		var dailyProbeBudget, ratioLimit float64
 		var modelMappingJSON, capabilitiesJSON string
 		var balanceAPIURL, balanceAPIToken string
 		var createdAt time.Time
 
-		if err := rows.Scan(&id, &name, &baseURL, &enabled, &role, &userPriority, &weight,
+		if err := rows.Scan(&id, &name, &baseURL, &enabled, &role, &proto, &userPriority, &weight,
 			&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt); err != nil {
 			h.logger.Warn("Failed to scan channel row", zap.Error(err))
 			continue
@@ -262,6 +272,7 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 			"base_url":           baseURL,
 			"enabled":            enabled,
 			"role":               role,
+			"protocol":           proto,
 			"user_priority":      userPriority,
 			"weight":             weight,
 			"model_mapping":      modelMapping,
@@ -287,7 +298,7 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 
 	var (
 		channelID, userPriority, weight    int
-		name, baseURL, role                string
+		name, baseURL, role, proto         string
 		enabled                            bool
 		dailyProbeBudget, ratioLimit       float64
 		modelMappingJSON, capabilitiesJSON string
@@ -296,11 +307,11 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 	)
 
 	err := h.db.Pool.QueryRow(ctx, `
-		SELECT id, name, base_url, enabled, role, user_priority, weight,
+		SELECT id, name, base_url, enabled, role, protocol, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
 		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at
 		FROM upstreams WHERE id = $1
-	`, id).Scan(&channelID, &name, &baseURL, &enabled, &role, &userPriority, &weight,
+	`, id).Scan(&channelID, &name, &baseURL, &enabled, &role, &proto, &userPriority, &weight,
 		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt)
 
 	if err != nil {
@@ -319,6 +330,7 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		"base_url":           baseURL,
 		"enabled":            enabled,
 		"role":               role,
+		"protocol":           proto,
 		"user_priority":      userPriority,
 		"weight":             weight,
 		"model_mapping":      modelMapping,
@@ -370,6 +382,14 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 	if req.APIKey != nil {
 		updates = append(updates, "api_key = $"+strconv.Itoa(len(args)+1))
 		args = append(args, *req.APIKey)
+	}
+	if req.Protocol != nil {
+		if !protocol.ValidProtocol(*req.Protocol) {
+			c.JSON(400, gin.H{"error": "protocol must be 'openai' or 'anthropic'"})
+			return
+		}
+		updates = append(updates, "protocol = $"+strconv.Itoa(len(args)+1))
+		args = append(args, *req.Protocol)
 	}
 	if req.Enabled != nil {
 		updates = append(updates, "enabled = $"+strconv.Itoa(len(args)+1))
@@ -601,19 +621,24 @@ type UpstreamModel struct {
 }
 
 // fetchUpstreamModels 调用上游 GET /v1/models 并解析模型列表
-// 兼容 OpenAI / OneAPI 等格式：{data:[...]} 或 {models:[...]}
-func fetchUpstreamModels(baseURL, apiKey string) ([]UpstreamModel, error) {
+// 兼容 OpenAI / OneAPI 等格式：{data:[...]} 或 {models:[...]}；
+// anthropic 协议站点使用 x-api-key + anthropic-version 头。
+func fetchUpstreamModels(baseURL, apiKey, proto string) ([]UpstreamModel, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("base_url is empty")
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("GET", baseURL+"/v1/models", nil)
+	req, err := http.NewRequest("GET", protocol.ModelsEndpoint(baseURL), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	if apiKey != "" {
+	if protocol.IsAnthropic(proto) {
+		for k, v := range protocol.AnthropicHeaders(apiKey) {
+			req.Header.Set(k, v)
+		}
+	} else if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
@@ -659,10 +684,10 @@ func (h *AdminHandler) GetUpstreamModels(c *gin.Context) {
 	id := c.Param("id")
 	ctx := context.Background()
 
-	var baseURL, accessToken, apiKey string
+	var baseURL, accessToken, apiKey, proto string
 	err := h.db.Pool.QueryRow(ctx, `
-		SELECT base_url, access_token, api_key FROM upstreams WHERE id = $1
-	`, id).Scan(&baseURL, &accessToken, &apiKey)
+		SELECT base_url, access_token, api_key, protocol FROM upstreams WHERE id = $1
+	`, id).Scan(&baseURL, &accessToken, &apiKey, &proto)
 	if err != nil {
 		c.JSON(404, gin.H{"error": "channel not found"})
 		return
@@ -674,7 +699,7 @@ func (h *AdminHandler) GetUpstreamModels(c *gin.Context) {
 		key = accessToken
 	}
 
-	models, err := fetchUpstreamModels(baseURL, key)
+	models, err := fetchUpstreamModels(baseURL, key, proto)
 	if err != nil {
 		c.JSON(502, gin.H{"error": err.Error()})
 		return
@@ -693,9 +718,17 @@ func (h *AdminHandler) ProbeUpstreamModels(c *gin.Context) {
 		BaseURL     string `json:"base_url" binding:"required"`
 		APIKey      string `json:"api_key"`
 		AccessToken string `json:"access_token"`
+		Protocol    string `json:"protocol"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Protocol == "" {
+		req.Protocol = protocol.ProtocolOpenAI
+	}
+	if !protocol.ValidProtocol(req.Protocol) {
+		c.JSON(400, gin.H{"error": "protocol must be 'openai' or 'anthropic'"})
 		return
 	}
 
@@ -704,7 +737,7 @@ func (h *AdminHandler) ProbeUpstreamModels(c *gin.Context) {
 		key = req.AccessToken
 	}
 
-	models, err := fetchUpstreamModels(req.BaseURL, key)
+	models, err := fetchUpstreamModels(req.BaseURL, key, req.Protocol)
 	if err != nil {
 		c.JSON(502, gin.H{"error": err.Error()})
 		return

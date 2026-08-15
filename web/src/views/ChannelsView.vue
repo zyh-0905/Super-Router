@@ -119,6 +119,7 @@ async function deleteGroup(g) {
 function emptyForm() {
   return {
     name: '', base_url: '', access_token: '', api_key: '',
+    protocol: 'openai',
     role: 'primary', user_priority: 100, weight: 1,
     daily_probe_budget: 1.0,
     balance_api_url: '',
@@ -464,6 +465,7 @@ function openEdit(ch) {
   editing.value = ch
   form.value = {
     name: ch.name, base_url: ch.base_url, access_token: '', api_key: '',
+    protocol: ch.protocol || 'openai',
     role: ch.role, user_priority: ch.user_priority, weight: ch.weight || 1,
     daily_probe_budget: ch.daily_probe_budget || 0,
     balance_api_url: ch.balance_api_url || '',
@@ -501,6 +503,7 @@ async function save() {
     form.value.model_pairs.filter(p => p.from).forEach(p => { mm[p.from] = p.to || p.from })
     const payload = {
       name: form.value.name, base_url: form.value.base_url,
+      protocol: form.value.protocol || 'openai',
       role: form.value.role, user_priority: form.value.user_priority, weight: form.value.weight,
       daily_probe_budget: form.value.daily_probe_budget, model_mapping: mm, capabilities: form.value.capabilities,
       balance_api_url: form.value.balance_api_url || '',
@@ -525,9 +528,11 @@ async function testConn() {
   testing.value = true
   testResult.value = null
   try {
-    const resp = await fetch(form.value.base_url.replace(/\/+$/, '') + '/v1/models', {
-      headers: { Authorization: `Bearer ${form.value.api_key}` },
-    })
+    const isAnthropic = form.value.protocol === 'anthropic'
+    const headers = isAnthropic
+      ? { 'x-api-key': form.value.api_key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
+      : { Authorization: `Bearer ${form.value.api_key}` }
+    const resp = await fetch(form.value.base_url.replace(/\/+$/, '') + '/v1/models', { headers })
     if (resp.ok) testResult.value = { ok: true, msg: '上游连接成功' }
     else testResult.value = { ok: false, msg: `HTTP ${resp.status}` }
   } catch (e) {
@@ -549,7 +554,7 @@ async function fetchUpstreamModels() {
     } else {
       // 表单模式：用表单里的地址与凭据经后端探测（避免浏览器 CORS 限制）
       if (!form.value.base_url) { modelsError.value = '请先填写 Base URL'; return }
-      const r = await api.probeUpstreamModels(form.value.base_url, form.value.api_key)
+      const r = await api.probeUpstreamModels(form.value.base_url, form.value.api_key, form.value.protocol || 'openai')
       list = r.models || []
     }
     upstreamModels.value = list
@@ -672,6 +677,7 @@ onMounted(() => { load(); loadGroups() })
           <div class="row gap-2">
             <span :class="dotClass(ch)" />
             <span class="grow truncate" style="font-size:14px;font-weight:600">{{ ch.name }}</span>
+            <span v-if="ch.protocol === 'anthropic'" class="badge badge-purple" title="Claude 原生协议，网关自动转换">anthropic</span>
             <span class="badge" :class="roleBadge(ch.role)">{{ ch.role }}</span>
           </div>
           <div class="row gap-2 mt-1">
@@ -702,6 +708,7 @@ onMounted(() => { load(); loadGroups() })
             <div class="row gap-2">
               <span :class="dotClass(selected)" />
               <span style="font-size:17px;font-weight:700">{{ selected.name }}</span>
+              <span v-if="selected.protocol === 'anthropic'" class="badge badge-purple">anthropic</span>
               <span class="badge" :class="roleBadge(selected.role)">{{ selected.role }}</span>
             </div>
             <div class="row gap-2">
@@ -724,6 +731,8 @@ onMounted(() => { load(); loadGroups() })
             <div v-if="detailTab === 'info'">
               <div class="field"><label class="field-label">Base URL</label><div class="code">{{ selected.base_url }}</div></div>
               <div class="form-grid-2">
+                <div class="field"><label class="field-label">接口协议</label><div class="code">{{ selected.protocol === 'anthropic' ? 'anthropic · Claude 原生' : 'openai · OpenAI 兼容' }}</div></div>
+                <div class="field"><label class="field-label">聊天端点</label><div class="code">{{ (selected.base_url || '').replace(/\/+$/, '') + (selected.protocol === 'anthropic' ? '/v1/messages' : '/v1/chat/completions') }}</div></div>
                 <div class="field"><label class="field-label">用户优先级</label><div class="code">{{ selected.user_priority }}</div></div>
                 <div class="field"><label class="field-label">权重</label><div class="code">{{ selected.weight || 1 }}</div></div>
                 <div class="field"><label class="field-label">每日探针预算</label><div class="code">${{ selected.daily_probe_budget || 0 }}</div></div>
@@ -1022,6 +1031,20 @@ onMounted(() => { load(); loadGroups() })
     <BaseModal v-if="showModal" :title="editing ? '编辑站点' : '添加站点'" width="560px" @close="showModal = false">
       <div class="field"><label class="field-label">站点名称 *</label><input v-model="form.name" class="input" placeholder="channel-primary-01"></div>
       <div class="field"><label class="field-label">Base URL *</label><input v-model="form.base_url" class="input mono" placeholder="https://api.example-relay.com"></div>
+      <div class="form-grid-2">
+        <div class="field">
+          <label class="field-label">接口协议</label>
+          <select v-model="form.protocol" class="select">
+            <option value="openai">openai · OpenAI 兼容</option>
+            <option value="anthropic">anthropic · Claude 原生</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="field-label">聊天端点（自动推导）</label>
+          <div class="code" style="margin-top:6px">{{ form.base_url ? form.base_url.replace(/\/+$/, '') + (form.protocol === 'anthropic' ? '/v1/messages' : '/v1/chat/completions') : '—' }}</div>
+        </div>
+      </div>
+      <div class="field-hint" style="margin-top:-8px;margin-bottom:8px">anthropic 协议站点使用 x-api-key 认证，网关会自动完成 OpenAI↔Anthropic 请求/响应/流式转换；余额探测与健康检查不受影响。</div>
       <div class="form-grid-2">
         <div class="field"><label class="field-label">Access Token {{ editing ? '' : '*' }}</label><input v-model="form.access_token" type="password" class="input mono" :placeholder="editing ? '留空则保持不变' : 'Bearer sk-…'"></div>
         <div class="field"><label class="field-label">API Key {{ editing ? '' : '*' }}</label><input v-model="form.api_key" type="password" class="input mono" :placeholder="editing ? '留空则保持不变' : 'sk-…'"></div>
