@@ -3,7 +3,8 @@
 // ============================================================
 import { reactive, computed } from 'vue'
 
-const savedKey = localStorage.getItem('sr_apikey') || ''
+// 本地开发默认 Key（仅前端预填；服务端是否自动创建由 bootstrap_default_keys 控制）
+const savedKey = localStorage.getItem('sr_apikey') || 'test-admin-key'
 const savedBase = (localStorage.getItem('sr_baseurl') || '').replace(/\/+$/, '')
 const savedTheme = localStorage.getItem('sr_theme') || 'auto' // 'auto' | 'light' | 'dark'
 const savedDefaultModel = localStorage.getItem('sr_default_model') || '' // 测试台默认模型
