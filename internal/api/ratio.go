@@ -525,7 +525,11 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		var msg string
 		switch res.Stage {
 		case "balance_before", "balance_after":
-			msg = "无法读取该站点的余额（可能未开放 /api/user/self 或 Access Token 无效），无法实测倍率"
+			if res.Error != "" {
+				msg = "无法读取该站点的余额：" + res.Error
+			} else {
+				msg = "无法读取该站点的余额（可能未开放 /api/user/self 或 Access Token 无效），无法实测倍率"
+			}
 		case "chat":
 			msg = "推理请求失败：" + res.Error
 		default:

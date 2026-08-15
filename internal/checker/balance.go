@@ -155,6 +155,21 @@ func (b *BalanceChecker) fetchGeneric(ctx context.Context, url, credential strin
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			if b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096)); len(b) > 0 {
+				var em struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				}
+				if json.Unmarshal(b, &em) == nil && (em.Code != "" || em.Message != "") {
+					msg := em.Message
+					if msg == "" {
+						msg = em.Code
+					}
+					return 0, "", fmt.Errorf("HTTP %d %s（令牌已过期或无权限，请更新站点「余额接口令牌」，建议使用控制台生成的长期有效系统访问令牌）", resp.StatusCode, msg)
+				}
+			}
+		}
 		return 0, "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
@@ -262,6 +277,21 @@ func (b *BalanceChecker) fetchOneAPI(ctx context.Context, baseURL, accessToken s
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			if bb, _ := io.ReadAll(io.LimitReader(resp.Body, 4096)); len(bb) > 0 {
+				var em struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				}
+				if json.Unmarshal(bb, &em) == nil && (em.Code != "" || em.Message != "") {
+					msg := em.Message
+					if msg == "" {
+						msg = em.Code
+					}
+					return 0, fmt.Errorf("HTTP %d %s（令牌已过期或无权限，请更新站点凭证）", resp.StatusCode, msg)
+				}
+			}
+		}
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
