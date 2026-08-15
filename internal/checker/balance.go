@@ -145,32 +145,45 @@ func (b *BalanceChecker) fetchGeneric(ctx context.Context, url, credential strin
 		return 0, "", fmt.Errorf("非 JSON 响应")
 	}
 
-	// 1. one-api 格式：data.quota / data.balance / data.remain_quota
+	// 1. one-api 格式：data.quota / data.remain_quota（quota 单位）/ data.balance（美元）
 	if data, ok := raw["data"].(map[string]interface{}); ok {
-		for _, k := range []string{"quota", "balance", "remain_quota"} {
+		for _, k := range []string{"quota", "remain_quota"} {
 			if v, ok := data[k]; ok {
+				if f, ok := toFloat(v); ok {
+					return quotaToUSD(f), "oneapi", nil
+				}
+			}
+		}
+		if v, ok := data["balance"]; ok {
+			if f, ok := toFloat(v); ok {
+				return f, "oneapi", nil
+			}
+		}
+		// 1b. new-api 登录/会话响应嵌套格式：data.user.quota
+		if user, ok := data["user"].(map[string]interface{}); ok {
+			for _, k := range []string{"quota", "remain_quota"} {
+				if v, ok := user[k]; ok {
+					if f, ok := toFloat(v); ok {
+						return quotaToUSD(f), "oneapi", nil
+					}
+				}
+			}
+			if v, ok := user["balance"]; ok {
 				if f, ok := toFloat(v); ok {
 					return f, "oneapi", nil
 				}
 			}
 		}
-		// 1b. new-api 登录/会话响应嵌套格式：data.user.quota
-		if user, ok := data["user"].(map[string]interface{}); ok {
-			for _, k := range []string{"quota", "balance", "remain_quota"} {
-				if v, ok := user[k]; ok {
-					if f, ok := toFloat(v); ok {
-						return f, "oneapi", nil
-					}
-				}
-			}
-		}
 	}
 	// 顶层 quota（无 data 包装）
-	for _, k := range []string{"quota", "balance"} {
-		if v, ok := raw[k]; ok {
-			if f, ok := toFloat(v); ok {
-				return f, "oneapi", nil
-			}
+	if v, ok := raw["quota"]; ok {
+		if f, ok := toFloat(v); ok {
+			return quotaToUSD(f), "oneapi", nil
+		}
+	}
+	if v, ok := raw["balance"]; ok {
+		if f, ok := toFloat(v); ok {
+			return f, "oneapi", nil
 		}
 	}
 	// 2. OpenAI 格式
@@ -181,6 +194,22 @@ func (b *BalanceChecker) fetchGeneric(ctx context.Context, url, credential strin
 	}
 
 	return 0, "", fmt.Errorf("响应中未找到余额字段")
+}
+
+// 单位换算：new-api 口径 1 美元 = 500,000 quota。
+// 部分部署直接返回美元数值，接口无法区分单位，因此采用启发式：
+// 数值高于阈值视为 quota 单位 → ÷500,000；低于阈值视为已是美元。
+// （个人中转账户的美元余额通常在 $0.1~$100，quota 数值通常在 25 万以上，阈值落在两者之间。）
+const (
+	quotaPerUSD         = 500000.0
+	quotaToUSDThreshold = 100000.0
+)
+
+func quotaToUSD(v float64) float64 {
+	if v > quotaToUSDThreshold {
+		return v / quotaPerUSD
+	}
+	return v
 }
 
 // toFloat 宽松数字转换（兼容字符串/数字）
@@ -230,7 +259,7 @@ func (b *BalanceChecker) fetchOneAPI(ctx context.Context, baseURL, accessToken s
 	if !parsed.Success {
 		return 0, fmt.Errorf("success=false")
 	}
-	return parsed.Data.Quota, nil
+	return quotaToUSD(parsed.Data.Quota), nil
 }
 
 // fetchOpenAI OpenAI 官方：/v1/dashboard/billing/credit_grants → total_available

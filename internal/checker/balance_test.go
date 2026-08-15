@@ -3,13 +3,14 @@ package checker
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
 func TestFetchGenericNestedUserQuota(t *testing.T) {
-	// new-api 登录/会话响应：余额在 data.user.quota
+	// new-api 登录/会话响应：余额在 data.user.quota（quota 单位，应换算为美元）
 	payload := map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
@@ -29,13 +30,14 @@ func TestFetchGenericNestedUserQuota(t *testing.T) {
 	if src != "oneapi" {
 		t.Fatalf("source = %q, want oneapi", src)
 	}
-	if bal != 4775054 {
-		t.Fatalf("balance = %v, want 4775054", bal)
+	// 4775054 / 500000 ≈ 9.55 美元
+	if bal < 9.5 || bal > 9.6 {
+		t.Fatalf("balance = %v, want about 9.55 (USD)", bal)
 	}
 }
 
 func TestFetchGenericStandardDataQuota(t *testing.T) {
-	// 标准 /api/user/self：data.quota 直接挂余额（回归保护）
+	// 标准 /api/user/self：data.quota 小数值视为已是美元（回归保护）
 	payload := map[string]interface{}{
 		"success": true,
 		"data":    map[string]interface{}{"quota": 123.45},
@@ -52,5 +54,24 @@ func TestFetchGenericStandardDataQuota(t *testing.T) {
 	}
 	if src != "oneapi" || bal != 123.45 {
 		t.Fatalf("got source=%q balance=%v, want oneapi/123.45", src, bal)
+	}
+}
+
+func TestQuotaToUSDHeuristic(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want float64
+	}{
+		{4775054, 9.550108},  // quota 单位 → ÷500000
+		{250000, 0.5},        // quota 单位
+		{5.53, 5.53},         // 已是美元（小数值不动）
+		{0.68, 0.68},         // 已是美元
+		{123.45, 123.45},     // 已是美元
+	}
+	for _, c := range cases {
+		got := quotaToUSD(c.in)
+		if math.Abs(got-c.want) > 0.0001 {
+			t.Errorf("quotaToUSD(%v) = %v, want %v", c.in, got, c.want)
+		}
 	}
 }
