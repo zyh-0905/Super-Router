@@ -186,6 +186,14 @@ func nullableFloat(v float64) interface{} {
 	return v
 }
 
+// orEmptyList 将 nil 切片归一为空切片（前端无空值守卫时不至于崩溃）
+func orEmptyList(v []map[string]interface{}) []map[string]interface{} {
+	if v == nil {
+		return []map[string]interface{}{}
+	}
+	return v
+}
+
 // GetRatio GET /admin/channels/:id/ratio - 声明倍率表 + 实测历史 + 各模型最新实测
 func (h *RatioHandler) GetRatio(c *gin.Context) {
 	channelID, err := strconv.Atoi(c.Param("id"))
@@ -1129,11 +1137,11 @@ func (h *RatioHandler) GetChannelMetrics(c *gin.Context) {
 			"ratio_limit":         b.limit,
 			"over_limit":          overLimit,
 			"default_probe_model": probeModel,
-			"ratios":              ratios,
+			"ratios":              orEmptyList(ratioMap[b.id]),
 			"balance_current":     balanceCurrent[b.id],
-			"balance_series":      balanceSeries[b.id],
+			"balance_series":      orEmptyList(balanceSeries[b.id]),
 			"hourly":              hourly,
-			"health":              healthMap[b.id],
+			"health":              orEmptyList(healthMap[b.id]),
 		})
 	}
 

@@ -350,7 +350,7 @@ onMounted(load)
           <div class="metric-grid">
             <div class="metric-cell">
               <div class="metric-title">倍率（各模型实测，悬停看详情）</div>
-              <BaseChart v-if="ch.ratios.length" :option="ratioBarOption(ch)" height="112px" />
+              <BaseChart v-if="(ch.ratios || []).length" :option="ratioBarOption(ch)" height="112px" />
               <div v-else class="text-3 metric-empty">暂无实测数据，点击「立即实测」</div>
             </div>
             <div class="metric-cell">
@@ -368,7 +368,7 @@ onMounted(load)
             </div>
             <div class="metric-cell metric-cell-full">
               <div class="metric-title">健康（最近 50 次存活探测，悬停看时间与延迟）</div>
-              <BaseChart v-if="ch.health.length" :option="healthBarOption(ch)" height="58px" />
+              <BaseChart v-if="(ch.health || []).length" :option="healthBarOption(ch)" height="58px" />
               <div v-else class="text-3 metric-empty">暂无存活探测记录</div>
             </div>
           </div>
