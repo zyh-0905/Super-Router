@@ -2,7 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api'
-import { store, toast, setDefaultModel } from '../store'
+import { store, toast } from '../store'
 import BaseModal from '../components/BaseModal.vue'
 import EmptyState from '../components/EmptyState.vue'
 import BaseChart from '../components/BaseChart.vue'
@@ -621,9 +621,13 @@ function mapAll() {
   else appendModelToForm(upstreamModels.value)
 }
 
-function setDefault(m) {
-  setDefaultModel(m.id)
-  toast(`「${m.id}」已设为测试台默认模型`, 'success')
+async function setDefault(m) {
+  if (!selected.value) return
+  try {
+    await api.updateChannel(selected.value.id, { test_model: m.id })
+    toast(`「${m.id}」已设为「${selected.value.name}」的默认测试模型`, 'success')
+    await load()
+  } catch { /* 已提示 */ }
 }
 
 async function toggleChannel(ch) {
@@ -1187,10 +1191,10 @@ onMounted(() => { load(); loadGroups() })
           <span class="mono text-3" style="width:22px;font-size:11px">{{ i + 1 }}</span>
           <span class="grow mono truncate" style="font-size:13px" :title="m.id">
             {{ m.id }}
-            <span v-if="store.defaultModel === m.id" class="badge badge-blue" style="margin-left:6px;font-size:9.5px">默认测试模型</span>
+            <span v-if="modelsSource === 'detail' && selected?.test_model === m.id" class="badge badge-blue" style="margin-left:6px;font-size:9.5px">该站点默认测试模型</span>
           </span>
           <span v-if="m.object" class="badge badge-gray">{{ m.object }}</span>
-          <button class="btn btn-ghost btn-sm" :class="{ 'btn-primary': store.defaultModel === m.id }" @click="setDefault(m)" :title="'设为测试台默认模型'">
+          <button v-if="modelsSource === 'detail'" class="btn btn-ghost btn-sm" :class="{ 'btn-primary': selected?.test_model === m.id }" @click="setDefault(m)" :title="`设为「${selected?.name}」的默认测试模型`">
             <Icon name="beaker" :size="12" />默认
           </button>
           <button class="btn btn-ghost btn-sm" @click="mapOne(m)">

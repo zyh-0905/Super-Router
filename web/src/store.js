@@ -7,7 +7,6 @@ import { reactive, computed } from 'vue'
 const savedKey = localStorage.getItem('sr_apikey') || 'test-admin-key'
 const savedBase = (localStorage.getItem('sr_baseurl') || '').replace(/\/+$/, '')
 const savedTheme = localStorage.getItem('sr_theme') || 'auto' // 'auto' | 'light' | 'dark'
-const savedDefaultModel = localStorage.getItem('sr_default_model') || '' // 测试台默认模型
 
 export const store = reactive({
   // 连接配置
@@ -30,9 +29,6 @@ export const store = reactive({
 
   // 全局分组筛选器（null = 全部），各页面共享
   currentGroup: null,
-
-  // 测试台默认模型（用户自定义，来自上游模型列表）
-  defaultModel: savedDefaultModel,
 
   // Toast 队列
   toasts: [],
@@ -67,11 +63,6 @@ export function cycleTheme() {
 export function saveConnection() {
   localStorage.setItem('sr_apikey', store.apiKey)
   localStorage.setItem('sr_baseurl', store.baseURL)
-}
-
-export function setDefaultModel(model) {
-  store.defaultModel = model || ''
-  localStorage.setItem('sr_default_model', store.defaultModel)
 }
 
 let toastId = 0

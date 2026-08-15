@@ -10,7 +10,7 @@ import { fmtMs } from '../utils'
 const router = useRouter()
 
 const req = ref({
-  model: store.defaultModel || 'gpt-4o',
+  model: '',
   stream: false,
   group: '', // 分组名（空 = 不限定）
   max_tokens: 1024,
@@ -19,13 +19,32 @@ const req = ref({
 })
 
 const groups = ref([])
+const channels = ref([])
+const selChannelId = ref(null)
 
 async function loadGroups() {
   try { groups.value = (await api.listGroups()).groups || [] } catch { /* 忽略 */ }
 }
-onMounted(loadGroups)
+
+async function loadChannels() {
+  try { channels.value = (await api.listChannels()).channels || [] } catch { /* 忽略 */ }
+}
+onMounted(() => { loadGroups(); loadChannels() })
 
 const knownModels = ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku']
+
+// 选中站点后：预填该站点的默认测试模型，模型输入的下拉提示切换为该站点已映射模型
+const modelSuggestions = computed(() => {
+  const ch = channels.value.find(c => c.id === selChannelId.value)
+  return ch ? Object.keys(ch.model_mapping || {}) : knownModels
+})
+
+function onChannelChange() {
+  const ch = channels.value.find(c => c.id === selChannelId.value)
+  if (!ch) return
+  const mapped = Object.keys(ch.model_mapping || {})
+  req.value.model = ch.test_model || mapped[0] || ''
+}
 
 const loading = ref(false)
 const streamText = ref('')
@@ -145,11 +164,11 @@ function reset() {
         <div class="play-body">
           <div class="form-grid-2">
             <div class="field">
-              <label class="field-label">模型</label>
-              <input v-model="req.model" class="input mono" list="known-models" placeholder="gpt-4o">
-              <datalist id="known-models">
-                <option v-for="m in knownModels" :key="m" :value="m" />
-              </datalist>
+              <label class="field-label">站点（自动预填该站点默认测试模型）</label>
+              <select v-model="selChannelId" class="select" @change="onChannelChange">
+                <option :value="null">不选择（手动填写模型）</option>
+                <option v-for="ch in channels" :key="ch.id" :value="ch.id">{{ ch.name }}</option>
+              </select>
             </div>
             <div class="field">
               <label class="field-label">分组（限定路由范围）</label>
@@ -158,6 +177,14 @@ function reset() {
                 <option v-for="g in groups" :key="g.id" :value="g.name">{{ g.name }}（{{ g.channel_count }} 站点）</option>
               </select>
             </div>
+          </div>
+
+          <div class="field">
+            <label class="field-label">模型</label>
+            <input v-model="req.model" class="input mono" list="known-models" :placeholder="selChannelId ? '选择站点后自动预填' : '如 gpt-4o / claude-sonnet-5'">
+            <datalist id="known-models">
+              <option v-for="m in modelSuggestions" :key="m" :value="m" />
+            </datalist>
           </div>
 
           <div class="field">

@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { api } from '../api'
-import { store, toast, saveConnection, setTheme, setDefaultModel } from '../store'
+import { store, toast, saveConnection, setTheme } from '../store'
 import BaseModal from '../components/BaseModal.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Icon from '../components/Icon.vue'
@@ -117,35 +117,27 @@ async function saveBinding() {
   finally { savingBinding.value = false }
 }
 
-// ===== 测试台默认模型 =====
+// ===== 测试台默认模型（每个站点专属） =====
 const channels = ref([])
-const modelSiteId = ref(null)
-const modelList = ref([])
-const modelLoading = ref(false)
-const modelError = ref(null)
-const defaultModelDraft = ref(store.defaultModel)
+const testModelDrafts = ref({}) // channelId -> 模型名草稿
+const savingTestModel = ref(null)
 
 async function loadChannels() {
-  try { channels.value = (await api.listChannels()).channels || [] } catch { /* 已提示 */ }
-}
-
-async function fetchModels() {
-  if (!modelSiteId.value) { modelError.value = '请先选择站点'; return }
-  modelLoading.value = true
-  modelError.value = null
-  modelList.value = []
   try {
-    const r = await api.channelModels(modelSiteId.value)
-    modelList.value = r.models || []
-    if (!modelList.value.length) modelError.value = '上游未返回任何模型'
-  } catch (e) {
-    modelError.value = e.message
-  } finally { modelLoading.value = false }
+    channels.value = (await api.listChannels()).channels || []
+    const drafts = {}
+    channels.value.forEach(ch => { drafts[ch.id] = ch.test_model || '' })
+    testModelDrafts.value = drafts
+  } catch { /* 已提示 */ }
 }
 
-function saveDefaultModel() {
-  setDefaultModel(defaultModelDraft.value)
-  toast('默认测试模型已保存', 'success')
+async function saveChannelTestModel(ch) {
+  savingTestModel.value = ch.id
+  try {
+    await api.updateChannel(ch.id, { test_model: (testModelDrafts.value[ch.id] || '').trim() })
+    toast(`「${ch.name}」的默认测试模型已保存`, 'success')
+  } catch { /* 已提示 */ }
+  finally { savingTestModel.value = null }
 }
 
 // ===== 告警设置 =====
@@ -368,35 +360,31 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
       <!-- 测试台设置 -->
       <div class="card card-pad" style="grid-column:1/-1">
         <div class="set-title">请求测试台设置</div>
-        <p class="set-desc">设置测试台的默认请求模型：从任意站点的上游模型列表中选择，测试台打开时自动预填。</p>
-        <div class="row gap-2" style="flex-wrap:wrap;align-items:flex-start">
-          <div class="field" style="margin-bottom:0;min-width:180px">
-            <label class="field-label">站点</label>
-            <select v-model="modelSiteId" class="select" @change="modelList = []; modelError = null">
-              <option :value="null" disabled>选择站点…</option>
-              <option v-for="ch in channels" :key="ch.id" :value="ch.id">{{ ch.name }}</option>
-            </select>
-          </div>
-          <div class="field" style="margin-bottom:0;min-width:180px">
-            <label class="field-label">默认测试模型</label>
-            <select v-model="defaultModelDraft" class="select mono" :disabled="!modelList.length">
-              <option value="" disabled>{{ modelList.length ? '选择模型…' : '请先获取上游模型' }}</option>
-              <option v-for="m in modelList" :key="m.id" :value="m.id">{{ m.id }}</option>
-            </select>
-          </div>
-          <div class="row gap-2" style="padding-top:22px">
-            <button class="btn btn-ghost" @click="fetchModels" :disabled="modelLoading || !modelSiteId">
-              <Icon name="download" :size="14" />{{ modelLoading ? '获取中…' : '获取上游模型' }}
-            </button>
-            <button class="btn btn-primary" @click="saveDefaultModel" :disabled="!defaultModelDraft">保存</button>
-          </div>
-        </div>
-        <div class="row gap-2 mt-2">
-          <span class="text-3" style="font-size:12px">当前默认：</span>
-          <span v-if="store.defaultModel" class="badge badge-blue">{{ store.defaultModel }}</span>
-          <span v-else class="text-3" style="font-size:12px">未设置（测试台默认 gpt-4o）</span>
-          <span v-if="modelError" class="text-red" style="font-size:12px">{{ modelError }}</span>
-          <span v-else-if="modelList.length" class="text-3" style="font-size:12px">已获取 {{ modelList.length }} 个模型</span>
+        <p class="set-desc">每个中转站站点都有专属的默认测试模型：在测试台选择站点后自动预填该模型，也可从该站点已映射的模型中任选。留空则回退到该站点模型映射的第一个模型。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th style="width:180px">站点</th><th>默认测试模型</th><th style="width:90px"></th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="ch in channels" :key="ch.id">
+                <td><span class="badge badge-teal">{{ ch.name }}</span></td>
+                <td>
+                  <input v-model="testModelDrafts[ch.id]" class="input mono" :list="'tm-' + ch.id"
+                    :placeholder="(ch.model_mapping && Object.keys(ch.model_mapping)[0]) || '如 gpt-4o'">
+                  <datalist :id="'tm-' + ch.id">
+                    <option v-for="m in Object.keys(ch.model_mapping || {})" :key="m" :value="m" />
+                  </datalist>
+                </td>
+                <td>
+                  <button class="btn btn-ghost btn-sm" @click="saveChannelTestModel(ch)" :disabled="savingTestModel === ch.id">
+                    {{ savingTestModel === ch.id ? '保存中…' : '保存' }}
+                  </button>
+                </td>
+              </tr>
+              <tr v-if="!channels.length"><td colspan="3" class="text-3" style="padding:14px">暂无站点，请先在「站点」页添加</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
 

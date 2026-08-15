@@ -38,6 +38,7 @@ type channelUpdateRequest struct {
 	APIKey           *string           `json:"api_key"`
 	Protocol         *string           `json:"protocol"`
 	RelayType        *string           `json:"relay_type"`
+	TestModel        *string           `json:"test_model"`
 	Enabled          *bool             `json:"enabled"`
 	Role             *string           `json:"role"`
 	UserPriority     *int              `json:"user_priority"`
@@ -87,6 +88,7 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 		APIKey           string            `json:"api_key" binding:"required"`
 		Protocol         string            `json:"protocol"`
 		RelayType        string            `json:"relay_type"`
+		TestModel        string            `json:"test_model"`
 		Role             string            `json:"role"`
 		UserPriority     int               `json:"user_priority"`
 		Weight           int               `json:"weight"`
@@ -138,10 +140,10 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 
 	var id int
 	err := h.db.Pool.QueryRow(ctx, `
-		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, protocol, relay_type, user_priority, weight, model_mapping, capabilities, daily_probe_budget, ratio_limit, balance_api_url, balance_api_token)
-		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, protocol, relay_type, test_model, user_priority, weight, model_mapping, capabilities, daily_probe_budget, ratio_limit, balance_api_url, balance_api_token)
+		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING id
-	`, req.Name, req.BaseURL, req.AccessToken, req.APIKey, req.Role, req.Protocol, req.RelayType, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, req.BalanceAPIToken).Scan(&id)
+	`, req.Name, req.BaseURL, req.AccessToken, req.APIKey, req.Role, req.Protocol, req.RelayType, req.TestModel, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, req.BalanceAPIToken).Scan(&id)
 
 	if err != nil {
 		h.logger.Error("Failed to create channel", zap.Error(err))
@@ -235,7 +237,7 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 	ctx := context.Background()
 
 	rows, err := h.db.Pool.Query(ctx, `
-		SELECT id, name, base_url, enabled, role, protocol, relay_type, user_priority, weight,
+		SELECT id, name, base_url, enabled, role, protocol, relay_type, test_model, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
 		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at
 		FROM upstreams
@@ -252,14 +254,14 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 	channels := []map[string]interface{}{}
 	for rows.Next() {
 		var id, userPriority, weight int
-		var name, baseURL, role, proto, relayType string
+		var name, baseURL, role, proto, relayType, testModel string
 		var enabled bool
 		var dailyProbeBudget, ratioLimit float64
 		var modelMappingJSON, capabilitiesJSON string
 		var balanceAPIURL, balanceAPIToken string
 		var createdAt time.Time
 
-		if err := rows.Scan(&id, &name, &baseURL, &enabled, &role, &proto, &relayType, &userPriority, &weight,
+		if err := rows.Scan(&id, &name, &baseURL, &enabled, &role, &proto, &relayType, &testModel, &userPriority, &weight,
 			&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt); err != nil {
 			h.logger.Warn("Failed to scan channel row", zap.Error(err))
 			continue
@@ -283,6 +285,7 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 			"role":               role,
 			"protocol":           proto,
 			"relay_type":         relayType,
+			"test_model":         testModel,
 			"user_priority":      userPriority,
 			"weight":             weight,
 			"model_mapping":      modelMapping,
@@ -307,21 +310,22 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 	ctx := context.Background()
 
 	var (
-		channelID, userPriority, weight    int
-		name, baseURL, role, proto, relayType string
-		enabled                            bool
-		dailyProbeBudget, ratioLimit       float64
-		modelMappingJSON, capabilitiesJSON string
-		balanceAPIURL, balanceAPIToken     string
-		createdAt                          time.Time
+		channelID, userPriority, weight        int
+		name, baseURL, role, proto, relayType  string
+		testModel                              string
+		enabled                                bool
+		dailyProbeBudget, ratioLimit           float64
+		modelMappingJSON, capabilitiesJSON     string
+		balanceAPIURL, balanceAPIToken         string
+		createdAt                              time.Time
 	)
 
 	err := h.db.Pool.QueryRow(ctx, `
-		SELECT id, name, base_url, enabled, role, protocol, relay_type, user_priority, weight,
+		SELECT id, name, base_url, enabled, role, protocol, relay_type, test_model, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
 		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at
 		FROM upstreams WHERE id = $1
-	`, id).Scan(&channelID, &name, &baseURL, &enabled, &role, &proto, &relayType, &userPriority, &weight,
+	`, id).Scan(&channelID, &name, &baseURL, &enabled, &role, &proto, &relayType, &testModel, &userPriority, &weight,
 		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt)
 
 	if err != nil {
@@ -342,6 +346,7 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		"role":               role,
 		"protocol":           proto,
 		"relay_type":         relayType,
+		"test_model":         testModel,
 		"user_priority":      userPriority,
 		"weight":             weight,
 		"model_mapping":      modelMapping,
@@ -409,6 +414,10 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 		}
 		updates = append(updates, "relay_type = $"+strconv.Itoa(len(args)+1))
 		args = append(args, *req.RelayType)
+	}
+	if req.TestModel != nil {
+		updates = append(updates, "test_model = $"+strconv.Itoa(len(args)+1))
+		args = append(args, *req.TestModel)
 	}
 	if req.Enabled != nil {
 		updates = append(updates, "enabled = $"+strconv.Itoa(len(args)+1))
