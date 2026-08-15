@@ -33,6 +33,7 @@ const icons = {
   arrow_right: '<path d="M4 12h15M13 6l6 6-6 6"/>',
   chevron_right: '<path d="M9 5l7 7-7 7"/>',
   chevron_down: '<path d="M5 9l7 7 7-7"/>',
+  chevron_up: '<path d="M5 15l7-7 7 7"/>',
   clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/>',
   zap_off: '<path d="M9.5 4.5 13 2 4.5 13.5H11L10 22l4.5-7M4 3l17 17"/>',
   dot: '<circle cx="12" cy="12" r="4"/>',

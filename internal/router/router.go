@@ -57,6 +57,7 @@ type RouteResult struct {
 	SelectedChannel  *ChannelHealth
 	AllScores        map[int]float64
 	CandidateOrder   []int
+	Candidates       map[int]*ChannelHealth // 通过硬过滤的候选渠道（按 ID 索引，供代理层故障切换）
 	Excluded         []Exclusion
 	DecisionReason   string
 	Strategy         string
@@ -65,6 +66,12 @@ type RouteResult struct {
 	SnapshotChecksum string
 	GroupID          *int
 	GroupName        string
+	// 有效策略的执行参数（已应用默认值）
+	MaxAttempts        int
+	TotalBudgetMS      int
+	HalfOpenProbeCount int
+	// 候选六维评分（雷达图数据）
+	CandidateDetails []CandidateDetail
 }
 
 // Router 路由决策器
@@ -80,6 +87,11 @@ func NewRouter(db *store.DB, redis *store.RedisClient) *Router {
 		redis:        redis,
 		policyLoader: NewPolicyLoader(db),
 	}
+}
+
+// SetPolicyDefaults 注入系统级策略默认值（来自配置文件，DB 无策略记录时兜底）
+func (r *Router) SetPolicyDefaults(d PolicyDefaults) {
+	r.policyLoader.SetDefaults(d)
 }
 
 // Route 执行路由决策（纯函数）
@@ -121,7 +133,7 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 	recordSnapshotLoadDuration(time.Since(snapshotStart).Seconds())
 
 	// 阶段 D：硬过滤
-	filter := NewHardFilter(policy)
+	filter := NewHardFilter(policy, snapshot.ModelPrices)
 	filterReq := &FilterRequest{
 		Model:          req.Model,
 		Capabilities:   req.Capabilities,
@@ -178,19 +190,23 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 
 	// 阶段 E：策略排序
 	strategy := GetStrategy(policy.Strategy)
-	scored := strategy.Sort(candidates, filterReq, policy)
+	scored := strategy.Sort(candidates, filterReq, policy, snapshot.ModelPrices)
 
 	// 构建结果
 	result := &RouteResult{
 		SelectedChannel:  scored[0].Channel,
 		AllScores:        make(map[int]float64),
 		CandidateOrder:   make([]int, 0, len(scored)),
+		Candidates:       make(map[int]*ChannelHealth, len(scored)),
 		Excluded:         excluded,
 		Strategy:         policy.Strategy,
 		PolicyVersion:    policy.Version,
 		Epoch:            snapshot.Epoch,
 		SnapshotChecksum: snapshot.ContentHash,
-		GroupID:          req.GroupID,
+		GroupID:            req.GroupID,
+		MaxAttempts:        policy.GetConfigInt("max_attempts", 3),
+		TotalBudgetMS:      policy.GetConfigInt("total_budget_ms", 15000),
+		HalfOpenProbeCount: policy.GetConfigInt("half_open_probe_count", 1),
 	}
 
 	if group != nil {
@@ -200,7 +216,11 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 	for _, s := range scored {
 		result.AllScores[s.Channel.ID] = s.Score
 		result.CandidateOrder = append(result.CandidateOrder, s.Channel.ID)
+		result.Candidates[s.Channel.ID] = s.Channel
 	}
+
+	// 候选六维评分（雷达图数据）
+	result.CandidateDetails = buildCandidateDetails(scored, filterReq, policy, snapshot.ModelPrices)
 
 	result.DecisionReason = fmt.Sprintf(
 		"selected channel %s (id=%d) using strategy=%s, score=%.4f%s",
@@ -227,6 +247,7 @@ func (r *Router) LogDecision(ctx context.Context, req RouteRequest, result *Rout
 	candidateOrderJSON, _ := toJSON(result.CandidateOrder)
 	excludedJSON, _ := toJSON(result.Excluded)
 	allScoresJSON, _ := toJSON(result.AllScores)
+	candidateDetailsJSON, _ := toJSON(result.CandidateDetails)
 	attemptsJSON := `[]` // 尝试记录在实际调用时填充
 
 	var selectedChannelID *int
@@ -239,9 +260,9 @@ func (r *Router) LogDecision(ctx context.Context, req RouteRequest, result *Rout
 		INSERT INTO decision_logs (
 			request_id, token_id_hash, model, is_stream,
 			policy_version, strategy, epoch, snapshot_checksum,
-			candidate_order, excluded, all_scores,
+			candidate_order, excluded, all_scores, candidate_details,
 			attempts, selected_channel, decision_reason, group_id, decided_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
 	`,
 		req.RequestID,
 		hashTokenID(req.TokenID),
@@ -254,6 +275,7 @@ func (r *Router) LogDecision(ctx context.Context, req RouteRequest, result *Rout
 		candidateOrderJSON,
 		excludedJSON,
 		allScoresJSON,
+		candidateDetailsJSON,
 		attemptsJSON,
 		selectedChannelID,
 		result.DecisionReason,

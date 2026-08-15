@@ -204,6 +204,10 @@ function select(ch) {
   detailTab.value = 'info'
   health.value = []
   balance.value = null
+  ratio.value = null
+  probeResult.value = null
+  showRatioGroupModal.value = false
+  ratioLimitInput.value = ch.ratio_limit || 0
 }
 
 async function loadHealth() {
@@ -227,6 +231,194 @@ async function loadBalance() {
     balance.value = await api.channelBalance(selected.value.id)
   } catch { balance.value = null }
   finally { balanceLoading.value = false }
+}
+
+// ===== 倍率 =====
+const ratio = ref(null) // {declared, history, latest}
+const ratioLoading = ref(false)
+const probing = ref(false)
+const probeModel = ref('')
+const probeTokens = ref(64)
+const probeResult = ref(null) // 最近一次实测结果
+const modelPrices = ref([]) // 官方模型价格库
+const declaredInPrice = ref(null) // 所选模型未收录时用户声明的官网输入价
+const declaredOutPrice = ref(null)
+
+const currentModelPrice = computed(() => modelPrices.value.find(p => p.model === probeModel.value) || null)
+const priceMissing = computed(() => !!probeModel.value && !currentModelPrice.value)
+
+// 倍率上限（站点级，0 = 不限），在倍率页签内直接设置
+const ratioLimitInput = ref(0)
+const savingRatioLimit = ref(false)
+
+const overLimitNow = computed(() => {
+  if (ratioLimitInput.value <= 0) return false
+  const latest = ratio.value?.latest || {}
+  return Object.values(latest).some(l => Number(l.real_ratio) > Number(ratioLimitInput.value))
+})
+
+async function saveRatioLimit() {
+  if (!selected.value) return
+  savingRatioLimit.value = true
+  try {
+    await api.updateChannel(selected.value.id, { ratio_limit: Number(ratioLimitInput.value) || 0 })
+    toast(ratioLimitInput.value > 0 ? `倍率上限已设为 ${Number(ratioLimitInput.value).toFixed(4)}x` : '已取消倍率上限限制', 'success')
+    await load()
+  } catch { /* api 层已提示 */ }
+  finally { savingRatioLimit.value = false }
+}
+
+async function loadRatio() {
+  if (!selected.value) return
+  ratioLoading.value = true
+  try {
+    const [r, mp] = await Promise.all([api.channelRatio(selected.value.id), api.listModelPrices()])
+    ratio.value = r
+    modelPrices.value = mp.prices || []
+    if (!probeModel.value) {
+      const keys = Object.keys(selected.value.model_mapping || {})
+      probeModel.value = keys[0] || ''
+    }
+  } catch { ratio.value = null }
+  finally { ratioLoading.value = false }
+}
+
+async function runProbe() {
+  if (!selected.value || probing.value) return
+  if (!probeModel.value) { toast('请先选择要实测的模型', 'error'); return }
+  // 价格库未收录：需要用户先声明官网价
+  let official = null
+  if (priceMissing.value) {
+    const inP = Number(declaredInPrice.value)
+    const outP = Number(declaredOutPrice.value)
+    if (!(inP > 0) || !(outP > 0)) { toast('该模型暂无官方价格，请先声明官网输入/输出价（$/1M）', 'error'); return }
+    official = { input: inP, output: outP }
+  }
+  probing.value = true
+  probeResult.value = null
+  try {
+    probeResult.value = await api.probeRatio(selected.value.id, probeModel.value, Number(probeTokens.value) || 64, official)
+    toast('实测完成，结果已写入路由数据', 'success')
+    await Promise.all([loadRatio(), load()])
+  } catch { /* api 层已提示（含 400/409/429/502 原因） */ }
+  finally { probing.value = false }
+}
+
+const modelKeys = computed(() => Object.keys(selected.value?.model_mapping || {}))
+
+const ratioChartOption = computed(() => {
+  const hist = [...(ratio.value?.history || [])].filter(h => h.model === probeModel.value).reverse()
+  return {
+    grid: { left: 50, right: 14, top: 20, bottom: 26 },
+    xAxis: { type: 'category', data: hist.map(h => h.checked_at.slice(5, 16).replace('T', ' ')), axisLabel: { fontSize: 10, interval: Math.max(0, Math.floor(hist.length / 8)) } },
+    yAxis: { type: 'value', axisLabel: { formatter: '{value}x' } },
+    tooltip: {
+      trigger: 'axis',
+      formatter: ps => {
+        const p = Array.isArray(ps) ? ps[0] : ps
+        const idx = p?.dataIndex
+        const h = idx != null ? hist[idx] : null
+        if (!h) return ''
+        return `${h.checked_at.slice(5, 16).replace('T', ' ')}<br/>实测倍率: <b>${Number(h.real_ratio).toFixed(4)}x</b><br/>来源: ${h.source === 'manual' ? '手动实测' : '定时探针'}<br/>tokens: ${h.tokens_used} · ttft: ${h.ttft_ms}ms`
+      },
+    },
+    series: [{
+      type: 'line', smooth: true, symbol: 'circle', symbolSize: 5,
+      data: hist.map(h => h.real_ratio),
+      lineStyle: { color: '#0a84ff', width: 2 },
+      areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(10,132,255,0.14)' }, { offset: 1, color: 'rgba(10,132,255,0)' }] } },
+    }],
+  }
+})
+
+function fmtDrift(v) {
+  if (v == null) return null
+  return (v > 0 ? '+' : '') + v.toFixed(1) + '%'
+}
+
+// ===== 倍率检测分组 =====
+const showRatioGroupModal = ref(false)
+const editingRatioGroup = ref(null)
+const savingRatioGroup = ref(false)
+const ratioGroupForm = ref({ name: '', models: [], default_model: '' })
+const probingGroupId = ref(null)
+const probingAll = ref(false)
+
+function openRatioGroupModal(g) {
+  editingRatioGroup.value = g || null
+  ratioGroupForm.value = g
+    ? { name: g.name, models: [...(g.models || [])], default_model: g.default_model || '' }
+    : { name: '', models: [], default_model: '' }
+  showRatioGroupModal.value = true
+}
+
+function toggleGroupModel(m) {
+  const i = ratioGroupForm.value.models.indexOf(m)
+  if (i >= 0) {
+    ratioGroupForm.value.models.splice(i, 1)
+    if (ratioGroupForm.value.default_model === m) ratioGroupForm.value.default_model = ''
+  } else {
+    ratioGroupForm.value.models.push(m)
+    if (!ratioGroupForm.value.default_model) ratioGroupForm.value.default_model = m
+  }
+}
+
+async function saveRatioGroup() {
+  if (!selected.value) return
+  const f = ratioGroupForm.value
+  if (!f.name) { toast('请填写分组名称', 'error'); return }
+  if (!f.models.length) { toast('请至少选择一个模型', 'error'); return }
+  if (!f.default_model) { toast('请选择默认检测模型', 'error'); return }
+  savingRatioGroup.value = true
+  try {
+    if (editingRatioGroup.value) await api.updateRatioGroup(selected.value.id, editingRatioGroup.value.id, f)
+    else await api.createRatioGroup(selected.value.id, f)
+    toast(editingRatioGroup.value ? '分组已更新' : '分组已创建', 'success')
+    showRatioGroupModal.value = false
+    await loadRatio()
+  } catch { /* api 层已提示 */ }
+  finally { savingRatioGroup.value = false }
+}
+
+async function deleteRatioGroup(g) {
+  if (!selected.value) return
+  if (!confirm(`确认删除倍率分组「${g.name}」？`)) return
+  try {
+    await api.deleteRatioGroup(selected.value.id, g.id)
+    toast('分组已删除', 'success')
+    await loadRatio()
+  } catch { /* api 层已提示 */ }
+}
+
+async function probeGroup(g) {
+  if (!selected.value || probingGroupId.value || probingAll.value) return
+  probingGroupId.value = g.id
+  probeResult.value = null
+  try {
+    probeResult.value = await api.probeRatioGroup(selected.value.id, g.id)
+    toast(`分组「${g.name}」实测完成，代表倍率已更新`, 'success')
+    await Promise.all([loadRatio(), load()])
+  } catch { /* api 层已提示 */ }
+  finally { probingGroupId.value = null }
+}
+
+async function probeAllGroups() {
+  if (!selected.value || probingAll.value || probingGroupId.value) return
+  const groups = ratio.value?.groups || []
+  if (!groups.length) return
+  probingAll.value = true
+  let ok = 0, fail = 0
+  try {
+    for (const g of groups) {
+      try {
+        const r = await api.probeRatioGroup(selected.value.id, g.id)
+        probeResult.value = r // 展示最近一组的实测结果
+        ok++
+      } catch { fail++ }
+    }
+    toast(`一键实测完成：成功 ${ok} 组${fail ? `，失败 ${fail} 组` : ''}`, fail ? 'info' : 'success')
+    await Promise.all([loadRatio(), load()])
+  } finally { probingAll.value = false }
 }
 
 const balanceChartOption = computed(() => {
@@ -514,8 +706,8 @@ onMounted(() => { load(); loadGroups() })
 
           <!-- 页签 -->
           <div class="ch-tabs">
-            <button v-for="t in [{k:'info',l:'基本信息'},{k:'health',l:'健康'},{k:'stats',l:'统计'},{k:'balance',l:'余额'}]" :key="t.k"
-              class="ch-tab" :class="{ active: detailTab === t.k }" @click="detailTab = t.k; t.k === 'health' && loadHealth(); t.k === 'balance' && loadBalance()">
+            <button v-for="t in [{k:'info',l:'基本信息'},{k:'health',l:'健康'},{k:'stats',l:'统计'},{k:'balance',l:'余额'},{k:'ratio',l:'倍率'}]" :key="t.k"
+              class="ch-tab" :class="{ active: detailTab === t.k }" @click="detailTab = t.k; t.k === 'health' && loadHealth(); t.k === 'balance' && loadBalance(); t.k === 'ratio' && loadRatio()">
               {{ t.l }}
             </button>
           </div>
@@ -595,6 +787,181 @@ onMounted(() => { load(); loadGroups() })
                   </table>
                 </div>
               </div>
+            </div>
+
+            <!-- 倍率 -->
+            <div v-else-if="detailTab === 'ratio'">
+              <div v-if="ratioLoading" class="skeleton" style="height:180px" />
+              <template v-else>
+                <!-- 倍率上限设置 -->
+                <div class="card card-pad mb-3" style="padding:12px 16px">
+                  <div class="row gap-2" style="align-items:center;flex-wrap:wrap">
+                    <Icon name="alert" :size="15" :style="{ color: overLimitNow ? 'var(--red)' : 'var(--text-3)' }" />
+                    <label class="field-label" style="margin-bottom:0">倍率上限</label>
+                    <input v-model.number="ratioLimitInput" type="number" step="0.01" min="0" class="input" style="width:110px" placeholder="如 2.0">
+                    <span class="text-3" style="font-size:12px">x（0 = 不限）</span>
+                    <button class="btn btn-ghost btn-sm" :disabled="savingRatioLimit" @click="saveRatioLimit">
+                      <Icon name="check" :size="12" />{{ savingRatioLimit ? '保存中…' : '保存' }}
+                    </button>
+                    <span v-if="overLimitNow" class="badge badge-red">当前实测已超上限</span>
+                    <span v-else-if="ratioLimitInput > 0" class="badge badge-green">实测均在限内</span>
+                    <span class="text-3" style="font-size:11.5px;margin-left:auto">实测倍率超过上限时，总览「告警」与侧边栏红点会提示</span>
+                  </div>
+                </div>
+
+                <!-- 实测控制行 -->
+                <div class="row gap-2 mb-3" style="flex-wrap:wrap;align-items:flex-end">
+                  <div class="field" style="margin-bottom:0">
+                    <label class="field-label">实测模型</label>
+                    <select v-model="probeModel" class="select" style="width:190px">
+                      <option v-for="m in modelKeys" :key="m" :value="m">{{ m }}</option>
+                    </select>
+                  </div>
+                  <div class="field" style="margin-bottom:0">
+                    <label class="field-label">max_tokens</label>
+                    <input v-model.number="probeTokens" type="number" min="8" max="256" class="input" style="width:90px">
+                  </div>
+                  <div v-if="currentModelPrice" class="field" style="margin-bottom:0">
+                    <label class="field-label">官网价（$/1M）</label>
+                    <div class="code" style="padding:7px 10px;font-size:12px">
+                      输入 ${{ Number(currentModelPrice.input_price_per_m).toFixed(2) }} · 输出 ${{ Number(currentModelPrice.output_price_per_m).toFixed(2) }}
+                      <span v-if="currentModelPrice.note" class="text-3" style="font-size:10.5px;margin-left:6px" :title="currentModelPrice.note">（可在设置页修改）</span>
+                    </div>
+                  </div>
+                  <div v-else-if="priceMissing" class="field" style="margin-bottom:0">
+                    <label class="field-label" style="color:var(--orange)">该模型暂无官网价，请声明（$/1M）</label>
+                    <div class="row gap-2">
+                      <input v-model.number="declaredInPrice" type="number" min="0" step="0.01" class="input" style="width:100px" placeholder="输入价">
+                      <input v-model.number="declaredOutPrice" type="number" min="0" step="0.01" class="input" style="width:100px" placeholder="输出价">
+                    </div>
+                  </div>
+                  <button class="btn btn-primary btn-sm" :disabled="probing || !probeModel" @click="runProbe">
+                    <Icon name="bolt" :size="13" />{{ probing ? '实测中…' : '立即实测' }}
+                  </button>
+                  <span class="text-3" style="font-size:11.5px;padding-bottom:7px">真实推理 + 余额差值，花费计入每日探测预算</span>
+                </div>
+
+                <!-- 倍率检测分组 -->
+                <div class="mb-3">
+                  <div class="row gap-2 mb-2" style="align-items:center">
+                    <span style="font-size:13px;font-weight:700">倍率分组</span>
+                    <button class="btn btn-ghost btn-sm" @click="openRatioGroupModal()"><Icon name="plus" :size="12" />新建分组</button>
+                    <button v-if="(ratio?.groups || []).length" class="btn btn-ghost btn-sm" :disabled="probingAll || probingGroupId != null" @click="probeAllGroups">
+                      <Icon name="bolt" :size="12" />{{ probingAll ? '批量实测中…' : '一键实测全部组' }}
+                    </button>
+                    <span class="text-3" style="font-size:11.5px;margin-left:auto">每组实测其默认检测模型</span>
+                  </div>
+                  <div v-if="!(ratio?.groups || []).length" class="text-3" style="font-size:12.5px;margin-bottom:6px">
+                    尚未定义分组。上游通常有多个模型倍率组（如特惠组/高级组），在此为每组指定模型与默认检测模型，实测时以默认模型代表整组倍率。
+                  </div>
+                  <div v-for="g in ratio?.groups || []" :key="g.id" class="card card-pad mb-2" style="padding:12px 16px">
+                    <div class="row gap-2" style="align-items:center">
+                      <span style="font-size:13.5px;font-weight:700">{{ g.name }}</span>
+                      <span class="badge badge-blue">默认检测: {{ g.default_model || '—' }}</span>
+                      <span v-if="g.default_ratio != null" class="badge mono badge-teal">代表倍率 {{ Number(g.default_ratio).toFixed(4) }}x</span>
+                      <span v-else class="badge badge-gray">未实测</span>
+                      <span class="row gap-1" style="margin-left:auto">
+                        <button class="btn btn-ghost btn-sm" :disabled="probingGroupId === g.id || probingAll" @click="probeGroup(g)">
+                          <Icon name="bolt" :size="12" />{{ probingGroupId === g.id ? '实测中…' : '实测' }}
+                        </button>
+                        <button class="btn btn-ghost btn-sm" @click="openRatioGroupModal(g)"><Icon name="pencil" :size="12" /></button>
+                        <button class="btn btn-ghost btn-sm" @click="deleteRatioGroup(g)"><Icon name="trash" :size="12" /></button>
+                      </span>
+                    </div>
+                    <div v-if="g.default_checked_at" class="text-3" style="font-size:11px;margin-top:4px">
+                      代表倍率实测于 {{ fmtDate(g.default_checked_at) }}（{{ g.default_source === 'manual' ? '手动' : '定时' }}）
+                    </div>
+                    <div class="row gap-2 mt-2" style="flex-wrap:wrap">
+                      <span v-for="m in g.members || []" :key="m.model" class="badge mono" :class="m.model === g.default_model ? 'badge-teal' : 'badge-gray'" :title="m.real_ratio != null ? '实测 ' + Number(m.real_ratio).toFixed(4) + 'x（' + (m.source === 'manual' ? '手动' : '定时') + '）' : '未实测'">
+                        {{ m.model }}<template v-if="m.real_ratio != null"> · {{ Number(m.real_ratio).toFixed(4) }}x</template>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 实测结果卡 -->
+                <div v-if="probeResult" class="card card-pad mb-3" style="padding:14px 18px">
+                  <div class="row gap-3" style="flex-wrap:wrap;align-items:center">
+                    <div style="min-width:130px">
+                      <div class="stat-label">实测倍率 · {{ probeResult.model }}</div>
+                      <div class="stat-value" style="font-size:30px;color:var(--blue)">{{ Number(probeResult.real_ratio).toFixed(4) }}x</div>
+                      <div class="stat-foot" style="font-size:11.5px">
+                        <template v-if="probeResult.basis === 'official'">
+                          官网价 {{ Number(probeResult.official_input_per_m).toFixed(2) }}/{{ Number(probeResult.official_output_per_m).toFixed(2) }} $/1M
+                        </template>
+                        <template v-else>官方价未知，按 $10/1M 混合基准估算</template>
+                      </div>
+                    </div>
+                    <div v-if="probeResult.basis === 'official'" class="text-3 mono" style="font-size:12px;line-height:1.7">
+                      推算实际单价：输入 ${{ Number(probeResult.estimated_input_per_m).toFixed(2) }}/1M · 输出 ${{ Number(probeResult.estimated_output_per_m).toFixed(2) }}/1M
+                    </div>
+                    <div v-if="probeResult.drift_pct != null" class="badge" :class="Math.abs(probeResult.drift_pct) > 30 ? 'badge-red' : 'badge-green'">
+                      相对声明 {{ fmtDrift(probeResult.drift_pct) }}
+                    </div>
+                    <span class="badge" :class="probeResult.basis === 'official' ? 'badge-teal' : 'badge-gray'">{{ probeResult.basis === 'official' ? '相对官网价' : '基准估测' }}</span>
+                    <div class="text-3 mono" style="font-size:12px;line-height:1.7">
+                      扣费 ${{ Number(probeResult.cost).toFixed(4) }} · tokens {{ probeResult.prompt_tokens }}+{{ probeResult.completion_tokens }}<br/>
+                      TTFT {{ probeResult.ttft_ms }}ms · 余额 ${{ Number(probeResult.balance_before).toFixed(2) }} → ${{ Number(probeResult.balance_after).toFixed(2) }}
+                    </div>
+                  </div>
+                  <div v-if="probeResult.warning" class="mt-2" style="color:var(--orange);font-size:12px">⚠ {{ probeResult.warning }}</div>
+                </div>
+
+                <!-- 上次实测 -->
+                <div v-if="ratio?.latest?.[probeModel]" class="mb-3 text-3" style="font-size:12px">
+                  上次实测（{{ ratio.latest[probeModel].source === 'manual' ? '手动' : '定时' }}）：
+                  <b class="mono">{{ Number(ratio.latest[probeModel].real_ratio).toFixed(4) }}x</b>
+                  · {{ fmtDate(ratio.latest[probeModel].checked_at) }}
+                </div>
+
+                <!-- 实测历史折线 -->
+                <div v-if="(ratio?.history || []).filter(h => h.model === probeModel).length >= 2" class="card card-pad mb-3" style="padding:14px 18px">
+                  <div class="field-label mb-1">实测倍率历史（{{ probeModel }}）</div>
+                  <BaseChart :option="ratioChartOption" height="170px" />
+                </div>
+
+                <!-- 声明倍率表 -->
+                <div v-if="(ratio?.declared || []).length" class="field">
+                  <label class="field-label">声明倍率（/api/pricing 同步）</label>
+                  <div class="table-wrap">
+                    <table>
+                      <thead><tr><th>模型</th><th>输入倍率</th><th>输出倍率</th><th>换算单价（输入/输出）</th><th>同步时间</th></tr></thead>
+                      <tbody>
+                        <tr v-for="d in ratio.declared" :key="d.model">
+                          <td><span class="badge badge-blue">{{ d.model }}</span></td>
+                          <td class="mono">{{ Number(d.prompt_ratio).toFixed(2) }}x</td>
+                          <td class="mono">{{ Number(d.completion_ratio).toFixed(2) }}x</td>
+                          <td class="mono text-3">${{ Number(d.prompt_price_per_m).toFixed(2) }} / ${{ Number(d.completion_price_per_m).toFixed(2) }} /1M</td>
+                          <td class="mono text-3">{{ fmtDate(d.checked_at) }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div v-else class="text-3" style="font-size:12.5px;margin-bottom:12px">暂无声明倍率（checker 每 10 分钟从 /api/pricing 同步一次）</div>
+
+                <!-- 实测记录表 -->
+                <div v-if="(ratio?.history || []).length" class="field">
+                  <label class="field-label">实测记录（最近 15 条）</label>
+                  <div class="table-wrap">
+                    <table>
+                      <thead><tr><th>时间</th><th>模型</th><th>实测倍率</th><th>扣费</th><th>tokens</th><th>TTFT</th><th>来源</th></tr></thead>
+                      <tbody>
+                        <tr v-for="h in (ratio.history || []).slice(0, 15)" :key="h.checked_at + h.model">
+                          <td class="mono text-3">{{ fmtDate(h.checked_at) }}</td>
+                          <td><span class="badge badge-blue">{{ h.model }}</span></td>
+                          <td class="mono" :style="{ fontWeight: 600, color: 'var(--blue)' }">{{ Number(h.real_ratio).toFixed(4) }}x</td>
+                          <td class="mono">${{ Number(h.cost).toFixed(4) }}</td>
+                          <td class="mono">{{ h.tokens_used }}</td>
+                          <td class="mono">{{ h.ttft_ms }}ms</td>
+                          <td><span class="badge" :class="h.source === 'manual' ? 'badge-teal' : 'badge-gray'">{{ h.source === 'manual' ? '手动' : '定时' }}</span></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <EmptyState v-if="!(ratio?.history || []).length && !(ratio?.declared || []).length" icon="gauge" title="暂无倍率数据" desc="点击「立即实测」获取真实倍率，或等待定时探针（每小时）" style="padding:30px 0" />
+              </template>
             </div>
 
             <!-- 余额 -->
@@ -835,6 +1202,35 @@ onMounted(() => { load(); loadGroups() })
         <button class="btn btn-ghost" @click="showGroupModal = false">关闭</button>
         <button class="btn btn-primary" @click="saveGroup" :disabled="savingGroup">{{ savingGroup ? '保存中…' : editingGroup ? '保存修改' : '创建分组' }}</button>
       </template>
+    </BaseModal>
+
+    <!-- 倍率检测分组弹窗 -->
+    <BaseModal v-if="showRatioGroupModal" :title="editingRatioGroup ? '编辑倍率分组' : '新建倍率分组'" width="480px" @close="showRatioGroupModal = false">
+      <div class="field">
+        <label class="field-label">分组名称 *</label>
+        <input v-model="ratioGroupForm.name" class="input" placeholder="如：特惠组 / 高级组">
+      </div>
+      <div class="field">
+        <label class="field-label">组内模型 *（可多选，模型可同时属于多个分组）</label>
+        <div class="row gap-2" style="flex-wrap:wrap">
+          <button v-for="m in modelKeys" :key="m" type="button"
+            class="seg" :class="{ on: ratioGroupForm.models.includes(m) }" @click="toggleGroupModel(m)">
+            {{ m }}
+          </button>
+          <span v-if="!modelKeys.length" class="text-3" style="font-size:12px">该站点暂无模型映射，请先在「基本信息」中配置</span>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field-label">默认检测模型 *（实测该组倍率时使用的模型）</label>
+        <select v-model="ratioGroupForm.default_model" class="select" style="width:100%">
+          <option value="" disabled>选择默认检测模型</option>
+          <option v-for="m in ratioGroupForm.models" :key="m" :value="m">{{ m }}</option>
+        </select>
+      </div>
+      <div class="row gap-2" style="justify-content:flex-end;margin-top:16px">
+        <button class="btn btn-ghost" @click="showRatioGroupModal = false">取消</button>
+        <button class="btn btn-primary" :disabled="savingRatioGroup" @click="saveRatioGroup">{{ savingRatioGroup ? '保存中…' : '保存' }}</button>
+      </div>
     </BaseModal>
   </div>
 </template>

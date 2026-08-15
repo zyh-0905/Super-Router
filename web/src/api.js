@@ -92,6 +92,23 @@ export const api = {
   channelHealth: (id) => api.get(`/admin/health/${id}`),
   channelModels: (id) => api.get(`/admin/channels/${id}/models`),
   channelBalance: (id) => api.get(`/admin/channels/${id}/balance`),
+  channelRatio: (id) => api.get(`/admin/channels/${id}/ratio`),
+  channelMetrics: (groupId) => api.get('/admin/channel-metrics' + (groupId ? `?group_id=${groupId}` : '')),
+  probeRatio: (id, model, maxTokens, official) => {
+    const body = { model, max_tokens: maxTokens }
+    if (official) {
+      body.input_price_per_m = official.input
+      body.output_price_per_m = official.output
+    }
+    return api.post(`/admin/channels/${id}/probe-ratio`, body)
+  },
+  listModelPrices: () => api.get('/admin/model-prices'),
+  upsertModelPrice: (p) => api.post('/admin/model-prices', p),
+  deleteModelPrice: (model) => api.del(`/admin/model-prices/${encodeURIComponent(model)}`),
+  createRatioGroup: (id, p) => api.post(`/admin/channels/${id}/ratio-groups`, p),
+  updateRatioGroup: (id, gid, p) => api.patch(`/admin/channels/${id}/ratio-groups/${gid}`, p),
+  deleteRatioGroup: (id, gid) => api.del(`/admin/channels/${id}/ratio-groups/${gid}`),
+  probeRatioGroup: (id, gid) => api.post(`/admin/channels/${id}/ratio-groups/${gid}/probe`, {}),
   probeUpstreamModels: (base_url, api_key) => api.post('/admin/upstream/models', { base_url, api_key }),
   getSettings: () => api.get('/admin/settings'),
   updateSettings: (p) => api.patch('/admin/settings', p),

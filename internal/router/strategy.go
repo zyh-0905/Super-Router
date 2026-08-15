@@ -10,9 +10,9 @@ type CandidateScore struct {
 	Score   float64
 }
 
-// Strategy 排序策略接口
+// Strategy 排序策略接口（prices 为官方模型价格库，供成本估算）
 type Strategy interface {
-	Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy) []CandidateScore
+	Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy, prices map[string]*ModelPrice) []CandidateScore
 }
 
 // GetStrategy 根据策略名称获取策略实现
@@ -37,7 +37,7 @@ func GetStrategy(strategyName string) Strategy {
 
 type CustomPriorityStrategy struct{}
 
-func (s *CustomPriorityStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy) []CandidateScore {
+func (s *CustomPriorityStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy, prices map[string]*ModelPrice) []CandidateScore {
 	scores := make([]CandidateScore, len(candidates))
 
 	for i, ch := range candidates {
@@ -98,11 +98,11 @@ func (s *CustomPriorityStrategy) calculateScore(ch *ChannelHealth, req *FilterRe
 
 type PriceFirstStrategy struct{}
 
-func (s *PriceFirstStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy) []CandidateScore {
+func (s *PriceFirstStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy, prices map[string]*ModelPrice) []CandidateScore {
 	scores := make([]CandidateScore, len(candidates))
 
 	for i, ch := range candidates {
-		cost := estimateCost(ch, req, policy)
+		cost := estimateCost(ch, req, policy, prices)
 		scores[i] = CandidateScore{
 			Channel: ch,
 			Score:   -cost, // 成本越低得分越高（取负数）
@@ -139,7 +139,7 @@ func (s *PriceFirstStrategy) Sort(candidates []*ChannelHealth, req *FilterReques
 
 type LatencyFirstStrategy struct{}
 
-func (s *LatencyFirstStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy) []CandidateScore {
+func (s *LatencyFirstStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy, prices map[string]*ModelPrice) []CandidateScore {
 	scores := make([]CandidateScore, len(candidates))
 
 	for i, ch := range candidates {
@@ -180,7 +180,7 @@ func (s *LatencyFirstStrategy) Sort(candidates []*ChannelHealth, req *FilterRequ
 
 type ReliabilityFirstStrategy struct{}
 
-func (s *ReliabilityFirstStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy) []CandidateScore {
+func (s *ReliabilityFirstStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy, prices map[string]*ModelPrice) []CandidateScore {
 	scores := make([]CandidateScore, len(candidates))
 
 	for i, ch := range candidates {
@@ -204,8 +204,8 @@ func (s *ReliabilityFirstStrategy) Sort(candidates []*ChannelHealth, req *Filter
 			return ttftA < ttftB
 		}
 
-		costA := estimateCost(a.Channel, req, policy)
-		costB := estimateCost(b.Channel, req, policy)
+		costA := estimateCost(a.Channel, req, policy, prices)
+		costB := estimateCost(b.Channel, req, policy, prices)
 		if costA != costB {
 			return costA < costB
 		}
@@ -220,26 +220,30 @@ func (s *ReliabilityFirstStrategy) Sort(candidates []*ChannelHealth, req *Filter
 
 type BalancedStrategy struct{}
 
-func (s *BalancedStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy) []CandidateScore {
-	// 读取权重配置
-	costWeight := policy.GetConfigFloat("balanced_weights.cost", 0.35)
-	reliabilityWeight := policy.GetConfigFloat("balanced_weights.reliability", 0.30)
-	latencyWeight := policy.GetConfigFloat("balanced_weights.latency", 0.25)
-	loadWeight := policy.GetConfigFloat("balanced_weights.load", 0.10)
+func (s *BalancedStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest, policy *Policy, prices map[string]*ModelPrice) []CandidateScore {
+	// 读取权重配置（支持嵌套 balanced_weights 或扁平键）
+	costWeight := policy.GetConfigNestedFloat("balanced_weights.cost", 0.35)
+	reliabilityWeight := policy.GetConfigNestedFloat("balanced_weights.reliability", 0.30)
+	latencyWeight := policy.GetConfigNestedFloat("balanced_weights.latency", 0.25)
+	loadWeight := policy.GetConfigNestedFloat("balanced_weights.load", 0.10)
 
 	scores := make([]CandidateScore, len(candidates))
 
 	// 归一化因子（用于将各指标映射到 [0, 1]）
 	maxCost := 0.0
 	maxTTFT := 0
+	maxLoad := 0
 	for _, ch := range candidates {
-		cost := estimateCost(ch, req, policy)
+		cost := estimateCost(ch, req, policy, prices)
 		if cost > maxCost {
 			maxCost = cost
 		}
 		ttft := getTTFT(ch, req.Model)
 		if ttft > maxTTFT {
 			maxTTFT = ttft
+		}
+		if ch.RecentAttempts > maxLoad {
+			maxLoad = ch.RecentAttempts
 		}
 	}
 
@@ -251,14 +255,18 @@ func (s *BalancedStrategy) Sort(candidates []*ChannelHealth, req *FilterRequest,
 	}
 
 	for i, ch := range candidates {
-		cost := estimateCost(ch, req, policy)
+		cost := estimateCost(ch, req, policy, prices)
 		ttft := getTTFT(ch, req.Model)
 
 		// 归一化到 [0, 1]，分数越高越好
 		costScore := 1.0 - (cost / maxCost)
 		reliabilityScore := ch.ReliabilityScore
 		latencyScore := 1.0 - (float64(ttft) / float64(maxTTFT))
-		loadScore := 0.5 // 简化：暂时固定为 0.5
+		// 负载分：基于滑动窗口内的尝试次数（越空闲分越高）；无数据视为完全空闲
+		loadScore := 1.0
+		if maxLoad > 0 {
+			loadScore = 1.0 - float64(ch.RecentAttempts)/float64(maxLoad)
+		}
 
 		// 加权求和
 		compositeScore := costWeight*costScore +
@@ -319,11 +327,32 @@ func getTTFTP95(ch *ChannelHealth, model string) int {
 	return 9999
 }
 
-func estimateCost(ch *ChannelHealth, req *FilterRequest, policy *Policy) float64 {
+// estimateCost 估算一次请求的成本（输入输出分开计价）：
+// 1. 实测倍率（official）：输入价 = 倍率 × 官网输入价，输出价 = 倍率 × 官网输出价
+//    （优先使用探测当时记录的官网价快照，价格库调整不影响历史倍率；快照缺失时回退价格库当前值）
+// 2. 实测倍率（baseline）：输入价 = 输出价 = 倍率 × $10/1M（价格库未收录的旧口径）
+// 3. 声明价格（declared_prices）
+// 4. 无价格信息：保守估计输入 $10/1M、输出 $30/1M
+func estimateCost(ch *ChannelHealth, req *FilterRequest, policy *Policy, prices map[string]*ModelPrice) float64 {
 	var inputPrice, outputPrice float64
 
-	// 优先使用实测倍率
 	if ratio, ok := ch.RealRatio[req.Model]; ok && ratio > 0 {
+		if ch.RealRatioBasis[req.Model] == "official" {
+			inPerM := ch.RealRatioOfficialInPerM[req.Model]
+			outPerM := ch.RealRatioOfficialOutPerM[req.Model]
+			if (inPerM <= 0 || outPerM <= 0) && prices != nil {
+				// 旧数据没有官网价快照：回退价格库当前值
+				if p, ok := prices[req.Model]; ok && p != nil {
+					inPerM, outPerM = p.InputPerM, p.OutputPerM
+				}
+			}
+			if inPerM > 0 && outPerM > 0 {
+				inputPrice = ratio * inPerM / 1_000_000
+				outputPrice = ratio * outPerM / 1_000_000
+				return computeEstimatedCost(req, policy, inputPrice, outputPrice)
+			}
+		}
+		// baseline 兜底：$10/1M 混合基准
 		basePrice := 10.0 / 1_000_000
 		inputPrice = ratio * basePrice
 		outputPrice = ratio * basePrice
@@ -336,6 +365,11 @@ func estimateCost(ch *ChannelHealth, req *FilterRequest, policy *Policy) float64
 		outputPrice = 30.0 / 1_000_000
 	}
 
+	return computeEstimatedCost(req, policy, inputPrice, outputPrice)
+}
+
+// computeEstimatedCost 按预估输入/输出 token 计算总成本
+func computeEstimatedCost(req *FilterRequest, policy *Policy, inputPrice, outputPrice float64) float64 {
 	// 读取预期输出比例
 	expectedOutputRatio := policy.GetConfigFloat("expected_output_ratio", 2.0)
 	maxOutput := req.MaxOutput

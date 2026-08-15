@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"smart-router/internal/metrics"
@@ -52,10 +54,39 @@ type ChatMessage struct {
 	Content string `json:"content"`
 }
 
+// upstreamError 上游调用失败（携带 HTTP 状态码便于分类）
+type upstreamError struct {
+	StatusCode int
+	Body       string
+	Err        error
+}
+
+func (e *upstreamError) Error() string {
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	if e.StatusCode > 0 {
+		detail := strings.TrimSpace(e.Body)
+		if len(detail) > 200 {
+			detail = detail[:200] + "…"
+		}
+		if detail == "" {
+			return fmt.Sprintf("upstream status %d", e.StatusCode)
+		}
+		return fmt.Sprintf("upstream status %d: %s", e.StatusCode, detail)
+	}
+	return "upstream error"
+}
+
+func (e *upstreamError) Unwrap() error { return e.Err }
+
 // HandleChatCompletion 处理 /v1/chat/completions 请求
 func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 	ctx := c.Request.Context()
 	requestID := generateRequestID()
+
+	// 请求体大小限制（防止超大 JSON 造成内存 DoS）
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 8<<20)
 
 	// 解析请求
 	var req ChatCompletionRequest
@@ -137,6 +168,11 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 	routeResult, err := h.router.Route(ctx, routeReq)
 	if err != nil {
 		h.logger.Error("Route failed", zap.Error(err))
+		if routeResult == nil {
+			// 快照/策略加载失败：返回不含排除明细的通用错误
+			c.JSON(503, gin.H{"error": "no available upstream"})
+			return
+		}
 		c.JSON(503, gin.H{
 			"error": "no available upstream",
 			"details": gin.H{
@@ -158,11 +194,23 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 		zap.Int("candidates", len(routeResult.CandidateOrder)),
 	)
 
-	// 故障切换循环
+	// 故障切换循环：按候选顺序依次尝试，客户端未收到首字节前可切换
 	attempts := []router.AttemptRecord{}
+	// 请求结束时回填决策日志的 attempts（审计故障切换明细）
+	defer func() {
+		if len(attempts) > 0 {
+			h.persistAttempts(requestID, attempts)
+		}
+	}()
 	startTime := time.Now()
-	maxAttempts := 3
-	totalBudgetMS := 15000
+	maxAttempts := routeResult.MaxAttempts
+	totalBudgetMS := routeResult.TotalBudgetMS
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	if totalBudgetMS <= 0 {
+		totalBudgetMS = 15000
+	}
 
 	for i, channelID := range routeResult.CandidateOrder {
 		if i >= maxAttempts {
@@ -176,136 +224,86 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 			break
 		}
 
-		// 找到对应的渠道（从原始快照中查找）
-		channel := routeResult.SelectedChannel
-		if i > 0 {
-			// 如果不是第一个候选，需要从快照中查找（简化实现：暂时复用 SelectedChannel）
-			// 实际应该保存完整的候选列表
-			h.logger.Warn("Fallback to next candidate not fully implemented", zap.Int("channel_id", channelID))
-		}
-
-		// 尝试调用
-		attemptStart := time.Now()
-		result, firstByte, err := h.callUpstream(ctx, channel, &req)
-
-		attempt := router.AttemptRecord{
-			ChannelID:       channel.ID,
-			StartedAt:       attemptStart,
-			DurationMS:      int(time.Since(attemptStart).Milliseconds()),
-			FirstByteCommit: firstByte,
-		}
-
-		if err != nil {
-			attempt.ErrorClass = classifyError(err)
-			attempts = append(attempts, attempt)
-
-			// 记录失败的代理请求
-			metrics.RecordProxyRequest(
-				fmt.Sprintf("%d", channel.ID),
-				req.Model,
-				"error",
-				time.Since(attemptStart).Seconds(),
-			)
-
-			// 更新熔断状态
-			if h.circuit != nil {
-				_ = h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, false, attempt.ErrorClass)
-			}
-
-			h.logger.Warn("Upstream call failed",
-				zap.String("channel", channel.Name),
-				zap.Error(err),
-				zap.Bool("first_byte_committed", firstByte),
-			)
-
-			// 记录故障切换（如果不是最后一个候选）
-			if i > 0 {
-				prevChannelID := routeResult.CandidateOrder[i-1]
-				metrics.RecordFailover(
-					fmt.Sprintf("%d", prevChannelID),
-					fmt.Sprintf("%d", channel.ID),
-					attempt.ErrorClass,
-				)
-			}
-
-			// 首字节后禁止切换
-			if firstByte {
-				h.logger.Error("Stream interrupted after first byte",
-					zap.String("channel", channel.Name),
-				)
-				c.JSON(500, gin.H{
-					"error": "stream interrupted",
-				})
-
-				// 记录失败的请求历史
-				h.recordRequestHistory(ctx, channel.ID, req.Model, false, firstByte, int(time.Since(attemptStart).Milliseconds()), groupID)
-				return
-			}
-
-			// 检查是否可重试
-			if !isRetryable(err) {
-				h.logger.Info("Error not retryable", zap.String("error_class", attempt.ErrorClass))
-				c.JSON(500, gin.H{
-					"error": fmt.Sprintf("upstream error: %v", err),
-				})
-				h.recordRequestHistory(ctx, channel.ID, req.Model, false, firstByte, int(time.Since(attemptStart).Milliseconds()), groupID)
-				return
-			}
-
-			// 继续尝试下一个候选
+		// 从候选集中取出完整的渠道健康数据
+		channel := routeResult.Candidates[channelID]
+		if channel == nil {
+			h.logger.Warn("Candidate channel missing from snapshot, skipped", zap.Int("channel_id", channelID))
 			continue
 		}
 
-		// 成功
-		attempt.StatusCode = 200
-		attempts = append(attempts, attempt)
-
-		// 记录成功的代理请求
-		metrics.RecordProxyRequest(
-			fmt.Sprintf("%d", channel.ID),
-			req.Model,
-			"success",
-			time.Since(attemptStart).Seconds(),
-		)
-
-		// 更新熔断状态
-		if h.circuit != nil {
-			_ = h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, true, "")
+		// 半开渠道：预约探测名额（half_open_probe_count 个在途探测），名额耗尽则跳过该候选
+		probeReserved := false
+		if channel.CircuitState == "half_open" {
+			ok, rerr := h.router.ReserveHalfOpenProbe(ctx, channel.ID, req.Model, routeResult.HalfOpenProbeCount)
+			if rerr != nil {
+				h.logger.Warn("Failed to reserve half-open probe slot, candidate skipped",
+					zap.Int("channel_id", channel.ID), zap.Error(rerr))
+				continue
+			}
+			if !ok {
+				h.logger.Info("Half-open probe limit reached, candidate skipped",
+					zap.Int("channel_id", channel.ID))
+				continue
+			}
+			probeReserved = true
 		}
 
-		// 记录故障切换（如果使用了备选渠道）
-		if i > 0 {
-			prevChannelID := routeResult.CandidateOrder[i-1]
-			metrics.RecordFailover(
-				fmt.Sprintf("%d", prevChannelID),
-				fmt.Sprintf("%d", channel.ID),
-				"success_after_retry",
-			)
+		attemptStart := time.Now()
+		upstreamBody, err := h.callUpstream(ctx, channel, &req)
+		if err != nil {
+			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, err, &attempts, i, false, probeReserved)
+			if !isRetryable(err) {
+				h.logger.Info("Error not retryable", zap.String("error_class", classifyError(err)))
+				c.JSON(502, gin.H{"error": fmt.Sprintf("upstream error: %v", err)})
+				return
+			}
+			// 首字节未发出，切换到下一个候选
+			continue
 		}
 
-		// 记录请求历史（用于计算成功率）
-		h.recordRequestHistory(ctx, channel.ID, req.Model, true, firstByte, int(time.Since(attemptStart).Milliseconds()), groupID)
+		if req.Stream {
+			// 流式：边读边转发；首字节写给客户端后无法再切换
+			committed, ok := h.streamResponse(c, upstreamBody, func() {
+				h.setRoutingHeaders(c, requestID, channel, routeResult)
+				c.Set("model", req.Model)
+				c.Set("channel", fmt.Sprintf("%d", channel.ID))
+			})
+			if !ok {
+				if committed {
+					// 客户端已收到部分数据，只能中断连接
+					h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart,
+						fmt.Errorf("stream interrupted: %w", io.ErrUnexpectedEOF), &attempts, i, true, probeReserved)
+					return
+				}
+				// 客户端未收到任何字节，安全切换
+				h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart,
+					fmt.Errorf("stream failed before first byte"), &attempts, i, false, probeReserved)
+				continue
+			}
+			h.succeedAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, &attempts, i, probeReserved)
+			return
+		}
 
-		// 设置上下文信息（供 PrometheusMiddleware 使用）
+		// 非流式：先完整缓冲响应；读取失败时客户端未收到任何数据，可安全切换
+		data, readErr := io.ReadAll(io.LimitReader(upstreamBody, 64<<20))
+		upstreamBody.Close()
+		if readErr != nil {
+			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, readErr, &attempts, i, false, probeReserved)
+			continue
+		}
+
+		var response map[string]interface{}
+		if err := json.Unmarshal(data, &response); err != nil {
+			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart,
+				fmt.Errorf("invalid upstream response: %w", err), &attempts, i, false, probeReserved)
+			continue
+		}
+
+		h.succeedAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, &attempts, i, probeReserved)
+		h.setRoutingHeaders(c, requestID, channel, routeResult)
 		c.Set("model", req.Model)
 		c.Set("channel", fmt.Sprintf("%d", channel.ID))
-
-		// 设置路由决策响应头（供前端展示真实路由结果）
-		c.Header("X-Request-ID", requestID)
-		c.Header("X-Selected-Channel", channel.Name)
-		c.Header("X-Selected-Channel-Id", fmt.Sprintf("%d", channel.ID))
-		c.Header("X-Strategy", routeResult.Strategy)
-		if routeResult.GroupName != "" {
-			c.Header("X-Group", routeResult.GroupName)
-		}
-
-		// 返回响应
-		if req.Stream {
-			h.streamResponse(c, result)
-		} else {
-			h.returnResponse(c, result)
-		}
-
+		c.JSON(200, response)
 		return
 	}
 
@@ -320,7 +318,123 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 	})
 }
 
-func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.ChannelHealth, req *ChatCompletionRequest) (io.ReadCloser, bool, error) {
+// persistAttempts 回填决策日志的 attempts 明细（请求结束时调用，独立上下文避免随请求取消）
+func (h *ProxyHandler) persistAttempts(requestID string, attempts []router.AttemptRecord) {
+	data, err := json.Marshal(attempts)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := h.db.Pool.Exec(ctx, `
+		UPDATE decision_logs SET attempts = $1 WHERE request_id = $2
+	`, string(data), requestID); err != nil {
+		h.logger.Warn("Failed to persist decision attempts", zap.String("request_id", requestID), zap.Error(err))
+	}
+}
+
+// setRoutingHeaders 设置路由决策响应头（供前端/客户端查看真实路由结果）
+func (h *ProxyHandler) setRoutingHeaders(c *gin.Context, requestID string, channel *router.ChannelHealth, routeResult *router.RouteResult) {
+	c.Header("X-Request-ID", requestID)
+	c.Header("X-Selected-Channel", channel.Name)
+	c.Header("X-Selected-Channel-Id", fmt.Sprintf("%d", channel.ID))
+	c.Header("X-Strategy", routeResult.Strategy)
+	if routeResult.GroupName != "" {
+		c.Header("X-Group", routeResult.GroupName)
+	}
+}
+
+// failAttempt 记录一次失败尝试：指标、熔断、请求历史与故障切换计数
+func (h *ProxyHandler) failAttempt(ctx context.Context, requestID string, req *ChatCompletionRequest, routeResult *router.RouteResult, groupID *int, channel *router.ChannelHealth, attemptStart time.Time, err error, attempts *[]router.AttemptRecord, index int, firstByteCommitted bool, probeReserved bool) {
+	if probeReserved {
+		// 探测完成（无论成败），释放半开探测名额
+		h.router.ReleaseHalfOpenProbe(ctx, channel.ID, req.Model)
+	}
+
+	errClass := classifyError(err)
+	*attempts = append(*attempts, router.AttemptRecord{
+		ChannelID:       channel.ID,
+		StartedAt:       attemptStart,
+		DurationMS:      int(time.Since(attemptStart).Milliseconds()),
+		FirstByteCommit: firstByteCommitted,
+		ErrorClass:      errClass,
+	})
+
+	metrics.RecordProxyRequest(
+		fmt.Sprintf("%d", channel.ID),
+		req.Model,
+		"error",
+		time.Since(attemptStart).Seconds(),
+	)
+
+	if h.circuit != nil {
+		if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, false, errClass); cerr != nil {
+			h.logger.Warn("Failed to update circuit state (failure)",
+				zap.Int("channel_id", channel.ID), zap.Error(cerr))
+		}
+	}
+
+	if index > 0 {
+		prevChannelID := routeResult.CandidateOrder[index-1]
+		metrics.RecordFailover(
+			fmt.Sprintf("%d", prevChannelID),
+			fmt.Sprintf("%d", channel.ID),
+			errClass,
+		)
+	}
+
+	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, firstByteCommitted, int(time.Since(attemptStart).Milliseconds()), groupID)
+
+	h.logger.Warn("Upstream call failed",
+		zap.String("channel", channel.Name),
+		zap.Error(err),
+		zap.Bool("first_byte_committed", firstByteCommitted),
+	)
+}
+
+// succeedAttempt 记录一次成功尝试：指标、熔断、请求历史与故障切换计数
+func (h *ProxyHandler) succeedAttempt(ctx context.Context, requestID string, req *ChatCompletionRequest, routeResult *router.RouteResult, groupID *int, channel *router.ChannelHealth, attemptStart time.Time, attempts *[]router.AttemptRecord, index int, probeReserved bool) {
+	if probeReserved {
+		// 探测成功，释放半开探测名额
+		h.router.ReleaseHalfOpenProbe(ctx, channel.ID, req.Model)
+	}
+
+	*attempts = append(*attempts, router.AttemptRecord{
+		ChannelID:       channel.ID,
+		StartedAt:       attemptStart,
+		DurationMS:      int(time.Since(attemptStart).Milliseconds()),
+		FirstByteCommit: true,
+		StatusCode:      200,
+	})
+
+	metrics.RecordProxyRequest(
+		fmt.Sprintf("%d", channel.ID),
+		req.Model,
+		"success",
+		time.Since(attemptStart).Seconds(),
+	)
+
+	if h.circuit != nil {
+		if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, true, ""); cerr != nil {
+			h.logger.Warn("Failed to update circuit state (success)",
+				zap.Int("channel_id", channel.ID), zap.Error(cerr))
+		}
+	}
+
+	if index > 0 {
+		prevChannelID := routeResult.CandidateOrder[index-1]
+		metrics.RecordFailover(
+			fmt.Sprintf("%d", prevChannelID),
+			fmt.Sprintf("%d", channel.ID),
+			"success_after_retry",
+		)
+	}
+
+	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, true, true, int(time.Since(attemptStart).Milliseconds()), groupID)
+}
+
+// callUpstream 调用上游站点，返回 200 时的响应体（未读取）
+func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.ChannelHealth, req *ChatCompletionRequest) (io.ReadCloser, error) {
 	// 映射模型名
 	upstreamModel := channel.ModelMapping[req.Model]
 	if upstreamModel == "" {
@@ -333,7 +447,7 @@ func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.Channel
 		SELECT api_key FROM upstreams WHERE id = $1
 	`, channel.ID).Scan(&apiKey)
 	if err != nil {
-		return nil, false, fmt.Errorf("get api_key: %w", err)
+		return nil, &upstreamError{Err: fmt.Errorf("get api_key: %w", err)}
 	}
 
 	// 构建上游请求（移除网关扩展字段 group）
@@ -343,13 +457,13 @@ func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.Channel
 
 	body, err := json.Marshal(upstreamReq)
 	if err != nil {
-		return nil, false, fmt.Errorf("marshal request: %w", err)
+		return nil, &upstreamError{Err: fmt.Errorf("marshal request: %w", err)}
 	}
 
 	url := fmt.Sprintf("%s/v1/chat/completions", channel.BaseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return nil, false, fmt.Errorf("create request: %w", err)
+		return nil, &upstreamError{Err: fmt.Errorf("create request: %w", err)}
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -357,62 +471,56 @@ func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.Channel
 
 	resp, err := h.client.Do(httpReq)
 	if err != nil {
-		return nil, false, fmt.Errorf("http request: %w", err)
+		return nil, &upstreamError{Err: fmt.Errorf("http request: %w", err)}
 	}
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
-		return nil, false, fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(body))
+		return nil, &upstreamError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
-	// 返回响应体（firstByte 暂时简化为 false，实际需要在第一次读取时标记）
-	return resp.Body, false, nil
+	return resp.Body, nil
 }
 
-func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser) {
+// streamResponse 边读边转发 SSE 流。
+// 返回 (committed, ok)：committed 表示是否已向客户端写出数据；
+// ok 表示流是否正常结束。首字节到达后、写出前通过 setHeaders 设置路由响应头。
+func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHeaders func()) (committed bool, ok bool) {
 	defer body.Close()
 
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 
-	// 边读边写
-	c.Stream(func(w io.Writer) bool {
-		buf := make([]byte, 1024)
+	buf := make([]byte, 4096)
+	for {
 		n, err := body.Read(buf)
 		if n > 0 {
-			w.Write(buf[:n])
+			if !committed {
+				setHeaders()
+			}
+			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
+				// 客户端已断开
+				return committed, false
+			}
+			c.Writer.Flush()
+			committed = true
 		}
-		return err == nil
-	})
+		if err != nil {
+			return committed, err == io.EOF
+		}
+	}
 }
 
-func (h *ProxyHandler) returnResponse(c *gin.Context, body io.ReadCloser) {
-	defer body.Close()
-
-	data, err := io.ReadAll(body)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to read upstream response"})
-		return
-	}
-
-	var response map[string]interface{}
-	if err := json.Unmarshal(data, &response); err != nil {
-		c.JSON(500, gin.H{"error": "invalid upstream response"})
-		return
-	}
-
-	c.JSON(200, response)
-}
-
-func (h *ProxyHandler) recordRequestHistory(ctx context.Context, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int) {
+// recordRequestHistory 写入请求历史（requestID 复用本次请求，便于全链路追踪）
+func (h *ProxyHandler) recordRequestHistory(ctx context.Context, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int) {
 	_, err := h.db.Pool.Exec(ctx, `
 		INSERT INTO request_history (
 			request_id, channel_id, model, success, first_byte_commit,
 			ttft_ms, total_duration_ms, group_id, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-	`, generateRequestID(), channelID, model, success, firstByte, durationMS, durationMS, groupID)
+	`, requestID, channelID, model, success, firstByte, durationMS, durationMS, groupID)
 
 	if err != nil {
 		h.logger.Warn("Failed to record request history", zap.Error(err))
@@ -465,12 +573,49 @@ func generateRequestID() string {
 	return fmt.Sprintf("req_%d", time.Now().UnixNano())
 }
 
+// classifyError 将错误归类为稳定类别（写入决策日志与请求历史）
 func classifyError(err error) string {
-	// 简化分类
-	return "retryable_pre_commit"
+	var ue *upstreamError
+	if errors.As(err, &ue) {
+		switch {
+		case ue.StatusCode == http.StatusTooManyRequests:
+			return "rate_limited"
+		case ue.StatusCode == http.StatusUnauthorized || ue.StatusCode == http.StatusForbidden:
+			return "auth_error"
+		case ue.StatusCode >= 500:
+			return "upstream_error"
+		case ue.StatusCode >= 400:
+			return "bad_request"
+		case ue.StatusCode > 0:
+			return "upstream_error"
+		}
+		// StatusCode == 0：上游未返回 HTTP 响应，按底层错误继续分类
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "client_canceled"
+	}
+	return "network_error"
 }
 
+// isRetryable 判断错误是否允许切换到下一个候选渠道
 func isRetryable(err error) bool {
-	// 简化：所有错误都可重试（首字节前）
-	return true
+	var ue *upstreamError
+	if errors.As(err, &ue) && ue.StatusCode > 0 {
+		// 上游返回了 HTTP 状态码：按状态码判定
+		switch {
+		case ue.StatusCode == http.StatusTooManyRequests || ue.StatusCode == http.StatusRequestTimeout:
+			return true // 限流/超时：换渠道有意义
+		case ue.StatusCode >= 500:
+			return true // 上游 5xx：换渠道有意义
+		default:
+			return false // 4xx（认证/参数错误）：换渠道无意义
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false // 调用方超时或断开：重试无意义
+	}
+	return true // 网络错误（含上游未响应）：可切换
 }

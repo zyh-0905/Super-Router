@@ -7,6 +7,8 @@ import { resolvedTheme } from '../store'
 const props = defineProps({
   option: { type: Object, required: true },
   height: { type: String, default: '240px' },
+  // 可选：ECharts 事件名 → 处理函数（挂载时注册）
+  events: { type: Object, default: () => ({}) },
 })
 
 const el = ref(null)
@@ -52,6 +54,9 @@ function render() {
 
 onMounted(() => {
   chart.value = echarts.init(el.value, null, { renderer: 'canvas' })
+  for (const [ev, handler] of Object.entries(props.events)) {
+    if (typeof handler === 'function') chart.value.on(ev, handler)
+  }
   render()
   resizeObserver = new ResizeObserver(() => chart.value && chart.value.resize())
   resizeObserver.observe(el.value)

@@ -34,9 +34,9 @@ EOF
 echo "✓ 测试站点已添加"
 echo ""
 
-# 3. 运行 checker（后台运行 30 秒）
+# 3. 运行 checker（后台运行 30 秒，使用本地开发配置连接 localhost）
 echo "3. 启动 checker（运行 30 秒）..."
-./bin/checker &
+./bin/checker -config configs/config.local.yaml &
 CHECKER_PID=$!
 
 echo "✓ Checker 已启动 (PID: $CHECKER_PID)"

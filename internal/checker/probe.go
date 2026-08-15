@@ -14,28 +14,28 @@ import (
 )
 
 type ProbeChecker struct {
-	db     *store.DB
-	logger *zap.Logger
-	client *http.Client
+	db         *store.DB
+	logger     *zap.Logger
+	client     *http.Client
+	balance    *BalanceChecker // 余额探测（支持自定义余额接口/多协议）
+	probeModel string          // 推理探针使用的模型（默认 gpt-4o，可配置）
 }
 
 func NewProbeChecker(db *store.DB, logger *zap.Logger) *ProbeChecker {
 	return &ProbeChecker{
-		db:     db,
-		logger: logger,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		db:         db,
+		logger:     logger,
+		client:     &http.Client{Timeout: 30 * time.Second},
+		balance:    NewBalanceChecker(db, logger),
+		probeModel: "gpt-4o",
 	}
 }
 
-// OneAPIUserSelfResponse one-api 的 /api/user/self 响应
-type OneAPIUserSelfResponse struct {
-	Success bool `json:"success"`
-	Data    struct {
-		Username string  `json:"username"`
-		Quota    float64 `json:"quota"` // 余额（单位：美元）
-	} `json:"data"`
+// SetProbeModel 设置推理探针模型（空值保持默认）
+func (p *ProbeChecker) SetProbeModel(model string) {
+	if model != "" {
+		p.probeModel = model
+	}
 }
 
 // ChatCompletionRequest OpenAI 兼容的请求格式
@@ -71,6 +71,82 @@ type ChatCompletionResponse struct {
 	} `json:"choices"`
 	Usage Usage `json:"usage"`
 }
+
+// ProbeResult 单次推理探测的结构化结果
+type ProbeResult struct {
+	Model            string  `json:"model"`
+	Success          bool    `json:"success"`
+	RealRatio        float64 `json:"real_ratio"`
+	Basis            string  `json:"basis,omitempty"` // official（相对官网价）| baseline（$10/1M 混合基准）
+	OfficialInputPerM  float64 `json:"official_input_per_m,omitempty"`  // 官网输入价 $/1M
+	OfficialOutputPerM float64 `json:"official_output_per_m,omitempty"` // 官网输出价 $/1M
+	TTFTMS           int     `json:"ttft_ms"`
+	Cost             float64 `json:"cost"`
+	BalanceBefore    float64 `json:"balance_before"`
+	BalanceAfter     float64 `json:"balance_after"`
+	TokensUsed       int     `json:"tokens_used"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	Stage            string  `json:"stage,omitempty"` // balance_before | chat | balance_after | ok（失败阶段）
+	Error            string  `json:"error,omitempty"`
+}
+
+// 计价基准常量（probe_results.basis）
+const (
+	BasisOfficial = "official" // 相对该模型官网价
+	BasisBaseline = "baseline" // $10/1M 混合基准（价格库未收录）
+)
+
+// computeRealRatio 按 token 拆分计算真实倍率：
+// 有官网价 → 实际扣费 ÷ 按官网价应扣费（official）
+// 无官网价 → 实际扣费 ÷ tokens ÷ $10/1M（baseline 兜底）
+func computeRealRatio(cost float64, promptTokens, completionTokens int, officialInPerM, officialOutPerM float64) (ratio float64, basis string) {
+	totalTokens := promptTokens + completionTokens
+	if totalTokens <= 0 || cost <= 0 {
+		return 0, BasisBaseline
+	}
+	if officialInPerM > 0 && officialOutPerM > 0 {
+		expected := float64(promptTokens)*officialInPerM/1_000_000 + float64(completionTokens)*officialOutPerM/1_000_000
+		if expected > 0 {
+			return cost / expected, BasisOfficial
+		}
+	}
+	// 兜底：$10/1M 混合基准
+	basePrice := 10.0 / 1_000_000
+	return cost / float64(totalTokens) / basePrice, BasisBaseline
+}
+
+// nullableFloat 将 0 转为 NULL（官网价未提供时入库为 NULL）
+func nullableFloat(v float64) interface{} {
+	if v <= 0 {
+		return nil
+	}
+	return v
+}
+
+// modelPrice 官方模型价格
+type modelPrice struct {
+	InputPerM  float64
+	OutputPerM float64
+}
+
+// lookupModelPrice 查询模型官方价格（未收录返回 nil）
+func (p *ProbeChecker) lookupModelPrice(ctx context.Context, model string) *modelPrice {
+	var in, out float64
+	err := p.db.Pool.QueryRow(ctx, `
+		SELECT input_price_per_m, output_price_per_m FROM model_prices WHERE model = $1
+	`, model).Scan(&in, &out)
+	if err != nil {
+		return nil
+	}
+	return &modelPrice{InputPerM: in, OutputPerM: out}
+}
+
+// 探测来源常量（probe_results.source）
+const (
+	ProbeSourceScheduled = "scheduled"
+	ProbeSourceManual    = "manual"
+)
 
 // Run 执行一轮推理探针
 func (p *ProbeChecker) Run(ctx context.Context, globalDailyBudget float64) error {
@@ -126,7 +202,7 @@ func (p *ProbeChecker) Run(ctx context.Context, globalDailyBudget float64) error
 		}
 
 		// 执行探针
-		cost, err := p.probeOne(ctx, upstream, epoch)
+		res, err := p.probeOne(ctx, upstream, epoch, p.probeModel, 16, ProbeSourceScheduled)
 		if err != nil {
 			p.logger.Error("Probe failed",
 				zap.String("name", upstream.Name),
@@ -134,7 +210,7 @@ func (p *ProbeChecker) Run(ctx context.Context, globalDailyBudget float64) error
 			)
 		} else {
 			probeCount++
-			totalCost += cost
+			totalCost += res.Cost
 
 			// 检查是否超全局预算
 			if todaySpent+totalCost >= globalDailyBudget {
@@ -202,7 +278,19 @@ func (p *ProbeChecker) getUpstreamTodaySpent(ctx context.Context, upstreamID int
 
 // ProbeChannel 对单个上游执行推理探针（分组调度器使用），返回实际成本
 func (p *ProbeChecker) ProbeChannel(ctx context.Context, upstream Upstream, epoch int64) (float64, error) {
-	return p.probeOne(ctx, upstream, epoch)
+	res, err := p.probeOne(ctx, upstream, epoch, p.probeModel, 16, ProbeSourceScheduled)
+	if err != nil {
+		return 0, err
+	}
+	return res.Cost, nil
+}
+
+// ProbeModel 按需探测指定模型（手动实测入口），返回结构化结果
+func (p *ProbeChecker) ProbeModel(ctx context.Context, upstream Upstream, epoch int64, model string, maxTokens int, source string) (*ProbeResult, error) {
+	if maxTokens <= 0 {
+		maxTokens = 64
+	}
+	return p.probeOne(ctx, upstream, epoch, model, maxTokens, source)
 }
 
 // TodaySpent 今日全局探针总花费（分组调度器使用）
@@ -215,108 +303,112 @@ func (p *ProbeChecker) UpstreamTodaySpent(ctx context.Context, upstreamID int) (
 	return p.getUpstreamTodaySpent(ctx, upstreamID)
 }
 
-func (p *ProbeChecker) probeOne(ctx context.Context, upstream Upstream, epoch int64) (float64, error) {
+func (p *ProbeChecker) probeOne(ctx context.Context, upstream Upstream, epoch int64, model string, maxTokens int, source string) (*ProbeResult, error) {
+	start := time.Now()
+	res := &ProbeResult{Model: model}
+
 	// 1. 读取余额前
+	res.Stage = "balance_before"
 	balanceBefore, err := p.getBalance(ctx, upstream)
 	if err != nil {
-		return 0, fmt.Errorf("get balance before: %w", err)
+		res.Error = fmt.Sprintf("读取余额失败: %v", err)
+		return res, fmt.Errorf("get balance before: %w", err)
 	}
+	res.BalanceBefore = balanceBefore
 
-	// 2. 发起极小推理请求
-	model := "gpt-4o" // 默认探测模型，可配置
-	start := time.Now()
-	usage, err := p.callChatCompletion(ctx, upstream, model)
-	ttftMS := int(time.Since(start).Milliseconds())
+	// 2. 发起真实推理请求（模型与 token 上限由调用方指定）
+	res.Stage = "chat"
+	usage, err := p.callChatCompletion(ctx, upstream, model, maxTokens)
+	res.TTFTMS = int(time.Since(start).Milliseconds())
 
 	if err != nil {
-		// 记录失败
+		res.Error = fmt.Sprintf("推理请求失败: %v", err)
+		// 记录失败（含来源）
 		_, _ = p.db.Pool.Exec(ctx, `
-			INSERT INTO probe_results (upstream_id, epoch, model, success, checked_at)
-			VALUES ($1, $2, $3, false, NOW())
-		`, upstream.ID, epoch, model)
-		return 0, fmt.Errorf("call completion: %w", err)
+			INSERT INTO probe_results (upstream_id, epoch, model, success, source, checked_at)
+			VALUES ($1, $2, $3, false, $4, NOW())
+		`, upstream.ID, epoch, model, source)
+		return res, fmt.Errorf("call completion: %w", err)
 	}
 
 	// 3. 读取余额后
+	res.Stage = "balance_after"
 	balanceAfter, err := p.getBalance(ctx, upstream)
 	if err != nil {
-		return 0, fmt.Errorf("get balance after: %w", err)
+		res.Error = fmt.Sprintf("读取余额失败: %v", err)
+		return res, fmt.Errorf("get balance after: %w", err)
 	}
+	res.BalanceAfter = balanceAfter
 
-	// 4. 计算实测倍率
+	// 4. 计算实测倍率（按该模型官网输入/输出价与 token 拆分）
 	cost := balanceBefore - balanceAfter
 	totalTokens := usage.PromptTokens + usage.CompletionTokens
-	var realRatio float64
-
-	if totalTokens > 0 && cost > 0 {
-		// 假设 GPT-4o 官方价格：$5/1M input, $15/1M output
-		// 这里简化为平均 $10/1M tokens 作为基准
-		basePrice := 10.0 / 1_000_000 // 每 token 的基准价格
-		realRatio = cost / float64(totalTokens) / basePrice
+	if totalTokens <= 0 {
+		totalTokens = usage.TotalTokens
 	}
+	res.Cost = cost
+	res.TokensUsed = totalTokens
+	res.PromptTokens = usage.PromptTokens
+	res.CompletionTokens = usage.CompletionTokens
 
-	// 5. 写入数据库
+	price := p.lookupModelPrice(ctx, model)
+	var officialInPerM, officialOutPerM float64
+	if price != nil {
+		officialInPerM = price.InputPerM
+		officialOutPerM = price.OutputPerM
+		res.OfficialInputPerM = officialInPerM
+		res.OfficialOutputPerM = officialOutPerM
+	}
+	res.RealRatio, res.Basis = computeRealRatio(cost, usage.PromptTokens, usage.CompletionTokens, officialInPerM, officialOutPerM)
+
+	// 5. 写入数据库（含 token 拆分、计价基准与官网价快照）
 	_, err = p.db.Pool.Exec(ctx, `
 		INSERT INTO probe_results (
 			upstream_id, epoch, model, success, real_ratio, ttft_ms, cost,
-			balance_before, balance_after, tokens_used, checked_at
-		) VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8, $9, NOW())
-	`, upstream.ID, epoch, model, realRatio, ttftMS, cost,
-		balanceBefore, balanceAfter, totalTokens)
+			balance_before, balance_after, tokens_used, prompt_tokens, completion_tokens,
+			basis, official_input_per_m, official_output_per_m, source, checked_at
+		) VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+	`, upstream.ID, epoch, model, res.RealRatio, res.TTFTMS, cost,
+		balanceBefore, balanceAfter, totalTokens, usage.PromptTokens, usage.CompletionTokens,
+		res.Basis, nullableFloat(officialInPerM), nullableFloat(officialOutPerM), source)
 
 	if err != nil {
-		return cost, fmt.Errorf("insert probe result: %w", err)
+		return res, fmt.Errorf("insert probe result: %w", err)
 	}
+	res.Stage = "ok"
+	res.Success = true
 
 	p.logger.Info("Probe succeeded",
 		zap.String("name", upstream.Name),
+		zap.String("model", model),
+		zap.String("source", source),
+		zap.String("basis", res.Basis),
 		zap.Float64("cost", cost),
-		zap.Float64("real_ratio", realRatio),
-		zap.Int("ttft_ms", ttftMS),
+		zap.Float64("real_ratio", res.RealRatio),
+		zap.Int("ttft_ms", res.TTFTMS),
 		zap.Int("tokens", totalTokens),
 	)
 
-	return cost, nil
+	return res, nil
 }
 
+// getBalance 读取站点余额（复用 BalanceChecker 的多协议探测：
+// 站点自定义余额接口 → one-api/new-api → OpenAI 官方）
 func (p *ProbeChecker) getBalance(ctx context.Context, upstream Upstream) (float64, error) {
-	url := fmt.Sprintf("%s/api/user/self", upstream.BaseURL)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	res, err := p.balance.FetchBalance(ctx, upstream)
 	if err != nil {
 		return 0, err
 	}
-
-	req.Header.Set("Authorization", "Bearer "+upstream.AccessToken)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	var userResp OneAPIUserSelfResponse
-	if err := json.NewDecoder(resp.Body).Decode(&userResp); err != nil {
-		return 0, err
-	}
-
-	if !userResp.Success {
-		return 0, fmt.Errorf("user API returned success=false")
-	}
-
-	return userResp.Data.Quota, nil
+	return res.Balance, nil
 }
 
-func (p *ProbeChecker) callChatCompletion(ctx context.Context, upstream Upstream, model string) (*Usage, error) {
+func (p *ProbeChecker) callChatCompletion(ctx context.Context, upstream Upstream, model string, maxTokens int) (*Usage, error) {
 	reqBody := ChatCompletionRequest{
 		Model: model,
 		Messages: []ChatMessage{
 			{Role: "user", Content: "Hi"},
 		},
-		MaxTokens:   16,
+		MaxTokens:   maxTokens,
 		Temperature: 0,
 		Stream:      false,
 	}

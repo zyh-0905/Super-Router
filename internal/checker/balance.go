@@ -38,7 +38,7 @@ func NewBalanceChecker(db *store.DB, logger *zap.Logger) *BalanceChecker {
 
 // CheckChannel 检测单站点余额并写入历史表
 func (b *BalanceChecker) CheckChannel(ctx context.Context, upstream Upstream) error {
-	res, err := b.fetch(ctx, upstream)
+	res, err := b.FetchBalance(ctx, upstream)
 	if err != nil {
 		_, _ = b.db.Pool.Exec(ctx, `
 			INSERT INTO balance_checks (channel_id, balance, currency, source, error, checked_at)
@@ -61,6 +61,11 @@ func (b *BalanceChecker) CheckChannel(ctx context.Context, upstream Upstream) er
 		zap.String("source", res.Source),
 	)
 	return nil
+}
+
+// FetchBalance 多协议探测站点余额（不写库，供余额检测与推理探针复用）
+func (b *BalanceChecker) FetchBalance(ctx context.Context, upstream Upstream) (*BalanceResult, error) {
+	return b.fetch(ctx, upstream)
 }
 
 // fetch 多协议探测：站点自定义接口 → one-api/new-api → OpenAI 官方

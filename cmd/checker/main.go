@@ -56,6 +56,7 @@ func main() {
 	pricingChecker := checker.NewPricingChecker(db, logger.Named("pricing"))
 	probeChecker := checker.NewProbeChecker(db, logger.Named("probe"))
 	balanceChecker := checker.NewBalanceChecker(db, logger.Named("balance"))
+	probeChecker.SetProbeModel(cfg.Checker.ProbeModel)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

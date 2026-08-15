@@ -114,6 +114,9 @@ func updateCircuitBreakerState(ctx context.Context, db *store.DB) error {
 		"degraded":  3,
 	}
 
+	// 先清空，避免渠道恢复/删除后旧标签序列残留导致告警误报
+	CircuitBreakerState.Reset()
+
 	count := 0
 	for rows.Next() {
 		var channelID int

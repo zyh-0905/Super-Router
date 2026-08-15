@@ -152,6 +152,61 @@ function saveDefaultModel() {
 const thresholdDraft = ref(1)
 const savingThreshold = ref(false)
 
+// ===== 官方模型价格 =====
+const modelPrices = ref([])
+const pricesLoading = ref(false)
+const showPriceModal = ref(false)
+const editingPrice = ref(null)
+const priceForm = ref({ model: '', input_price_per_m: null, output_price_per_m: null, note: '' })
+const savingPrice = ref(false)
+
+async function loadModelPrices() {
+  pricesLoading.value = true
+  try {
+    modelPrices.value = (await api.listModelPrices()).prices || []
+  } catch { /* 已提示 */ }
+  finally { pricesLoading.value = false }
+}
+
+function openPriceModal(p) {
+  editingPrice.value = p || null
+  priceForm.value = p
+    ? {
+        model: p.model,
+        input_price_per_m: Number(p.input_price_per_m),
+        output_price_per_m: Number(p.output_price_per_m),
+        cached_read_per_m: p.cached_read_per_m != null ? Number(p.cached_read_per_m) : null,
+        cached_write_per_m: p.cached_write_per_m != null ? Number(p.cached_write_per_m) : null,
+        note: p.note || '',
+      }
+    : { model: '', input_price_per_m: null, output_price_per_m: null, cached_read_per_m: null, cached_write_per_m: null, note: '' }
+  showPriceModal.value = true
+}
+
+async function savePrice() {
+  if (!priceForm.value.model) { toast('请填写模型名', 'error'); return }
+  if (!(Number(priceForm.value.input_price_per_m) > 0) || !(Number(priceForm.value.output_price_per_m) > 0)) {
+    toast('输入/输出价格必须大于 0', 'error'); return
+  }
+  savingPrice.value = true
+  try {
+    await api.upsertModelPrice(priceForm.value)
+    toast('官方价格已保存（立即生效）', 'success')
+    showPriceModal.value = false
+    await loadModelPrices()
+  } catch { /* 已提示 */ }
+  finally { savingPrice.value = false }
+}
+
+async function removePrice(p) {
+  if (!confirm(`确认删除「${p.model}」的官方价格？`)) return
+  try {
+    await api.deleteModelPrice(p.model)
+    toast('已删除', 'success')
+    await loadModelPrices()
+  } catch { /* 已提示 */ }
+}
+
 async function loadSettings() {
   try {
     const s = await api.getSettings()
@@ -197,7 +252,7 @@ const cfgRows = computed(() => {
   ]
 })
 
-onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSettings() })
+onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSettings(); loadModelPrices() })
 </script>
 
 <template>
@@ -221,7 +276,7 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
         <div class="field">
           <label class="field-label">API Key（Bearer Token）</label>
           <input v-model="keyDraft" type="password" class="input mono" placeholder="test-admin-key" @keyup.enter="saveConn">
-          <div class="field-hint">默认管理员 Key：<span class="mono">test-admin-key</span>（api_keys 表为空时首次启动自动创建）</div>
+          <div class="field-hint">本地开发默认 Key：<span class="mono">test-admin-key</span>（仅 config.local.yaml 开启引导时自动创建；生产环境使用启动日志中生成的一次性管理员 Key）</div>
         </div>
         <div class="row gap-2">
           <button class="btn btn-ghost" @click="testConn" :disabled="testing"><Icon name="plug" :size="14" />{{ testing ? '测试中…' : '测试连接' }}</button>
@@ -276,6 +331,37 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
             <span class="cfg-label">{{ row.label }}</span>
             <span class="cfg-val mono">{{ row.value }}</span>
           </div>
+        </div>
+      </div>
+
+      <!-- 官方模型价格 -->
+      <div class="card card-pad" style="grid-column:1/-1">
+        <div class="row">
+          <div class="set-title">官方模型价格</div>
+          <span class="spacer" />
+          <button class="btn btn-primary btn-sm" @click="openPriceModal()"><Icon name="plus" :size="13" />添加模型价格</button>
+        </div>
+        <p class="set-desc">倍率实测的官方基准价（$/1M，输入/输出分开）。价格会随官方调价变化，请以官网为准；修改后路由价格估算立即生效。</p>
+        <div v-if="pricesLoading" class="skeleton" style="height:80px" />
+        <EmptyState v-else-if="modelPrices.length === 0" icon="gauge" title="价格库为空" desc="添加模型官方价格后，实测倍率将按官网价精确换算" style="padding:26px 0" />
+        <div v-else class="table-wrap">
+          <table>
+            <thead><tr><th>模型</th><th>输入价 $/1M</th><th>输出价 $/1M</th><th>缓存读 $/1M</th><th>缓存写 $/1M</th><th>备注</th><th style="width:110px"></th></tr></thead>
+            <tbody>
+              <tr v-for="p in modelPrices" :key="p.model">
+                <td><span class="badge badge-blue mono">{{ p.model }}</span></td>
+                <td class="mono">${{ Number(p.input_price_per_m).toFixed(4) }}</td>
+                <td class="mono">${{ Number(p.output_price_per_m).toFixed(4) }}</td>
+                <td class="mono text-3">{{ p.cached_read_per_m != null ? '$' + Number(p.cached_read_per_m).toFixed(4) : '—' }}</td>
+                <td class="mono text-3">{{ p.cached_write_per_m != null ? '$' + Number(p.cached_write_per_m).toFixed(4) : '—' }}</td>
+                <td class="text-3" style="font-size:12px" :title="p.note">{{ p.note || '—' }}</td>
+                <td class="row gap-1" style="justify-content:flex-end">
+                  <button class="btn btn-ghost btn-sm" @click="openPriceModal(p)"><Icon name="pencil" :size="12" /></button>
+                  <button class="btn btn-ghost btn-sm" @click="removePrice(p)"><Icon name="trash" :size="12" /></button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -390,6 +476,29 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
       <template #footer>
         <button class="btn btn-ghost" @click="showBindGroups = false">取消</button>
         <button class="btn btn-primary" @click="saveBinding" :disabled="savingBinding">{{ savingBinding ? '保存中…' : '保存' }}</button>
+      </template>
+    </BaseModal>
+
+    <!-- 官方模型价格弹窗 -->
+    <BaseModal v-if="showPriceModal" :title="editingPrice ? '编辑官方价格' : '添加官方价格'" width="440px" @close="showPriceModal = false">
+      <div class="field">
+        <label class="field-label">模型名 *</label>
+        <input v-model="priceForm.model" class="input mono" :disabled="!!editingPrice" placeholder="如 gpt-5.5">
+        <div v-if="editingPrice" class="field-hint">模型名不可修改；需要改请删除后重新添加。</div>
+      </div>
+      <div class="form-grid-2">
+        <div class="field"><label class="field-label">官方输入价（$/1M）*</label><input v-model.number="priceForm.input_price_per_m" type="number" min="0" step="0.0001" class="input" placeholder="如 5"></div>
+        <div class="field"><label class="field-label">官方输出价（$/1M）*</label><input v-model.number="priceForm.output_price_per_m" type="number" min="0" step="0.0001" class="input" placeholder="如 30"></div>
+        <div class="field"><label class="field-label">缓存读价（$/1M，可选）</label><input v-model.number="priceForm.cached_read_per_m" type="number" min="0" step="0.0001" class="input" placeholder="留空 = 不支持/未知"></div>
+        <div class="field"><label class="field-label">缓存写价（$/1M，可选）</label><input v-model.number="priceForm.cached_write_per_m" type="number" min="0" step="0.0001" class="input" placeholder="留空 = 不支持/按小时计费"></div>
+      </div>
+      <div class="field">
+        <label class="field-label">备注（可选）</label>
+        <input v-model="priceForm.note" class="input" placeholder="如：OpenAI 官方 2026-08">
+      </div>
+      <template #footer>
+        <button class="btn btn-ghost" @click="showPriceModal = false">取消</button>
+        <button class="btn btn-primary" @click="savePrice" :disabled="savingPrice">{{ savingPrice ? '保存中…' : '保存' }}</button>
       </template>
     </BaseModal>
   </div>

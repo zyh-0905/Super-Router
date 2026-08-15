@@ -11,7 +11,7 @@
 - **5 种路由策略**：`custom_priority`（自定义优先级，默认）、`price_first`（低价）、`latency_first`（低延迟）、`reliability_first`（高成功率）、`balanced`（加权综合）
 - 策略查找链：Token×模型 → Token → **分组默认** → 系统默认
 - 8 类硬过滤：禁用、模型不支持、能力缺失、熔断中、超价格上限等
-- 首字节前故障切换（最多 3 次候选）；四态熔断器 closed → open → half_open → degraded，指数退避冷却
+- 首字节前故障切换（最多 3 次候选）；四态熔断器 closed → open → half_open → degraded，指数退避冷却，冷却到期自动半开并按 `half_open_probe_count` 放行探测流量自愈
 
 ### 🗂 中转站分组
 - 扁平**多对多分组**：一个站点可属于多个分组；站点/分组/Key 归属全部界面化管理
@@ -153,6 +153,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | 站点 CRUD | `GET/POST/PATCH/DELETE /admin/channels[/:id]` |
 | 站点健康 / 余额 | `GET /admin/health/:id` · `GET /admin/channels/:id/balance` |
 | 上游模型列表 | `GET /admin/channels/:id/models` · `POST /admin/upstream/models` |
+| 实时倍率 | `GET /admin/channels/:id/ratio` · `POST /admin/channels/:id/probe-ratio`（按需实测，计入每日探测预算） |
+| 倍率检测分组 | `POST/PATCH/DELETE /admin/channels/:id/ratio-groups[/:gid]` · `POST /admin/channels/:id/ratio-groups/:gid/probe`（每组自定义默认检测模型） |
 | 分组 CRUD | `GET/POST /admin/groups` · `PATCH/DELETE /admin/groups/:id` |
 | 统计聚合 | `GET /admin/stats[?group_id=]` |
 | 决策日志 | `GET /admin/decisions?limit=[&group_id=]` |
@@ -175,11 +177,13 @@ checker:
   probe_interval: 1h       # 推理探针
   balance_interval: 10m    # 余额检测
   daily_probe_budget: 5.00 # 全局每日探针预算（美元）
+  probe_model: "gpt-4o"    # 推理探针使用的模型
 routing:
   default_strategy: custom_priority
   max_attempts: 3
   total_budget_ms: 15000
   circuit_breaker: {...}   # 熔断参数（分组可覆盖）
+  balanced_weights: {...}  # balanced 策略权重（cost/reliability/latency/load）
 ```
 
 环境变量覆盖：`DATABASE_HOST/PORT/USER/PASSWORD/NAME`、`REDIS_HOST/PORT`。

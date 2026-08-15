@@ -14,8 +14,16 @@ import (
 type HealthSnapshot struct {
 	Epoch       int64                  `json:"epoch"`
 	Channels    map[int]*ChannelHealth `json:"channels"`
+	ModelPrices map[string]*ModelPrice `json:"model_prices"`
 	GeneratedAt time.Time              `json:"generated_at"`
 	ContentHash string                 `json:"content_hash"`
+}
+
+// ModelPrice 官方模型价格（$/1M）
+type ModelPrice struct {
+	Model       string  `json:"model"`
+	InputPerM   float64 `json:"input_per_m"`
+	OutputPerM  float64 `json:"output_per_m"`
 }
 
 // ChannelHealth 单个渠道的健康数据
@@ -35,6 +43,10 @@ type ChannelHealth struct {
 	IsAlive       bool                     `json:"is_alive"`
 	DeclaredPrice map[string]*PriceProfile `json:"declared_price"`
 	RealRatio     map[string]float64       `json:"real_ratio"`
+	RealRatioBasis map[string]string       `json:"real_ratio_basis"` // official | baseline
+	// 探测当时使用的官网价快照（价格库调整后历史倍率仍保持一致）
+	RealRatioOfficialInPerM  map[string]float64 `json:"real_ratio_official_in_per_m"`
+	RealRatioOfficialOutPerM map[string]float64 `json:"real_ratio_official_out_per_m"`
 	TTFTP50       map[string]int           `json:"ttft_p50"`
 	TTFTP95       map[string]int           `json:"ttft_p95"`
 
@@ -59,6 +71,15 @@ type PriceProfile struct {
 
 const snapshotCacheKey = "router:snapshot"
 const snapshotCacheTTL = 10 * time.Second
+
+// InvalidateSnapshotCache 清除快照缓存。
+// 手动实测倍率/站点配置变更后调用，使下一请求立即基于新数据路由。
+func InvalidateSnapshotCache(ctx context.Context, redis *store.RedisClient) {
+	if redis == nil || redis.Client == nil {
+		return
+	}
+	redis.Client.Del(ctx, snapshotCacheKey)
+}
 
 // LoadSnapshot 加载当前快照（带 Redis 缓存）
 func LoadSnapshot(ctx context.Context, db *store.DB, redis *store.RedisClient) (*HealthSnapshot, error) {
@@ -101,6 +122,7 @@ func buildSnapshot(ctx context.Context, db *store.DB) (*HealthSnapshot, error) {
 	snapshot := &HealthSnapshot{
 		Epoch:       epoch,
 		Channels:    make(map[int]*ChannelHealth),
+		ModelPrices: loadModelPrices(ctx, db),
 		GeneratedAt: time.Now(),
 	}
 
@@ -165,6 +187,9 @@ func loadChannels(ctx context.Context, db *store.DB) ([]*ChannelHealth, error) {
 		ch := &ChannelHealth{
 			DeclaredPrice: make(map[string]*PriceProfile),
 			RealRatio:     make(map[string]float64),
+			RealRatioBasis: make(map[string]string),
+			RealRatioOfficialInPerM:  make(map[string]float64),
+			RealRatioOfficialOutPerM: make(map[string]float64),
 			TTFTP50:       make(map[string]int),
 			TTFTP95:       make(map[string]int),
 			GroupIDs:      []int{},
@@ -257,11 +282,14 @@ func loadDeclaredPrices(ctx context.Context, db *store.DB, ch *ChannelHealth, ep
 }
 
 func loadProbeResults(ctx context.Context, db *store.DB, ch *ChannelHealth, epoch int64) error {
+	// 按 checked_at 取每个模型的最新一次成功探测：
+	// 手动实测（source=manual）与定时探针写入同一 epoch，按时间取最新才正确
 	rows, err := db.Pool.Query(ctx, `
-		SELECT DISTINCT ON (model) model, real_ratio, ttft_ms
+		SELECT DISTINCT ON (model) model, real_ratio, ttft_ms, basis,
+		       COALESCE(official_input_per_m, 0), COALESCE(official_output_per_m, 0)
 		FROM probe_results
 		WHERE upstream_id = $1 AND epoch <= $2 AND success = true
-		ORDER BY model, epoch DESC
+		ORDER BY model, checked_at DESC
 	`, ch.ID, epoch)
 	if err != nil {
 		return err
@@ -272,16 +300,43 @@ func loadProbeResults(ctx context.Context, db *store.DB, ch *ChannelHealth, epoc
 		var model string
 		var realRatio float64
 		var ttftMS int
-		if err := rows.Scan(&model, &realRatio, &ttftMS); err != nil {
+		var basis string
+		var officialInPerM, officialOutPerM float64
+		if err := rows.Scan(&model, &realRatio, &ttftMS, &basis, &officialInPerM, &officialOutPerM); err != nil {
 			continue
 		}
 
 		ch.RealRatio[model] = realRatio
+		ch.RealRatioBasis[model] = basis
+		ch.RealRatioOfficialInPerM[model] = officialInPerM
+		ch.RealRatioOfficialOutPerM[model] = officialOutPerM
 		ch.TTFTP50[model] = ttftMS                     // 简化：单个值作为 P50
 		ch.TTFTP95[model] = int(float64(ttftMS) * 1.2) // 简化：P95 约为 P50 的 1.2 倍
 	}
 
 	return rows.Err()
+}
+
+// loadModelPrices 加载官方模型价格库（快照全局共享，失败返回空表）
+func loadModelPrices(ctx context.Context, db *store.DB) map[string]*ModelPrice {
+	prices := map[string]*ModelPrice{}
+	rows, err := db.Pool.Query(ctx, `
+		SELECT model, input_price_per_m, output_price_per_m FROM model_prices
+	`)
+	if err != nil {
+		return prices
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var p ModelPrice
+		if err := rows.Scan(&p.Model, &p.InputPerM, &p.OutputPerM); err != nil {
+			continue
+		}
+		cp := p
+		prices[p.Model] = &cp
+	}
+	return prices
 }
 
 func loadRequestHistory(ctx context.Context, db *store.DB, ch *ChannelHealth) error {
@@ -309,12 +364,22 @@ func loadRequestHistory(ctx context.Context, db *store.DB, ch *ChannelHealth) er
 	return nil
 }
 
+// loadCircuitState 读取渠道级熔断状态（取该渠道所有模型行中的最严重状态）。
+// 说明：UpdateCircuitState 按 (channel_id, model) 写入各行，而快照/过滤器是渠道粒度的，
+// 因此聚合最严重状态作为渠道状态（open > degraded > half_open > closed）。
+// open 且冷却到期 → 视为 half_open（时间驱动转换，探测流量由代理层按名额限流）。
 func loadCircuitState(ctx context.Context, db *store.DB, ch *ChannelHealth) error {
-	// 读取通用熔断状态（capability=''）
 	err := db.Pool.QueryRow(ctx, `
-		SELECT state, COALESCE(cooling_until, '1970-01-01'::timestamp)
+		SELECT
+			CASE
+				WHEN COUNT(*) FILTER (WHERE state = 'open') > 0 THEN 'open'
+				WHEN COUNT(*) FILTER (WHERE state = 'degraded') > 0 THEN 'degraded'
+				WHEN COUNT(*) FILTER (WHERE state = 'half_open') > 0 THEN 'half_open'
+				ELSE 'closed'
+			END AS worst_state,
+			COALESCE(MAX(cooling_until) FILTER (WHERE state = 'open'), '1970-01-01'::timestamp) AS cooling_until
 		FROM circuit_states
-		WHERE channel_id = $1 AND model = '' AND capability = ''
+		WHERE channel_id = $1 AND capability = ''
 	`, ch.ID).Scan(&ch.CircuitState, &ch.CoolingUntil)
 
 	if err != nil {
@@ -324,17 +389,29 @@ func loadCircuitState(ctx context.Context, db *store.DB, ch *ChannelHealth) erro
 		return nil
 	}
 
+	ch.CircuitState = EffectiveCircuitState(ch.CircuitState, ch.CoolingUntil, time.Now())
 	return nil
+}
+
+// EffectiveCircuitState 时间驱动的状态换算：open 且冷却到期 → half_open。
+// 冷却截止取所有 open 行中的最大值（只有全部开闸行都冷却完成才允许探测）。
+func EffectiveCircuitState(state string, coolingUntil, now time.Time) string {
+	if state == "open" && !coolingUntil.IsZero() && !now.Before(coolingUntil) {
+		return "half_open"
+	}
+	return state
 }
 
 func computeSnapshotHash(snapshot *HealthSnapshot) string {
 	// 序列化快照内容（不包括 generated_at 和 content_hash 本身）
 	data, _ := json.Marshal(struct {
-		Epoch    int64                  `json:"epoch"`
-		Channels map[int]*ChannelHealth `json:"channels"`
+		Epoch       int64                  `json:"epoch"`
+		Channels    map[int]*ChannelHealth `json:"channels"`
+		ModelPrices map[string]*ModelPrice `json:"model_prices"`
 	}{
-		Epoch:    snapshot.Epoch,
-		Channels: snapshot.Channels,
+		Epoch:       snapshot.Epoch,
+		Channels:    snapshot.Channels,
+		ModelPrices: snapshot.ModelPrices,
 	})
 
 	hash := sha256.Sum256(data)

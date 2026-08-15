@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -137,36 +139,55 @@ func hashAPIKey(apiKey string) string {
 	return fmt.Sprintf("%x", hash)
 }
 
-// EnsureDefaultKeys 在 api_keys 表为空时写入默认开发用 Key
-// （test-admin-key → admin，test-caller-key → caller）
-func EnsureDefaultKeys(db *store.DB) error {
+// EnsureDefaultKeys 初始化管理员 Key：
+// - bootstrap=true（本地开发）：表为空时写入 test-admin-key / test-caller-key；
+// - bootstrap=false（生产）：表为空时生成随机管理员 Key，仅通过日志打印一次，
+//   返回该 Key 供启动日志展示，绝不写死公开凭据。
+func EnsureDefaultKeys(db *store.DB, bootstrap bool) (string, error) {
 	ctx := context.Background()
 
 	var count int
 	if err := db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM api_keys`).Scan(&count); err != nil {
-		return err
+		return "", err
 	}
 	if count > 0 {
-		return nil
+		return "", nil
 	}
 
-	defaults := []struct {
-		key  string
-		role string
-	}{
-		{"test-admin-key", "admin"},
-		{"test-caller-key", "caller"},
-	}
-
-	for _, d := range defaults {
-		_, err := db.Pool.Exec(ctx, `
-			INSERT INTO api_keys (key_hash, key_prefix, role, enabled)
-			VALUES ($1, $2, $3, true)
-			ON CONFLICT (key_hash) DO NOTHING
-		`, hashAPIKey(d.key), d.key[:8], d.role)
-		if err != nil {
-			return err
+	if bootstrap {
+		defaults := []struct {
+			key  string
+			role string
+		}{
+			{"test-admin-key", "admin"},
+			{"test-caller-key", "caller"},
 		}
+
+		for _, d := range defaults {
+			_, err := db.Pool.Exec(ctx, `
+				INSERT INTO api_keys (key_hash, key_prefix, role, enabled)
+				VALUES ($1, $2, $3, true)
+				ON CONFLICT (key_hash) DO NOTHING
+			`, hashAPIKey(d.key), d.key[:8], d.role)
+			if err != nil {
+				return "", err
+			}
+		}
+		return "", nil
 	}
-	return nil
+
+	// 生产模式：随机生成一次性管理员 Key
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	generated := "sr-" + hex.EncodeToString(buf)
+	if _, err := db.Pool.Exec(ctx, `
+		INSERT INTO api_keys (key_hash, key_prefix, role, enabled)
+		VALUES ($1, $2, 'admin', true)
+		ON CONFLICT (key_hash) DO NOTHING
+	`, hashAPIKey(generated), generated[:8]); err != nil {
+		return "", err
+	}
+	return generated, nil
 }

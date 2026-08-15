@@ -1,4 +1,6 @@
 
+name: smart-router
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -8,7 +10,7 @@ services:
       POSTGRES_PASSWORD: gateway_pass
       POSTGRES_DB: smart_router
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d
@@ -19,12 +21,13 @@ services:
       retries: 5
     networks:
       - router_net
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     container_name: smart-router-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
@@ -35,6 +38,7 @@ services:
       retries: 5
     networks:
       - router_net
+    restart: unless-stopped
 
   gateway:
     build: .

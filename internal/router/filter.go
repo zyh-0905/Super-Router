@@ -37,10 +37,11 @@ type FilterRequest struct {
 // HardFilter 硬过滤器
 type HardFilter struct {
 	policy *Policy
+	prices map[string]*ModelPrice
 }
 
-func NewHardFilter(policy *Policy) *HardFilter {
-	return &HardFilter{policy: policy}
+func NewHardFilter(policy *Policy, prices map[string]*ModelPrice) *HardFilter {
+	return &HardFilter{policy: policy, prices: prices}
 }
 
 // Filter 执行硬过滤，返回排除原因（nil 表示通过）
@@ -86,7 +87,7 @@ func (f *HardFilter) Filter(ch *ChannelHealth, req *FilterRequest) *Exclusion {
 
 	// 6. 预计成本超过策略价格上限
 	maxPriceCap := f.policy.GetConfigFloat("max_price_cap", 100.0)
-	estimatedCost := f.estimateCost(ch, req)
+	estimatedCost := estimateCost(ch, req, f.policy, f.prices)
 	if estimatedCost > maxPriceCap {
 		return &Exclusion{
 			ChannelID: ch.ID,
@@ -97,16 +98,14 @@ func (f *HardFilter) Filter(ch *ChannelHealth, req *FilterRequest) *Exclusion {
 	// 7. 熔断状态不允许正常流量
 	switch ch.CircuitState {
 	case "open":
+		// 冷却未到期的开闸：禁止流量（冷却到期后快照会将其视为 half_open）
 		return &Exclusion{
 			ChannelID: ch.ID,
 			Reason:    ExcludeCircuitOpen,
 		}
 	case "half_open":
-		// half_open 只允许探测请求，正常请求排除
-		return &Exclusion{
-			ChannelID: ch.ID,
-			Reason:    ExcludeCircuitHalfOpen,
-		}
+		// 半开：放行探测流量，由代理层按 half_open_probe_count 限额。
+		// 不能在过滤层排除，否则 open → half_open 后永远没有流量，熔断无法自愈。
 	case "cooling":
 		if time.Now().Before(ch.CoolingUntil) {
 			return &Exclusion{
@@ -129,30 +128,4 @@ func (f *HardFilter) Filter(ch *ChannelHealth, req *FilterRequest) *Exclusion {
 
 	// 通过所有过滤
 	return nil
-}
-
-// estimateCost 估算请求成本
-func (f *HardFilter) estimateCost(ch *ChannelHealth, req *FilterRequest) float64 {
-	// 优先使用实测倍率
-	var inputPrice, outputPrice float64
-
-	if ratio, ok := ch.RealRatio[req.Model]; ok && ratio > 0 {
-		// 使用实测倍率（假设基准价 $10/1M tokens）
-		basePrice := 10.0 / 1_000_000
-		inputPrice = ratio * basePrice
-		outputPrice = ratio * basePrice
-	} else if price, ok := ch.DeclaredPrice[req.Model]; ok {
-		// 使用声明价格
-		inputPrice = price.InputPrice / 1_000_000
-		outputPrice = price.OutputPrice / 1_000_000
-	} else {
-		// 无价格信息，使用保守估计
-		inputPrice = 10.0 / 1_000_000
-		outputPrice = 30.0 / 1_000_000
-	}
-
-	// 估算成本
-	estimatedCost := float64(req.EstimatedInput)*inputPrice + float64(req.MaxOutput)*outputPrice
-
-	return estimatedCost
 }

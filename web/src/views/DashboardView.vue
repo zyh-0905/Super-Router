@@ -8,7 +8,7 @@ import BaseChart from '../components/BaseChart.vue'
 import EmptyState from '../components/EmptyState.vue'
 import GroupSwitcher from '../components/GroupSwitcher.vue'
 import Icon from '../components/Icon.vue'
-import { fmtTime, fmtNum, fmtMs, fmtPct, fmtAgo } from '../utils'
+import { fmtTime, fmtNum, fmtMs, fmtPct, fmtAgo, fmtDate } from '../utils'
 
 const router = useRouter()
 const loading = ref(true)
@@ -87,16 +87,163 @@ const modelOption = computed(() => {
 // ---- 告警 ----
 const alertIcon = a => (a.sev === 'critical' ? 'alert' : 'alert')
 
+// ---- 站点综合信息（抽屉叠放）----
+const metricsStackEl = ref(null)
+const currentRatioIdx = ref(0)
+const probingRatioChannel = ref(null)
+const metrics = ref(null)
+const metricChannels = computed(() => metrics.value?.channels || [])
+
+function onRatioScroll() {
+  const el = metricsStackEl.value
+  if (!el) return
+  const idx = Math.round(el.scrollTop / el.clientHeight)
+  currentRatioIdx.value = Math.max(0, Math.min(idx, metricChannels.value.length - 1))
+}
+
+function scrollRatioTo(i) {
+  const el = metricsStackEl.value
+  if (!el) return
+  const idx = Math.max(0, Math.min(i, metricChannels.value.length - 1))
+  el.scrollTo({ top: idx * el.clientHeight, behavior: 'smooth' })
+  currentRatioIdx.value = idx
+}
+
+async function probeChannelRatio(ch) {
+  if (probingRatioChannel.value) return
+  if (!ch.default_probe_model) { toast('该站点无可用模型，无法实测', 'error'); return }
+  probingRatioChannel.value = ch.id
+  try {
+    await api.probeRatio(ch.id, ch.default_probe_model, 64)
+    toast(`「${ch.name}」实测完成`, 'success')
+    await load()
+  } catch { /* api 层已提示 */ }
+  finally { probingRatioChannel.value = null }
+}
+
+// ---- 五个迷你图 option 构建器 ----
+
+// 倍率：各模型实测倍率横向条形图（超限红色）
+function ratioBarOption(ch) {
+  const data = [...(ch.ratios || [])]
+    .map(mr => ({
+      value: Number(mr.real_ratio),
+      model: mr.model,
+      source: mr.source,
+      checked: mr.checked_at,
+      over: ch.ratio_limit > 0 && Number(mr.real_ratio) > Number(ch.ratio_limit),
+      itemStyle: { color: ch.ratio_limit > 0 && Number(mr.real_ratio) > Number(ch.ratio_limit) ? '#ff453a' : '#0a84ff', borderRadius: 4 },
+    }))
+    .sort((a, b) => b.value - a.value)
+  return {
+    grid: { left: 86, right: 14, top: 8, bottom: 18 },
+    xAxis: { type: 'value', axisLabel: { fontSize: 9, formatter: '{value}x' } },
+    yAxis: { type: 'category', data: data.map(d => d.model), axisLabel: { fontSize: 9.5, width: 80, overflow: 'truncate' } },
+    tooltip: {
+      trigger: 'item',
+      formatter: p => {
+        const d = p.data
+        return `${d.model}<br/>实测倍率: <b>${Number(d.value).toFixed(4)}x</b><br/>单价: $${(d.value * 10).toFixed(2)}/1M<br/>来源: ${d.source === 'manual' ? '手动' : '定时'}<br/>时间: ${fmtDate(d.checked)}`
+      },
+    },
+    series: [{ type: 'bar', data, barMaxWidth: 11 }],
+  }
+}
+
+// 余额：24h 折线
+function balanceLineOption(ch) {
+  const series = ch.balance_series || []
+  return {
+    grid: { left: 46, right: 12, top: 8, bottom: 18 },
+    xAxis: { type: 'category', data: series.map(s => s.t.slice(5, 16).replace('T', ' ')), axisLabel: { fontSize: 9, interval: Math.max(0, Math.floor(series.length / 6)) } },
+    yAxis: { type: 'value', axisLabel: { fontSize: 9, formatter: '${value}' } },
+    tooltip: {
+      trigger: 'axis',
+      formatter: ps => {
+        const p = Array.isArray(ps) ? ps[0] : ps
+        const s = series[p?.dataIndex]
+        return s ? `${fmtDate(s.t)}<br/>余额: <b>$${Number(s.v).toFixed(4)}</b>` : ''
+      },
+    },
+    series: [{
+      type: 'line', smooth: true, symbol: 'none', data: series.map(s => s.v),
+      lineStyle: { color: '#30d158', width: 1.8 },
+      areaStyle: { color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [{ offset: 0, color: 'rgba(48,209,88,0.15)' }, { offset: 1, color: 'rgba(48,209,88,0)' }] } },
+    }],
+  }
+}
+
+// 成功率 / 延迟：24h 小时桶折线
+function hourlyOption(ch, kind) {
+  const hourly = ch.hourly || []
+  const isRate = kind === 'rate'
+  const data = hourly.map(h => {
+    if (isRate) return h.success_rate != null ? Number((h.success_rate * 100).toFixed(1)) : null
+    return h.latency_ms != null ? Math.round(h.latency_ms) : null
+  })
+  return {
+    grid: { left: 42, right: 10, top: 8, bottom: 18 },
+    xAxis: { type: 'category', data: hourly.map(h => h.hour), axisLabel: { fontSize: 9, interval: 5 } },
+    yAxis: { type: 'value', axisLabel: { fontSize: 9, formatter: isRate ? '{value}%' : '{value}ms' } },
+    tooltip: {
+      trigger: 'axis',
+      formatter: ps => {
+        const p = Array.isArray(ps) ? ps[0] : ps
+        const h = hourly[p?.dataIndex]
+        if (!h) return ''
+        return isRate
+          ? `${h.hour}<br/>成功率: <b>${h.success_rate != null ? (h.success_rate * 100).toFixed(1) + '%' : '—'}</b><br/>请求: ${h.count}`
+          : `${h.hour}<br/>平均延迟: <b>${h.latency_ms != null ? Math.round(h.latency_ms) + 'ms' : '—'}</b><br/>请求: ${h.count}`
+      },
+    },
+    series: [{
+      type: 'line', smooth: true, symbol: 'none', connectNulls: false, data,
+      lineStyle: { color: isRate ? '#0a84ff' : '#ff9f0a', width: 1.8 },
+    }],
+  }
+}
+
+// 健康：最近 50 次存活探测点阵条（绿=存活 红=离线）
+function healthBarOption(ch) {
+  const health = ch.health || []
+  const data = health.map(h => ({
+    value: 1,
+    alive: h.alive,
+    time: h.checked_at,
+    lat: h.latency_ms,
+    itemStyle: { color: h.alive ? '#30d158' : '#ff453a', borderRadius: 2 },
+  }))
+  return {
+    grid: { left: 8, right: 8, top: 6, bottom: 6 },
+    xAxis: { type: 'category', show: false, data: health.map((_, i) => i) },
+    yAxis: { type: 'value', show: false, min: 0, max: 1 },
+    tooltip: {
+      trigger: 'item',
+      formatter: p => {
+        const d = p.data
+        return `${fmtDate(d.time)}<br/>${d.alive ? '✓ 存活' : '✗ 离线'}${d.lat != null ? `<br/>延迟: ${d.lat}ms` : ''}`
+      },
+    },
+    series: [{ type: 'bar', data, barWidth: '55%' }],
+  }
+}
+
 async function load() {
   loading.value = true
   try {
-    const [s, d] = await Promise.all([api.stats(store.currentGroup), api.decisions(10, store.currentGroup)])
+    const [s, d, m] = await Promise.all([
+      api.stats(store.currentGroup),
+      api.decisions(10, store.currentGroup),
+      api.channelMetrics(store.currentGroup),
+    ])
     stats.value = s
     store.stats = s
     store.groups = s.groups || []
     store.alerts = s.alerts || []
     store.epoch = s.epoch != null ? String(s.epoch) : null
     decisions.value = d.decisions || []
+    metrics.value = m
+    currentRatioIdx.value = 0
   } catch { /* 错误已由 api 层 toast */ }
   finally {
     loading.value = false
@@ -164,6 +311,71 @@ onMounted(load)
       </div>
     </div>
 
+    <!-- 站点综合信息（抽屉叠放） -->
+    <div class="card mb-4">
+      <div class="card-head" style="flex-wrap:wrap;gap:8px">
+        站点综合信息
+        <span class="sub">倍率 · 余额 · 健康 · 成功率 · 延迟（24h）</span>
+        <span class="spacer" />
+        <button class="btn btn-ghost btn-sm" :disabled="!metricChannels.length || currentRatioIdx <= 0" @click="scrollRatioTo(currentRatioIdx - 1)">
+          <Icon name="chevron_up" :size="13" />
+        </button>
+        <span class="mono text-3" style="font-size:12px;min-width:52px;text-align:center">
+          {{ metricChannels.length ? (currentRatioIdx + 1) + ' / ' + metricChannels.length : '0 / 0' }}
+        </span>
+        <button class="btn btn-ghost btn-sm" :disabled="!metricChannels.length || currentRatioIdx >= metricChannels.length - 1" @click="scrollRatioTo(currentRatioIdx + 1)">
+          <Icon name="chevron_down" :size="13" />
+        </button>
+      </div>
+      <div v-if="loading" class="skeleton" style="height:430px;margin:0 18px 18px" />
+      <EmptyState v-else-if="metricChannels.length === 0" icon="server" title="暂无站点数据"
+        desc="添加站点并完成一次实测后，这里会显示每个站点的倍率、余额、健康、成功率与延迟" style="padding:48px 0" />
+      <div v-else ref="metricsStackEl" class="ratio-stack" style="height:448px" @scroll="onRatioScroll">
+        <div v-for="ch in metricChannels" :key="ch.id" class="ratio-drawer">
+          <div class="row gap-2" style="align-items:center;flex-wrap:wrap">
+            <span class="dot" :class="!ch.enabled ? 'dot dot-gray' : ch.over_limit ? 'dot dot-red dot-pulse' : 'dot dot-green'" />
+            <span style="font-size:14.5px;font-weight:700">{{ ch.name }}</span>
+            <span class="badge" :class="ch.enabled ? 'badge-green' : 'badge-gray'">{{ ch.enabled ? '已启用' : '已禁用' }}</span>
+            <span v-if="ch.over_limit" class="badge badge-red">倍率超上限</span>
+            <span v-if="ch.balance_current" class="badge mono" :class="Number(ch.balance_current.balance) <= 1 ? 'badge-red' : 'badge-green'">
+              💰 ${{ Number(ch.balance_current.balance).toFixed(2) }}
+            </span>
+            <span class="badge badge-gray mono">上限 {{ ch.ratio_limit > 0 ? Number(ch.ratio_limit).toFixed(4) + 'x' : '不限' }}</span>
+            <span class="spacer" />
+            <button class="btn btn-ghost btn-sm" :disabled="probingRatioChannel != null || !ch.default_probe_model" @click="probeChannelRatio(ch)">
+              <Icon name="bolt" :size="12" />{{ probingRatioChannel === ch.id ? '实测中…' : '立即实测 ' + (ch.default_probe_model || '') }}
+            </button>
+            <router-link :to="{ path: '/channels', query: { select: ch.id } }" class="btn btn-ghost btn-sm">详情</router-link>
+          </div>
+          <div class="metric-grid">
+            <div class="metric-cell">
+              <div class="metric-title">倍率（各模型实测，悬停看详情）</div>
+              <BaseChart v-if="ch.ratios.length" :option="ratioBarOption(ch)" height="112px" />
+              <div v-else class="text-3 metric-empty">暂无实测数据，点击「立即实测」</div>
+            </div>
+            <div class="metric-cell">
+              <div class="metric-title">余额（24h）</div>
+              <BaseChart v-if="(ch.balance_series || []).length" :option="balanceLineOption(ch)" height="112px" />
+              <div v-else class="text-3 metric-empty">暂无余额记录</div>
+            </div>
+            <div class="metric-cell">
+              <div class="metric-title">成功率（24h · 每小时）</div>
+              <BaseChart :option="hourlyOption(ch, 'rate')" height="112px" />
+            </div>
+            <div class="metric-cell">
+              <div class="metric-title">延迟（24h · 每小时）</div>
+              <BaseChart :option="hourlyOption(ch, 'lat')" height="112px" />
+            </div>
+            <div class="metric-cell metric-cell-full">
+              <div class="metric-title">健康（最近 50 次存活探测，悬停看时间与延迟）</div>
+              <BaseChart v-if="ch.health.length" :option="healthBarOption(ch)" height="58px" />
+              <div v-else class="text-3 metric-empty">暂无存活探测记录</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 告警 + 最近决策 -->
     <div class="grid-2">
       <div class="card">
@@ -212,4 +424,44 @@ onMounted(load)
 .alert-row:first-child { padding-top: 2px; }
 .dec-row { padding: 9px 22px; cursor: pointer; transition: background var(--dur) var(--ease); }
 .dec-row:hover { background: var(--surface-hover); }
+
+/* 站点综合信息：抽屉叠放（滚轮吸附切换） */
+.ratio-stack {
+  height: 448px;
+  overflow-y: auto;
+  scroll-snap-type: y mandatory;
+  border-top: 1px solid var(--border);
+  scroll-behavior: smooth;
+}
+.ratio-drawer {
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  height: 100%;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ratio-drawer:last-child { border-bottom: none; }
+
+/* 五图网格 */
+.metric-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+}
+.metric-cell {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 6px 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.metric-cell-full { grid-column: 1 / -1; }
+.metric-title { font-size: 10.5px; color: var(--text-3); margin-bottom: 2px; }
+.metric-empty { font-size: 12px; padding: 16px 0; text-align: center; }
 </style>

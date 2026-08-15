@@ -37,7 +37,7 @@ open http://localhost:5173/
 | 路由 | 页面 | 说明 |
 |---|---|---|
 | `#/` | 总览 | 24h 请求/成功率/延迟（同比）、趋势图、模型分布、告警、最近决策、**分组切换器** |
-| `#/channels` | 站点 | 站点列表（**分组筛选 chips**、**余额徽章**）、详情（信息/健康/统计/**余额**）、新增/编辑（**多选分组**）、**分组管理**（增删改+策略/熔断/检测参数）、获取上游模型 |
+| `#/channels` | 站点 | 站点列表（**分组筛选 chips**、**余额徽章**）、详情（信息/健康/统计/余额/**倍率**）、新增/编辑（**多选分组**）、**分组管理**（增删改+策略/熔断/检测参数）、获取上游模型 |
 | `#/playground` | 测试台 | 真实流式请求、**分组选择**（限定路由范围）、路由决策信息 |
 | `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉 |
 | `#/circuit` | 熔断 | 四态熔断器、**分组切换器**、重置 |
@@ -90,6 +90,7 @@ web/
 | 站点 CRUD | `GET/POST/PATCH/DELETE /admin/channels[/:id]` |
 | 站点健康 | `GET /admin/health/:id` |
 | 上游模型列表 | `GET /admin/channels/:id/models` · `POST /admin/upstream/models` |
+| **实时倍率** | `GET /admin/channels/:id/ratio`（声明/实测/历史/**分组**） · `POST /admin/channels/:id/probe-ratio`（按需实测） · `POST/PATCH/DELETE /admin/channels/:id/ratio-groups[/:gid]` · `POST .../ratio-groups/:gid/probe` |
 | **分组 CRUD** | `GET/POST /admin/groups` · `PATCH/DELETE /admin/groups/:id` |
 | 统计聚合 | `GET /admin/stats[?group_id=]` |
 | 决策日志 | `GET /admin/decisions?limit=[&group_id=]` |

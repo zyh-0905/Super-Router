@@ -1,6 +1,7 @@
 package router
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -38,7 +39,7 @@ func TestCustomPriorityStrategy(t *testing.T) {
 	policy := &Policy{Strategy: "custom_priority", Config: map[string]interface{}{}}
 
 	strategy := &CustomPriorityStrategy{}
-	scored := strategy.Sort(candidates, req, policy)
+	scored := strategy.Sort(candidates, req, policy, nil)
 
 	// 验证排序：primary 优先，然后按 user_priority
 	if scored[0].Channel.ID != 1 {
@@ -86,7 +87,7 @@ func TestPriceFirstStrategy(t *testing.T) {
 	}
 
 	strategy := &PriceFirstStrategy{}
-	scored := strategy.Sort(candidates, req, policy)
+	scored := strategy.Sort(candidates, req, policy, nil)
 
 	// 验证排序：便宜的优先
 	if scored[0].Channel.ID != 2 {
@@ -130,7 +131,7 @@ func TestLatencyFirstStrategy(t *testing.T) {
 	policy := &Policy{Strategy: "latency_first", Config: map[string]interface{}{}}
 
 	strategy := &LatencyFirstStrategy{}
-	scored := strategy.Sort(candidates, req, policy)
+	scored := strategy.Sort(candidates, req, policy, nil)
 
 	// 验证排序：快的优先
 	if scored[0].Channel.ID != 2 {
@@ -171,7 +172,7 @@ func TestReliabilityFirstStrategy(t *testing.T) {
 	policy := &Policy{Strategy: "reliability_first", Config: map[string]interface{}{}}
 
 	strategy := &ReliabilityFirstStrategy{}
-	scored := strategy.Sort(candidates, req, policy)
+	scored := strategy.Sort(candidates, req, policy, nil)
 
 	// 验证排序：可靠性高的优先
 	if scored[0].Channel.ID != 2 {
@@ -228,7 +229,7 @@ func TestBalancedStrategy(t *testing.T) {
 	}
 
 	strategy := &BalancedStrategy{}
-	scored := strategy.Sort(candidates, req, policy)
+	scored := strategy.Sort(candidates, req, policy, nil)
 
 	// 验证：所有渠道都有得分
 	if len(scored) != 3 {
@@ -252,7 +253,7 @@ func TestHardFilter(t *testing.T) {
 			"max_ttft_ms":   1000, // 延迟上限 1000ms
 		},
 	}
-	filter := NewHardFilter(policy)
+	filter := NewHardFilter(policy, nil)
 
 	req := &FilterRequest{
 		Model:          "gpt-4o",
@@ -343,7 +344,7 @@ func TestStableSorting(t *testing.T) {
 	// 运行 1000 次，验证结果一致
 	var firstOrder []int
 	for i := 0; i < 1000; i++ {
-		scored := strategy.Sort(candidates, req, policy)
+		scored := strategy.Sort(candidates, req, policy, nil)
 
 		if i == 0 {
 			// 记录第一次的顺序
@@ -373,7 +374,7 @@ func TestCircuitStateCooling(t *testing.T) {
 		Strategy: "custom_priority",
 		Config:   map[string]interface{}{},
 	}
-	filter := NewHardFilter(policy)
+	filter := NewHardFilter(policy, nil)
 
 	req := &FilterRequest{
 		Model:          "gpt-4o",
@@ -407,5 +408,148 @@ func TestCircuitStateCooling(t *testing.T) {
 	}
 	if exclusion := filter.Filter(ch2, req); exclusion != nil {
 		t.Errorf("Expected expired cooling channel to pass, but got excluded with reason: %s", exclusion.Reason)
+	}
+}
+
+// TestGetConfigNestedFloat 测试嵌套配置读取（扁平键与嵌套 map 双兼容）
+func TestGetConfigNestedFloat(t *testing.T) {
+	flat := &Policy{Config: map[string]interface{}{"balanced_weights.cost": 0.35}}
+	if got := flat.GetConfigNestedFloat("balanced_weights.cost", 0.0); got != 0.35 {
+		t.Errorf("flat key: expected 0.35, got %v", got)
+	}
+
+	nested := &Policy{Config: map[string]interface{}{
+		"balanced_weights": map[string]interface{}{"cost": 0.35},
+	}}
+	if got := nested.GetConfigNestedFloat("balanced_weights.cost", 0.0); got != 0.35 {
+		t.Errorf("nested key: expected 0.35, got %v", got)
+	}
+
+	if got := nested.GetConfigNestedFloat("balanced_weights.latency", 0.25); got != 0.25 {
+		t.Errorf("missing key: expected default 0.25, got %v", got)
+	}
+}
+
+// TestBalancedStrategyLoadScore 测试负载分：相同其他条件时，越空闲的渠道得分越高
+func TestBalancedStrategyLoadScore(t *testing.T) {
+	candidates := []*ChannelHealth{
+		{
+			ID:              1,
+			Name:            "busy",
+			RecentAttempts:  500,
+			ReliabilityScore: 0.95,
+			TTFTP50:         map[string]int{"gpt-4o": 800},
+			RealRatio:       map[string]float64{"gpt-4o": 1.0},
+		},
+		{
+			ID:              2,
+			Name:            "idle",
+			RecentAttempts:  0,
+			ReliabilityScore: 0.95,
+			TTFTP50:         map[string]int{"gpt-4o": 800},
+			RealRatio:       map[string]float64{"gpt-4o": 1.0},
+		},
+	}
+
+	req := &FilterRequest{Model: "gpt-4o", EstimatedInput: 1000, MaxOutput: 2000}
+	// 只保留负载权重，其余为 0，隔离负载对排序的影响
+	policy := &Policy{
+		Strategy: "balanced",
+		Config: map[string]interface{}{
+			"balanced_weights.cost":        0.0,
+			"balanced_weights.reliability": 0.0,
+			"balanced_weights.latency":     0.0,
+			"balanced_weights.load":        1.0,
+		},
+	}
+
+	strategy := &BalancedStrategy{}
+	scored := strategy.Sort(candidates, req, policy, nil)
+
+	if scored[0].Channel.ID != 2 {
+		t.Errorf("Expected idle channel 2 first, got %d", scored[0].Channel.ID)
+	}
+	if scored[1].Channel.ID != 1 {
+		t.Errorf("Expected busy channel 1 second, got %d", scored[1].Channel.ID)
+	}
+}
+
+// TestResolvePolicyDefaults 测试配置默认值合并（零值回退硬编码兜底）
+func TestResolvePolicyDefaults(t *testing.T) {
+	strategy, maxAttempts, totalBudgetMS, maxPriceCap, maxTTFTMS, halfOpenProbeCount, weights := resolvePolicyDefaults(nil)
+	if strategy != "custom_priority" || maxAttempts != 3 || totalBudgetMS != 15000 || maxPriceCap != 100.0 || maxTTFTMS != 5000 || halfOpenProbeCount != 1 {
+		t.Errorf("hardcoded fallback mismatch: %s %d %d %v %d %d", strategy, maxAttempts, totalBudgetMS, maxPriceCap, maxTTFTMS, halfOpenProbeCount)
+	}
+	if weights["cost"] != 0.35 || weights["load"] != 0.10 {
+		t.Errorf("default balanced weights mismatch: %v", weights)
+	}
+
+	custom := &PolicyDefaults{
+		DefaultStrategy:    "price_first",
+		MaxAttempts:        5,
+		TotalBudgetMS:      30000,
+		MaxPriceCap:        50,
+		MaxTTFTMS:          2000,
+		HalfOpenProbeCount: 2,
+		BalancedWeights:    map[string]float64{"cost": 0.5, "reliability": 0.5, "latency": 0, "load": 0},
+	}
+	strategy, maxAttempts, totalBudgetMS, maxPriceCap, maxTTFTMS, halfOpenProbeCount, weights = resolvePolicyDefaults(custom)
+	if strategy != "price_first" || maxAttempts != 5 || totalBudgetMS != 30000 || maxPriceCap != 50 || maxTTFTMS != 2000 || halfOpenProbeCount != 2 {
+		t.Errorf("custom defaults mismatch: %s %d %d %v %d %d", strategy, maxAttempts, totalBudgetMS, maxPriceCap, maxTTFTMS, halfOpenProbeCount)
+	}
+	if weights["cost"] != 0.5 {
+		t.Errorf("custom balanced weights mismatch: %v", weights)
+	}
+}
+
+// TestEffectiveCircuitState 测试时间驱动的 open → half_open 换算
+func TestEffectiveCircuitState(t *testing.T) {
+	now := time.Now()
+	past := now.Add(-time.Minute)
+	future := now.Add(time.Minute)
+
+	if got := EffectiveCircuitState("open", past, now); got != "half_open" {
+		t.Errorf("expired open: expected half_open, got %s", got)
+	}
+	if got := EffectiveCircuitState("open", future, now); got != "open" {
+		t.Errorf("cooling open: expected open, got %s", got)
+	}
+	if got := EffectiveCircuitState("closed", past, now); got != "closed" {
+		t.Errorf("closed: expected closed, got %s", got)
+	}
+	if got := EffectiveCircuitState("half_open", time.Time{}, now); got != "half_open" {
+		t.Errorf("half_open: expected half_open, got %s", got)
+	}
+}
+
+// TestEstimateCostOfficialUsesStoredSnapshot 测试 official 口径使用探测时的官网价快照
+func TestEstimateCostOfficialUsesStoredSnapshot(t *testing.T) {
+	ch := &ChannelHealth{
+		RealRatio:                map[string]float64{"gpt-5.5": 2.0},
+		RealRatioBasis:           map[string]string{"gpt-5.5": "official"},
+		RealRatioOfficialInPerM:  map[string]float64{"gpt-5.5": 5.0},
+		RealRatioOfficialOutPerM: map[string]float64{"gpt-5.5": 30.0},
+	}
+	req := &FilterRequest{Model: "gpt-5.5", EstimatedInput: 1000, MaxOutput: 500}
+	policy := &Policy{Config: map[string]interface{}{}}
+	// 1000×2×5/1M + 500×2×30/1M = 0.01 + 0.03 = 0.04
+	cost := estimateCost(ch, req, policy, nil)
+	if math.Abs(cost-0.04) > 1e-9 {
+		t.Fatalf("cost = %v, want 0.04", cost)
+	}
+}
+
+// TestEstimateCostBaselineFallback 测试 baseline 口径沿用 $10/1M 混合基准
+func TestEstimateCostBaselineFallback(t *testing.T) {
+	ch := &ChannelHealth{
+		RealRatio:      map[string]float64{"m": 1.0},
+		RealRatioBasis: map[string]string{"m": "baseline"},
+	}
+	req := &FilterRequest{Model: "m", EstimatedInput: 1000, MaxOutput: 1000}
+	policy := &Policy{Config: map[string]interface{}{}}
+	// (1000 + 1000) × 10/1M = 0.02
+	cost := estimateCost(ch, req, policy, nil)
+	if math.Abs(cost-0.02) > 1e-9 {
+		t.Fatalf("cost = %v, want 0.02", cost)
 	}
 }

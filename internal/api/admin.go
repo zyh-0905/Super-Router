@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ type channelUpdateRequest struct {
 	ModelMapping     map[string]string `json:"model_mapping"`
 	Capabilities     []string          `json:"capabilities"`
 	DailyProbeBudget *float64          `json:"daily_probe_budget"`
+	RatioLimit       *float64          `json:"ratio_limit"`
 	BalanceAPIURL    *string           `json:"balance_api_url"`
 	BalanceAPIToken  *string           `json:"balance_api_token"`
 	GroupIDs         *[]int            `json:"group_ids"`
@@ -78,6 +80,7 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 		ModelMapping     map[string]string `json:"model_mapping"`
 		Capabilities     []string          `json:"capabilities"`
 		DailyProbeBudget float64           `json:"daily_probe_budget"`
+		RatioLimit       float64           `json:"ratio_limit"`
 		BalanceAPIURL    string            `json:"balance_api_url"`
 		BalanceAPIToken  string            `json:"balance_api_token"`
 		GroupIDs         []int             `json:"group_ids"`
@@ -108,10 +111,10 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 
 	var id int
 	err := h.db.Pool.QueryRow(ctx, `
-		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, user_priority, weight, model_mapping, capabilities, daily_probe_budget, balance_api_url, balance_api_token)
-		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12)
+		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, user_priority, weight, model_mapping, capabilities, daily_probe_budget, ratio_limit, balance_api_url, balance_api_token)
+		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id
-	`, req.Name, req.BaseURL, req.AccessToken, req.APIKey, req.Role, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.BalanceAPIURL, req.BalanceAPIToken).Scan(&id)
+	`, req.Name, req.BaseURL, req.AccessToken, req.APIKey, req.Role, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, req.BalanceAPIToken).Scan(&id)
 
 	if err != nil {
 		h.logger.Error("Failed to create channel", zap.Error(err))
@@ -206,7 +209,7 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, name, base_url, enabled, role, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
-		       daily_probe_budget, balance_api_url, balance_api_token, created_at
+		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at
 		FROM upstreams
 		ORDER BY id
 	`)
@@ -223,13 +226,13 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 		var id, userPriority, weight int
 		var name, baseURL, role string
 		var enabled bool
-		var dailyProbeBudget float64
+		var dailyProbeBudget, ratioLimit float64
 		var modelMappingJSON, capabilitiesJSON string
 		var balanceAPIURL, balanceAPIToken string
 		var createdAt time.Time
 
 		if err := rows.Scan(&id, &name, &baseURL, &enabled, &role, &userPriority, &weight,
-			&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &balanceAPIURL, &balanceAPIToken, &createdAt); err != nil {
+			&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt); err != nil {
 			h.logger.Warn("Failed to scan channel row", zap.Error(err))
 			continue
 		}
@@ -255,6 +258,7 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 			"model_mapping":      modelMapping,
 			"capabilities":       capabilities,
 			"daily_probe_budget": dailyProbeBudget,
+			"ratio_limit":        ratioLimit,
 			"balance_api_url":    balanceAPIURL,
 			"groups":             groups,
 			"created_at":         createdAt.Format(time.RFC3339),
@@ -276,7 +280,7 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		channelID, userPriority, weight    int
 		name, baseURL, role                string
 		enabled                            bool
-		dailyProbeBudget                   float64
+		dailyProbeBudget, ratioLimit       float64
 		modelMappingJSON, capabilitiesJSON string
 		createdAt                          time.Time
 	)
@@ -284,10 +288,10 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 	err := h.db.Pool.QueryRow(ctx, `
 		SELECT id, name, base_url, enabled, role, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
-		       daily_probe_budget, created_at
+		       daily_probe_budget, ratio_limit, created_at
 		FROM upstreams WHERE id = $1
 	`, id).Scan(&channelID, &name, &baseURL, &enabled, &role, &userPriority, &weight,
-		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &createdAt)
+		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &createdAt)
 
 	if err != nil {
 		c.JSON(404, gin.H{"error": "channel not found"})
@@ -310,6 +314,7 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		"model_mapping":      modelMapping,
 		"capabilities":       capabilities,
 		"daily_probe_budget": dailyProbeBudget,
+		"ratio_limit":        ratioLimit,
 		"created_at":         createdAt.Format(time.RFC3339),
 	})
 }
@@ -383,6 +388,10 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 	if req.DailyProbeBudget != nil {
 		updates = append(updates, "daily_probe_budget = $"+strconv.Itoa(len(args)+1))
 		args = append(args, *req.DailyProbeBudget)
+	}
+	if req.RatioLimit != nil {
+		updates = append(updates, "ratio_limit = $"+strconv.Itoa(len(args)+1))
+		args = append(args, *req.RatioLimit)
 	}
 	if req.BalanceAPIURL != nil {
 		updates = append(updates, "balance_api_url = $"+strconv.Itoa(len(args)+1))
@@ -1037,6 +1046,7 @@ func (h *AdminHandler) GetDecisions(c *gin.Context) {
 		SELECT request_id, token_id_hash, model, is_stream, policy_version, strategy,
 		       epoch, snapshot_checksum, COALESCE(candidate_order::text, '[]'),
 		       COALESCE(excluded::text, '[]'), COALESCE(all_scores::text, '{}'),
+		       COALESCE(candidate_details::text, '[]'),
 		       COALESCE(attempts::text, '[]'), selected_channel, decision_reason, group_id, decided_at
 		FROM decision_logs
 		WHERE ($1::int IS NULL OR group_id = $1)
@@ -1055,7 +1065,7 @@ func (h *AdminHandler) GetDecisions(c *gin.Context) {
 		var isStream bool
 		var epoch int64
 		var snapshotChecksum *string
-		var candidateOrderJSON, excludedJSON, allScoresJSON, attemptsJSON string
+		var candidateOrderJSON, excludedJSON, allScoresJSON, candidateDetailsJSON, attemptsJSON string
 		var selectedChannel *int
 		var decisionReason string
 		var groupID *int
@@ -1063,7 +1073,7 @@ func (h *AdminHandler) GetDecisions(c *gin.Context) {
 
 		if err := rows.Scan(&requestID, &tokenHash, &model, &isStream, &policyVersion, &strategy,
 			&epoch, &snapshotChecksum, &candidateOrderJSON, &excludedJSON, &allScoresJSON,
-			&attemptsJSON, &selectedChannel, &decisionReason, &groupID, &decidedAt); err != nil {
+			&candidateDetailsJSON, &attemptsJSON, &selectedChannel, &decisionReason, &groupID, &decidedAt); err != nil {
 			h.logger.Warn("Failed to scan decision row", zap.Error(err))
 			continue
 		}
@@ -1073,10 +1083,26 @@ func (h *AdminHandler) GetDecisions(c *gin.Context) {
 		var excluded []map[string]interface{}
 		var allScores map[string]float64
 		var attempts []map[string]interface{}
+		var candidateDetails []map[string]interface{}
 		_ = json.Unmarshal([]byte(candidateOrderJSON), &candidateIDs)
 		_ = json.Unmarshal([]byte(excludedJSON), &excluded)
 		_ = json.Unmarshal([]byte(allScoresJSON), &allScores)
 		_ = json.Unmarshal([]byte(attemptsJSON), &attempts)
+		_ = json.Unmarshal([]byte(candidateDetailsJSON), &candidateDetails)
+
+		// 六维评分富化渠道名
+		detailsEnriched := []map[string]interface{}{}
+		for _, cd := range candidateDetails {
+			cid := 0
+			if v, ok := cd["channel_id"].(float64); ok {
+				cid = int(v)
+			}
+			detailsEnriched = append(detailsEnriched, map[string]interface{}{
+				"channel_id": cid,
+				"channel":    nameMap[cid],
+				"dims":       cd["dims"],
+			})
+		}
 
 		// 候选排序 → 带渠道名与得分
 		var candidates []map[string]interface{}
@@ -1126,6 +1152,7 @@ func (h *AdminHandler) GetDecisions(c *gin.Context) {
 			"epoch":               epoch,
 			"snapshot_checksum":   snapshotChecksum,
 			"candidate_order":     candidates,
+			"candidate_details":   detailsEnriched,
 			"excluded":            excludedEnriched,
 			"all_scores":          allScores,
 			"attempts":            attempts,
@@ -1495,11 +1522,12 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 		ch["circuit_state"] = worstMap[id]
 	}
 
-	// 每站点最新余额
+	// 每站点最新余额（仅成功记录，失败行 balance=0 会误报低余额）
 	balMap := map[int]map[string]interface{}{}
 	rows, err = h.db.Pool.Query(ctx, `
 		SELECT DISTINCT ON (channel_id) channel_id, balance, currency, source, error, checked_at
 		FROM balance_checks
+		WHERE source != ''
 		ORDER BY channel_id, checked_at DESC
 	`)
 	if err == nil {
@@ -1533,6 +1561,10 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 	}
 	stats["channels"] = channelStats
 
+	// 倍率检测摘要（按站点：最新实测倍率/今日实测次数/默认检测模型/超限标记）
+	ratioSummary := h.buildRatioSummary(ctx, gid)
+	stats["ratio_summary"] = ratioSummary
+
 	// 告警：熔断开启 + 已禁用站点
 	alerts := []map[string]interface{}{}
 
@@ -1550,6 +1582,38 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 				"channel": name,
 				"sev":     "critical",
 				"ago":     formatAgo(time.Now()),
+			})
+		}
+	}
+
+	// 倍率超限告警
+	for _, ch := range ratioSummary {
+		limit, _ := ch["ratio_limit"].(float64)
+		if limit <= 0 {
+			continue
+		}
+		ratios, _ := ch["ratios"].([]map[string]interface{})
+		for _, mr := range ratios {
+			ratio, _ := mr["real_ratio"].(float64)
+			if ratio <= limit {
+				continue
+			}
+			model, _ := mr["model"].(string)
+			name, _ := ch["name"].(string)
+			cid, _ := ch["id"].(int)
+			ago := "—"
+			if s, ok := mr["checked_at"].(string); ok {
+				if t, err := time.Parse(time.RFC3339, s); err == nil {
+					ago = formatAgo(t)
+				}
+			}
+			alerts = append(alerts, map[string]interface{}{
+				"id":      fmt.Sprintf("ratio_%d_%s", cid, model),
+				"name":    fmt.Sprintf("倍率超标: %s %s 实测 %.4fx 超过上限 %.4fx", name, model, ratio, limit),
+				"channel": name,
+				"model":   model,
+				"sev":     "critical",
+				"ago":     ago,
 			})
 		}
 	}
@@ -1663,6 +1727,141 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 func worse(a, b string) bool {
 	rank := map[string]int{"": 0, "closed": 0, "half_open": 1, "degraded": 2, "open": 3}
 	return rank[a] > rank[b]
+}
+
+// buildRatioSummary 构建站点倍率检测摘要（支持分组筛选）：
+// 每站点：最新实测倍率（每模型）、今日实测次数、默认检测模型、超限标记
+func (h *AdminHandler) buildRatioSummary(ctx context.Context, gid *int) []map[string]interface{} {
+	rows, err := h.db.Pool.Query(ctx, `
+		SELECT u.id, u.name, u.enabled, COALESCE(u.ratio_limit, 0),
+		       COALESCE(u.model_mapping::text, '{}'), COALESCE(p.today_cnt, 0)
+		FROM upstreams u
+		LEFT JOIN (
+			SELECT upstream_id, COUNT(*) AS today_cnt
+			FROM probe_results
+			WHERE success = true AND checked_at >= CURRENT_DATE
+			GROUP BY upstream_id
+		) p ON p.upstream_id = u.id
+		WHERE $1::int IS NULL OR EXISTS (
+			SELECT 1 FROM channel_group_members cgm WHERE cgm.channel_id = u.id AND cgm.group_id = $1
+		)
+		ORDER BY u.id
+	`, gid)
+	if err != nil {
+		h.logger.Warn("Failed to query ratio summary channels", zap.Error(err))
+		return []map[string]interface{}{}
+	}
+	defer rows.Close()
+
+	type chRow struct {
+		id       int
+		name     string
+		enabled  bool
+		limit    float64
+		mapping  map[string]string
+		todayCnt int
+	}
+	var channels []chRow
+	for rows.Next() {
+		var r chRow
+		var mmJSON string
+		if err := rows.Scan(&r.id, &r.name, &r.enabled, &r.limit, &mmJSON, &r.todayCnt); err != nil {
+			continue
+		}
+		_ = json.Unmarshal([]byte(mmJSON), &r.mapping)
+		if r.mapping == nil {
+			r.mapping = map[string]string{}
+		}
+		channels = append(channels, r)
+	}
+
+	// 每站点每模型最新实测（成功）
+	ratioMap := map[int][]map[string]interface{}{}
+	rrows, err := h.db.Pool.Query(ctx, `
+		SELECT DISTINCT ON (upstream_id, model) upstream_id, model, real_ratio, source, checked_at
+		FROM probe_results
+		WHERE success = true
+		ORDER BY upstream_id, model, checked_at DESC
+	`)
+	if err == nil {
+		for rrows.Next() {
+			var cid int
+			var model, source string
+			var ratio float64
+			var checkedAt time.Time
+			if err := rrows.Scan(&cid, &model, &ratio, &source, &checkedAt); err != nil {
+				continue
+			}
+			ratioMap[cid] = append(ratioMap[cid], map[string]interface{}{
+				"model":      model,
+				"real_ratio": ratio,
+				"source":     source,
+				"checked_at": checkedAt.Format(time.RFC3339),
+			})
+		}
+		rrows.Close()
+	}
+
+	// 每站点默认检测模型：取该站点第一个倍率分组的默认模型
+	groupDefault := map[int]string{}
+	grows, err := h.db.Pool.Query(ctx, `
+		SELECT DISTINCT ON (channel_id) channel_id, default_model
+		FROM channel_ratio_groups
+		ORDER BY channel_id, id
+	`)
+	if err == nil {
+		for grows.Next() {
+			var cid int
+			var dm string
+			if err := grows.Scan(&cid, &dm); err != nil {
+				continue
+			}
+			if dm != "" {
+				groupDefault[cid] = dm
+			}
+		}
+		grows.Close()
+	}
+
+	summary := []map[string]interface{}{}
+	for _, r := range channels {
+		ratios := ratioMap[r.id]
+		overLimit := false
+		if r.limit > 0 {
+			for _, mr := range ratios {
+				if v, ok := mr["real_ratio"].(float64); ok && v > r.limit {
+					overLimit = true
+					break
+				}
+			}
+		}
+		// 默认检测模型：分组默认 → 最新实测过的模型 → 首个映射键
+		probeModel := groupDefault[r.id]
+		if probeModel == "" && len(ratios) > 0 {
+			if m, ok := ratios[0]["model"].(string); ok {
+				probeModel = m
+			}
+		}
+		if probeModel == "" && len(r.mapping) > 0 {
+			keys := make([]string, 0, len(r.mapping))
+			for k := range r.mapping {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			probeModel = keys[0]
+		}
+		summary = append(summary, map[string]interface{}{
+			"id":                  r.id,
+			"name":                r.name,
+			"enabled":             r.enabled,
+			"ratio_limit":         r.limit,
+			"probe_count_today":   r.todayCnt,
+			"default_probe_model": probeModel,
+			"over_limit":          overLimit,
+			"ratios":              ratios,
+		})
+	}
+	return summary
 }
 
 func formatAgo(t time.Time) string {

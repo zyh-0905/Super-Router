@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"smart-router/internal/store"
 )
@@ -26,11 +27,28 @@ type ChannelGroup struct {
 
 // PolicyLoader 策略加载器
 type PolicyLoader struct {
-	db *store.DB
+	db       *store.DB
+	defaults *PolicyDefaults
+}
+
+// PolicyDefaults 系统级策略默认值（来自配置文件，DB 无策略记录时的兜底）
+type PolicyDefaults struct {
+	DefaultStrategy    string
+	MaxAttempts        int
+	TotalBudgetMS      int
+	MaxPriceCap        float64
+	MaxTTFTMS          int
+	HalfOpenProbeCount int
+	BalancedWeights    map[string]float64 // 键：cost / reliability / latency / load
 }
 
 func NewPolicyLoader(db *store.DB) *PolicyLoader {
 	return &PolicyLoader{db: db}
+}
+
+// SetDefaults 注入系统级默认值（未设置则回退硬编码兜底）
+func (p *PolicyLoader) SetDefaults(d PolicyDefaults) {
+	p.defaults = &d
 }
 
 // LoadGroup 按 ID 加载分组（路由决策用）
@@ -76,17 +94,57 @@ func (p *PolicyLoader) LoadPolicy(ctx context.Context, tokenID, model string, gr
 		return policy, nil
 	}
 
-	// 5. 返回硬编码的最小默认策略
+	// 5. 返回兜底默认策略（优先使用配置注入的系统默认值）
+	strategy, maxAttempts, totalBudgetMS, maxPriceCap, maxTTFTMS, halfOpenProbeCount, weights := resolvePolicyDefaults(p.defaults)
+	weightsIface := make(map[string]interface{}, len(weights))
+	for k, v := range weights {
+		weightsIface[k] = v
+	}
 	return &Policy{
 		Version:  "default",
-		Strategy: "custom_priority",
+		Strategy: strategy,
 		Config: map[string]interface{}{
-			"max_attempts":    3,
-			"total_budget_ms": 15000,
-			"max_price_cap":   100.0,
-			"max_ttft_ms":     5000,
+			"max_attempts":          maxAttempts,
+			"total_budget_ms":       totalBudgetMS,
+			"max_price_cap":         maxPriceCap,
+			"max_ttft_ms":           maxTTFTMS,
+			"half_open_probe_count": halfOpenProbeCount,
+			"balanced_weights":      weightsIface,
 		},
 	}, nil
+}
+
+// resolvePolicyDefaults 合并配置默认值与硬编码兜底
+func resolvePolicyDefaults(d *PolicyDefaults) (strategy string, maxAttempts, totalBudgetMS int, maxPriceCap float64, maxTTFTMS int, halfOpenProbeCount int, weights map[string]float64) {
+	strategy, maxAttempts, totalBudgetMS = "custom_priority", 3, 15000
+	maxPriceCap, maxTTFTMS, halfOpenProbeCount = 100.0, 5000, 1
+	if d != nil {
+		if d.DefaultStrategy != "" {
+			strategy = d.DefaultStrategy
+		}
+		if d.MaxAttempts > 0 {
+			maxAttempts = d.MaxAttempts
+		}
+		if d.TotalBudgetMS > 0 {
+			totalBudgetMS = d.TotalBudgetMS
+		}
+		if d.MaxPriceCap > 0 {
+			maxPriceCap = d.MaxPriceCap
+		}
+		if d.MaxTTFTMS > 0 {
+			maxTTFTMS = d.MaxTTFTMS
+		}
+		if d.HalfOpenProbeCount > 0 {
+			halfOpenProbeCount = d.HalfOpenProbeCount
+		}
+		if len(d.BalancedWeights) > 0 {
+			weights = d.BalancedWeights
+		}
+	}
+	if weights == nil {
+		weights = map[string]float64{"cost": 0.35, "reliability": 0.30, "latency": 0.25, "load": 0.10}
+	}
+	return strategy, maxAttempts, totalBudgetMS, maxPriceCap, maxTTFTMS, halfOpenProbeCount, weights
 }
 
 func (p *PolicyLoader) loadFromDB(ctx context.Context, tokenID, model *string) (*Policy, error) {
@@ -164,4 +222,48 @@ func (p *Policy) GetConfigBool(key string, defaultValue bool) bool {
 		}
 	}
 	return defaultValue
+}
+
+// GetConfigNestedFloat 按点路径读取配置浮点数，带默认值。
+// 优先匹配扁平的字面键（如 DB 中直接存 "balanced_weights.cost"），
+// 其次按 "." 逐层下钻嵌套 map（如 {"balanced_weights": {"cost": 0.35}}）。
+func (p *Policy) GetConfigNestedFloat(key string, defaultValue float64) float64 {
+	// 1. 扁平字面键
+	if val, ok := p.Config[key]; ok {
+		if f, ok := asFloat64(val); ok {
+			return f
+		}
+	}
+
+	// 2. 嵌套路径下钻
+	parts := strings.Split(key, ".")
+	var cur interface{} = p.Config
+	for i, part := range parts {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return defaultValue
+		}
+		v, ok := m[part]
+		if !ok {
+			return defaultValue
+		}
+		if i == len(parts)-1 {
+			if f, ok := asFloat64(v); ok {
+				return f
+			}
+			return defaultValue
+		}
+		cur = v
+	}
+	return defaultValue
+}
+
+func asFloat64(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	}
+	return 0, false
 }

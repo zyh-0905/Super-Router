@@ -3,7 +3,7 @@
 // ============================================================
 import { reactive, computed } from 'vue'
 
-const savedKey = localStorage.getItem('sr_apikey') || 'test-admin-key'
+const savedKey = localStorage.getItem('sr_apikey') || ''
 const savedBase = (localStorage.getItem('sr_baseurl') || '').replace(/\/+$/, '')
 const savedTheme = localStorage.getItem('sr_theme') || 'auto' // 'auto' | 'light' | 'dark'
 const savedDefaultModel = localStorage.getItem('sr_default_model') || '' // 测试台默认模型

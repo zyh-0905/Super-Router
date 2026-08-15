@@ -15,9 +15,10 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port         int           `mapstructure:"port"`
-	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
-	WriteTimeout time.Duration `mapstructure:"write_timeout"`
+	Port                 int           `mapstructure:"port"`
+	ReadTimeout          time.Duration `mapstructure:"read_timeout"`
+	WriteTimeout         time.Duration `mapstructure:"write_timeout"`
+	BootstrapDefaultKeys bool          `mapstructure:"bootstrap_default_keys"` // 空库时是否写入开发用默认 Key（仅限本地开发）
 }
 
 type DatabaseConfig struct {
@@ -47,6 +48,7 @@ type CheckerConfig struct {
 	BalanceInterval    time.Duration `mapstructure:"balance_interval"`
 	DailyProbeBudget   float64       `mapstructure:"daily_probe_budget"`
 	ProbeFailedBackoff time.Duration `mapstructure:"probe_failed_backoff"`
+	ProbeModel         string        `mapstructure:"probe_model"`
 }
 
 type RoutingConfig struct {

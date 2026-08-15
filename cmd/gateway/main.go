@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"smart-router/internal/api"
+	"smart-router/internal/checker"
 	"smart-router/internal/config"
 	"smart-router/internal/logger"
 	"smart-router/internal/metrics"
@@ -71,9 +72,14 @@ func main() {
 
 	zapLogger.Info("Database and Redis connected")
 
-	// 确保默认开发用 API Key 存在（表为空时自动写入）
-	if err := api.EnsureDefaultKeys(db); err != nil {
-		zapLogger.Warn("Failed to ensure default api keys", zap.Error(err))
+	// 初始化管理员 Key（生产模式空库时生成随机 Key，仅打印一次）
+	generatedKey, err := api.EnsureDefaultKeys(db, cfg.Server.BootstrapDefaultKeys)
+	if err != nil {
+		zapLogger.Warn("Failed to ensure api keys", zap.Error(err))
+	}
+	if generatedKey != "" {
+		zapLogger.Warn("Generated initial admin API key (shown once, store it securely)",
+			zap.String("admin_key", generatedKey))
 	}
 
 	// 启动 Prometheus metrics 后台收集器
@@ -87,6 +93,22 @@ func main() {
 
 	// 初始化路由器
 	routerEngine := router.NewRouter(db, redisClient)
+
+	// 注入系统级策略默认值（DB 无策略记录时的兜底，来自配置文件）
+	routerEngine.SetPolicyDefaults(router.PolicyDefaults{
+		DefaultStrategy:    cfg.Routing.DefaultStrategy,
+		MaxAttempts:        cfg.Routing.MaxAttempts,
+		TotalBudgetMS:      cfg.Routing.TotalBudgetMS,
+		MaxPriceCap:        cfg.Routing.Filter.MaxPriceCap,
+		MaxTTFTMS:          cfg.Routing.Filter.MaxTTFTMS,
+		HalfOpenProbeCount: cfg.Routing.CircuitBreaker.HalfOpenProbeCount,
+		BalancedWeights: map[string]float64{
+			"cost":        cfg.Routing.BalancedWeights.Cost,
+			"reliability": cfg.Routing.BalancedWeights.Reliability,
+			"latency":     cfg.Routing.BalancedWeights.Latency,
+			"load":        cfg.Routing.BalancedWeights.Load,
+		},
+	})
 
 	// 初始化熔断管理器（分组级参数在请求时按 group 覆盖）
 	circuitManager := api.NewCircuitBreakerManager(db, zapLogger.Named("circuit"), api.CircuitBreakerConfig{
@@ -104,6 +126,11 @@ func main() {
 	// 初始化处理器
 	proxyHandler := api.NewProxyHandler(routerEngine, db, zapLogger.Named("proxy"), circuitManager)
 	adminHandler := api.NewAdminHandler(db, cfg, zapLogger.Named("admin"))
+
+	// 实时倍率：按需手动实测（复用 checker 探测逻辑，运行在 Gateway 内）
+	ratioProbe := checker.NewProbeChecker(db, zapLogger.Named("ratio-probe"))
+	ratioProbe.SetProbeModel(cfg.Checker.ProbeModel)
+	ratioHandler := api.NewRatioHandler(db, redisClient, cfg, ratioProbe, zapLogger.Named("ratio"))
 
 	// 初始化 HTTP 服务器
 	gin.SetMode(gin.ReleaseMode)
@@ -171,6 +198,16 @@ func main() {
 		adminGroup.DELETE("/channels/:id", adminHandler.DeleteChannel)
 		adminGroup.GET("/channels/:id/models", adminHandler.GetUpstreamModels)
 		adminGroup.POST("/upstream/models", adminHandler.ProbeUpstreamModels)
+		adminGroup.GET("/channels/:id/ratio", ratioHandler.GetRatio)
+		adminGroup.GET("/channel-metrics", ratioHandler.GetChannelMetrics)
+		adminGroup.GET("/model-prices", ratioHandler.ListModelPrices)
+		adminGroup.POST("/model-prices", ratioHandler.UpsertModelPrice)
+		adminGroup.DELETE("/model-prices/:model", ratioHandler.DeleteModelPrice)
+		adminGroup.POST("/channels/:id/probe-ratio", ratioHandler.ProbeRatio)
+		adminGroup.POST("/channels/:id/ratio-groups", ratioHandler.CreateRatioGroup)
+		adminGroup.PATCH("/channels/:id/ratio-groups/:gid", ratioHandler.UpdateRatioGroup)
+		adminGroup.DELETE("/channels/:id/ratio-groups/:gid", ratioHandler.DeleteRatioGroup)
+		adminGroup.POST("/channels/:id/ratio-groups/:gid/probe", ratioHandler.ProbeRatioGroup)
 		adminGroup.GET("/health/:channel_id", adminHandler.GetHealth)
 		adminGroup.GET("/channels/:id/balance", adminHandler.GetChannelBalance)
 		adminGroup.GET("/settings", adminHandler.GetSettings)
