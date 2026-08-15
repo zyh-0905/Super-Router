@@ -19,7 +19,7 @@ docker compose -p smart-router up -d --build
 | Metrics | http://localhost:8080/metrics | - |
 | Admin API | http://localhost:8080/admin/* | Bearer test-admin-key |
 | Prometheus | http://localhost:9090 | - |
-| Grafana | http://localhost:3000 | admin / admin |
+| Grafana | http://localhost:3001 | admin / admin |
 
 ## 📊 核心指标（9 个）
 
@@ -35,12 +35,12 @@ docker compose -p smart-router up -d --build
 | `smart_router_proxy_duration_seconds` | Histogram | 上游延迟 |
 | `smart_router_failover_total` | Counter | 故障切换次数 |
 
-## 🚨 告警规则（14 条）
+## 🚨 告警规则（13 条）
 
 - **可用性**：Gateway 或指标抓取不可达、没有健康上游
 - **成功率**：全局 < 95%、单渠道 < 90%（严重阈值 < 50%）
 - **延迟**：P95 > 5s、P99 > 10s、路由决策 P95 > 100ms
-- **熔断**：渠道进入 open 状态
+- **熔断**：渠道进入 open / degraded 状态
 - **故障切换**：短时间切换次数激增
 
 ## 🖥 Grafana 仪表板（9 个面板）

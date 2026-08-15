@@ -36,12 +36,12 @@ open http://localhost:5173/
 
 | 路由 | 页面 | 说明 |
 |---|---|---|
-| `#/` | 总览 | 24h 请求/成功率/延迟（同比）、趋势图、模型分布、告警、最近决策、**分组切换器** |
-| `#/channels` | 站点 | 站点列表（**分组筛选 chips**、**余额徽章**）、详情（信息/健康/统计/余额/**倍率**）、新增/编辑（**多选分组**）、**分组管理**（增删改+策略/熔断/检测参数）、获取上游模型 |
-| `#/playground` | 测试台 | 真实流式请求、**分组选择**（限定路由范围）、路由决策信息 |
-| `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉 |
+| `#/` | 总览 | 24h 请求/成功率/延迟（同比）、趋势图、模型分布、告警、最近决策、**分组切换器**、站点综合信息抽屉 |
+| `#/channels` | 站点 | 站点列表（**分组筛选 chips**、**余额徽章**、协议/中转站类型徽章）、详情（信息/健康/统计/余额/**倍率**）、新增/编辑（**接口协议**、**中转站类型**、**默认测试模型**、多选分组）、**分组管理**、**倍率检测分组**、获取上游模型 |
+| `#/playground` | 测试台 | 真实流式请求、**站点选择自动预填该站点默认测试模型**、**分组选择**（限定路由范围）、路由决策信息 |
+| `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉（候选**六维评分雷达图**/排除原因/故障切换明细） |
 | `#/circuit` | 熔断 | 四态熔断器、**分组切换器**、重置 |
-| `#/settings` | 设置 | 连接配置、API Keys（**分组绑定**）、运行配置、**默认测试模型**（从上游模型列表中选择）、**低余额告警阈值** |
+| `#/settings` | 设置 | 连接配置、API Keys（**分组绑定**）、**每站点默认测试模型**（表格逐站点设置）、**官方模型价格库**、**低余额告警阈值** |
 
 ## 项目结构
 
@@ -63,7 +63,9 @@ web/
     │   ├── AppSidebar.vue   # 毛玻璃侧边栏
     │   ├── BaseModal.vue    # 弹窗
     │   ├── BaseChart.vue    # ECharts 封装（主题自适应）
+    │   ├── RadarChart.vue   # 手绘 SVG 六维雷达图（决策候选评分）
     │   ├── StatCard.vue     # 统计卡
+    │   ├── GroupSwitcher.vue# 分组切换器
     │   ├── EmptyState.vue   # 空状态
     │   ├── ToastHost.vue    # Toast 通知
     │   └── Icon.vue         # SF Symbols 风格图标集
@@ -87,12 +89,13 @@ web/
 
 | 功能 | 接口 |
 |---|---|
-| 站点 CRUD | `GET/POST/PATCH/DELETE /admin/channels[/:id]` |
+| 站点 CRUD | `GET/POST/PATCH/DELETE /admin/channels[/:id]`（含 protocol / relay_type / test_model 等字段） |
 | 站点健康 | `GET /admin/health/:id` |
-| 上游模型列表 | `GET /admin/channels/:id/models` · `POST /admin/upstream/models` |
+| 上游模型列表 | `GET /admin/channels/:id/models` · `POST /admin/upstream/models`（按协议发送认证头） |
 | **实时倍率** | `GET /admin/channels/:id/ratio`（声明/实测/历史/**分组**） · `POST /admin/channels/:id/probe-ratio`（按需实测） · `POST/PATCH/DELETE /admin/channels/:id/ratio-groups[/:gid]` · `POST .../ratio-groups/:gid/probe` |
+| **官方价格库** | `GET/POST /admin/model-prices` · `DELETE /admin/model-prices/:model` |
 | **分组 CRUD** | `GET/POST /admin/groups` · `PATCH/DELETE /admin/groups/:id` |
-| 统计聚合 | `GET /admin/stats[?group_id=]` |
+| 统计聚合 | `GET /admin/stats[?group_id=]` · `GET /admin/channel-metrics` |
 | 决策日志 | `GET /admin/decisions?limit=[&group_id=]` |
 | 熔断 | `GET /admin/circuit[?group_id=]` · `POST /admin/circuit/:id/reset` |
 | API Keys | `GET/POST /admin/keys` · `PATCH/DELETE /admin/keys/:id`（支持 group_ids 绑定） |
@@ -107,10 +110,17 @@ web/
 - **默认分组**：迁移自动创建「默认分组」并将存量站点归入；新建站点未选分组时自动归入
 - **全链路记录**：决策日志与请求历史记录 group_id，统计/决策/熔断接口均支持按组筛选
 
+## 接口协议与中转站类型
+
+- **接口协议**（站点级）：`openai`（OpenAI 兼容，默认）/ `anthropic`（Claude 原生）。网关对外保持 OpenAI 接口；anthropic 站点由后端 `internal/protocol` 完成请求/响应/SSE 流式双向转换与 `x-api-key` 认证，前端聊天端点/测试连接/模型列表均按协议自动适配
+- **中转站类型**（站点级）：`newapi`（new-api/one-api 系）/ `sub2api`（Sub2API）/ `custom`。表单中选择类型后自动填入默认余额接口地址（new-api → `/api/user/self`，sub2api → `/api/v1/auth/me`），可手动覆盖
+- **默认测试模型**（站点级）：设置页「请求测试台设置」表格逐站点配置；测试台选择站点后自动预填该模型，模型下拉只提示该站点的已映射模型
+
 ## 余额自动检测
 
-- **多协议探测**：优先站点自定义接口（`balance_api_url`，完整 URL 或路径）→ one-api/new-api（`/api/user/self`，Access Token）→ OpenAI 官方（`/v1/dashboard/billing/credit_grants`，API Key）；均不支持时标记"不可用"而非误报
-- **自定义余额接口**：部分中转站的管理 API 不在标准路径或独立域名——在网页控制台 F12 → Network 找到余额请求地址，填入站点编辑表单的「余额接口地址」即可（响应格式自动识别：one-api `data.quota` / OpenAI `total_available` / 字符串数字）
+- **多协议探测**：优先站点自定义接口（`balance_api_url`，完整 URL 或路径）→ 中转站类型默认接口 → one-api/new-api（`/api/user/self`，Access Token）→ OpenAI 官方（`/v1/dashboard/billing/credit_grants`，API Key）；均不支持时标记"不可用"而非误报
+- **响应格式自动识别**：one-api `data.quota` / new-api 会话嵌套 `data.user.quota`（quota 单位自动换算美元，1 USD = 500,000 quota）→ `data.balance`（美元）→ OpenAI `total_available`；仅支持 POST 的接口 GET 失败自动回退 POST
+- **自定义余额接口**：部分中转站的管理 API 不在标准路径或独立域名——在网页控制台 F12 → Network 找到余额请求地址，填入站点编辑表单的「余额接口地址」即可；401/403 时界面提示令牌可能已过期
 - **自动调度**：checker 每 10 分钟检测一次（分组可覆盖 `balance_interval_seconds`）；新站点加入后立即检测
 - **展示**：站点卡片余额徽章（≤$1 红色 / >$1 绿色）、站点详情「余额」页签（当前余额 + 历史折线 + 明细）
 - **低余额告警**：余额 ≤ 阈值（设置页可配置，默认 $1）进入总览告警与侧边栏红点

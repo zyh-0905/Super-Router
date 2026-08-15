@@ -32,18 +32,18 @@ docker compose -p smart-router logs -f gateway checker
 | Metrics | http://localhost:8080/metrics | Prometheus 指标 |
 | Admin API | http://localhost:8080/admin/* | 管理接口（`Authorization: Bearer test-admin-key`） |
 | Prometheus | http://localhost:9090 | 监控（`./start-monitoring.sh`） |
-| Grafana | http://localhost:3000 | 仪表板 |
+| Grafana | http://localhost:3001 | 仪表板 |
 
 ## 🔑 默认凭证
 
 | 项 | 值 |
 |-----|-----|
-| 管理员 API Key | `test-admin-key`（表为空时自动创建） |
+| 管理员 API Key | `test-admin-key`（本地开发配置，表为空时自动创建） |
 | 调用方 API Key | `test-caller-key` |
 | PostgreSQL | gateway / gateway_pass · db: smart_router |
 | Grafana | admin / admin |
 
-默认凭证只适用于本地开发；共享或生产环境请替换并停用默认 Key。
+默认凭证只适用于本地开发；生产环境 `bootstrap_default_keys: false` 会在空库时生成随机 `sr-` 管理员 Key（仅日志打印一次），请及时替换并停用默认 Key。
 
 ## 🧪 调用网关
 
@@ -74,12 +74,21 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 策略查找链：Token×模型 → Token → **分组默认** → 系统默认
 
+## 🔌 站点配置速查（中转站类型 / 接口协议）
+
+| 项 | 取值 | 作用 |
+|-----|------|------|
+| 中转站类型 | `newapi` / `sub2api` / `custom` | 自动配置余额接口：new-api → `/api/user/self`，sub2api → `/api/v1/auth/me`；留空按类型自动探测 |
+| 接口协议 | `openai` / `anthropic` | anthropic 站点自动 OpenAI↔Anthropic 转换 + `x-api-key` 认证，对外仍是 OpenAI 接口 |
+| 默认测试模型 | 每站点独立 | 测试台选择站点后自动预填该模型 |
+
 ## 💰 余额检测速查
 
 | 项 | 值 |
 |-----|-----|
 | 默认频率 | 10 分钟（分组可覆盖 `balance_interval_seconds`） |
-| 探测顺序 | 站点自定义接口（`balance_api_url` + `balance_api_token`）→ `/api/user/self` → OpenAI `credit_grants` |
+| 探测顺序 | 站点自定义接口（`balance_api_url` + `balance_api_token`）→ 类型默认接口 → one-api `/api/user/self` → OpenAI `credit_grants` |
+| 响应格式 | 自动识别 `data.quota`（quota 自动换算美元）/ `data.user.quota` / `data.balance` / `total_available`；GET 失败自动回退 POST |
 | 低余额告警阈值 | 设置页配置，默认 $1（`GET/PATCH /admin/settings`） |
 | 查看 | 站点卡片徽章 / 站点详情「余额」页签 / `GET /admin/channels/:id/balance` |
 | 自定义接口抓包 | 网页控制台 F12 → Network → 余额请求的 URL 与 Authorization Bearer 令牌 |
@@ -115,5 +124,3 @@ docker compose -p smart-router down
 | `README.md` | 总览 + 快速开始 + 完整 API 表 |
 | `web/README.md` | 前端开发（页面/组件/接口对照/设计要点） |
 | `MONITORING-QUICKREF.md` | Prometheus/Grafana 速查 |
-| `docs/superpowers/specs/` | 功能与文档规格记录 |
-| `docs/superpowers/plans/` | 工程计划记录 |
