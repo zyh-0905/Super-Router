@@ -145,12 +145,22 @@ func (b *BalanceChecker) fetchGeneric(ctx context.Context, url, credential strin
 		return 0, "", fmt.Errorf("非 JSON 响应")
 	}
 
-	// 1. one-api 格式
+	// 1. one-api 格式：data.quota / data.balance / data.remain_quota
 	if data, ok := raw["data"].(map[string]interface{}); ok {
 		for _, k := range []string{"quota", "balance", "remain_quota"} {
 			if v, ok := data[k]; ok {
 				if f, ok := toFloat(v); ok {
 					return f, "oneapi", nil
+				}
+			}
+		}
+		// 1b. new-api 登录/会话响应嵌套格式：data.user.quota
+		if user, ok := data["user"].(map[string]interface{}); ok {
+			for _, k := range []string{"quota", "balance", "remain_quota"} {
+				if v, ok := user[k]; ok {
+					if f, ok := toFloat(v); ok {
+						return f, "oneapi", nil
+					}
 				}
 			}
 		}
