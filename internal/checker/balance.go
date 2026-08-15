@@ -117,21 +117,40 @@ func (b *BalanceChecker) fetch(ctx context.Context, upstream Upstream) (*Balance
 	return nil, fmt.Errorf("余额接口不可用: %s", strings.Join(attempts, " | "))
 }
 
-// fetchGeneric 通用余额接口请求：自动识别响应格式
-// 支持：one-api {success,data:{quota}} / OpenAI {total_available} / 直接数字
-// 兼容 quota 为字符串的数字（如 "8.20"）
-func (b *BalanceChecker) fetchGeneric(ctx context.Context, url, credential string) (float64, string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+// doBalanceRequest 发起余额接口请求（POST 携带空 JSON 体）
+func (b *BalanceChecker) doBalanceRequest(ctx context.Context, url, credential, method string) (*http.Response, error) {
+	var body io.Reader
+	if method == "POST" {
+		body = strings.NewReader("{}")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
-		return 0, "", err
+		return nil, err
+	}
+	if method == "POST" {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if credential != "" {
 		req.Header.Set("Authorization", "Bearer "+credential)
 	}
+	return b.client.Do(req)
+}
 
-	resp, err := b.client.Do(req)
+// fetchGeneric 通用余额接口请求：自动识别响应格式
+// 支持：one-api {success,data:{quota}} / OpenAI {total_available} / 直接数字
+// 兼容 quota 为字符串的数字（如 "8.20"）。
+// GET 返回 404/405 时自动回退 POST（部分站点余额/会话接口仅支持 POST）。
+func (b *BalanceChecker) fetchGeneric(ctx context.Context, url, credential string) (float64, string, error) {
+	resp, err := b.doBalanceRequest(ctx, url, credential, "GET")
 	if err != nil {
 		return 0, "", err
+	}
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		resp.Body.Close()
+		resp, err = b.doBalanceRequest(ctx, url, credential, "POST")
+		if err != nil {
+			return 0, "", err
+		}
 	}
 	defer resp.Body.Close()
 

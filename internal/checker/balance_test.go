@@ -75,3 +75,28 @@ func TestQuotaToUSDHeuristic(t *testing.T) {
 		}
 	}
 }
+
+func TestFetchGenericPostFallback(t *testing.T) {
+	// GET 404 → 自动回退 POST，POST 返回余额
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"data":    map[string]interface{}{"user": map[string]interface{}{"quota": 2500000}},
+		})
+	}))
+	defer srv.Close()
+
+	b := &BalanceChecker{client: srv.Client()}
+	bal, src, err := b.fetchGeneric(context.Background(), srv.URL, "")
+	if err != nil {
+		t.Fatalf("fetchGeneric error: %v", err)
+	}
+	// 2500000 quota → 5 USD
+	if src != "oneapi" || math.Abs(bal-5.0) > 0.0001 {
+		t.Fatalf("got source=%q balance=%v, want oneapi/5.0", src, bal)
+	}
+}
