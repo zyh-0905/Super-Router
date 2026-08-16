@@ -328,11 +328,11 @@ func getTTFTP95(ch *ChannelHealth, model string) int {
 }
 
 // estimateCost 估算一次请求的成本（输入输出分开计价）：
-// 1. 实测倍率（official）：输入价 = 倍率 × 官网输入价，输出价 = 倍率 × 官网输出价
-//    （优先使用探测当时记录的官网价快照，价格库调整不影响历史倍率；快照缺失时回退价格库当前值）
-// 2. 实测倍率（baseline）：输入价 = 输出价 = 倍率 × $10/1M（价格库未收录的旧口径）
-// 3. 声明价格（declared_prices）
-// 4. 无价格信息：保守估计输入 $10/1M、输出 $30/1M
+//  1. 实测倍率（official）：输入价 = 倍率 × 官网输入价，输出价 = 倍率 × 官网输出价
+//     （优先使用探测当时记录的官网价快照，价格库调整不影响历史倍率；快照缺失时回退价格库当前值）
+//  2. 实测倍率（baseline）：输入价 = 输出价 = 倍率 × $10/1M（价格库未收录的旧口径）
+//  3. 声明价格（declared_prices）
+//  4. 无价格信息：保守估计输入 $10/1M、输出 $30/1M
 func estimateCost(ch *ChannelHealth, req *FilterRequest, policy *Policy, prices map[string]*ModelPrice) float64 {
 	var inputPrice, outputPrice float64
 

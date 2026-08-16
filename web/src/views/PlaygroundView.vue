@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { api } from '../api'
 import { store, toast } from '../store'
 import EmptyState from '../components/EmptyState.vue'
+import SelectBox from '../components/SelectBox.vue'
 import Icon from '../components/Icon.vue'
 import { fmtMs } from '../utils'
 
@@ -21,6 +22,7 @@ const req = ref({
 const groups = ref([])
 const channels = ref([])
 const selChannelId = ref(null)
+const selGroupId = ref(null) // 选中的分组 ID（过滤站点列表用）
 
 async function loadGroups() {
   try { groups.value = (await api.listGroups()).groups || [] } catch { /* 忽略 */ }
@@ -34,6 +36,36 @@ onMounted(() => { loadGroups(); loadChannels() })
 const knownModels = ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku']
 
 const selectedChannel = computed(() => channels.value.find(c => c.id === selChannelId.value) || null)
+
+// 站点列表按选中分组过滤：未选分组 = 全部站点；选定分组 = 仅该分组内的站点
+const filteredChannels = computed(() => {
+  if (!selGroupId.value) return channels.value
+  return channels.value.filter(c => (c.groups || []).some(g => g.id === selGroupId.value))
+})
+
+// 分组切换：同步请求参数（分组名）并校验当前选中站点是否仍在该分组内
+function onGroupChange() {
+  const g = groups.value.find(x => x.id === selGroupId.value)
+  req.value.group = g ? g.name : ''
+  if (selChannelId.value != null && !filteredChannels.value.some(c => c.id === selChannelId.value)) {
+    selChannelId.value = null
+    req.value.model = ''
+  }
+}
+
+const channelOpts = computed(() => [
+  { value: null, label: '不选择（手动填写模型）' },
+  ...filteredChannels.value.map(c => ({ value: c.id, label: c.name })),
+])
+const groupOpts = computed(() => [
+  { value: null, label: '不限定（全部站点）' },
+  ...groups.value.map(g => ({ value: g.id, label: `${g.name}（${g.channel_count} 站点）` })),
+])
+const roleOpts = [
+  { value: 'system', label: 'system' },
+  { value: 'user', label: 'user' },
+  { value: 'assistant', label: 'assistant' },
+]
 
 // 选中站点后：只加载该站点在设置中配置的默认测试模型（未配置则回退其映射的第一个模型）
 function onChannelChange() {
@@ -167,17 +199,15 @@ function reset() {
           <div class="form-grid-2">
             <div class="field">
               <label class="field-label">站点（自动填入该站点默认测试模型）</label>
-              <select v-model="selChannelId" class="select" @change="onChannelChange">
-                <option :value="null">不选择（手动填写模型）</option>
-                <option v-for="ch in channels" :key="ch.id" :value="ch.id">{{ ch.name }}</option>
-              </select>
+              <SelectBox v-model="selChannelId" :options="channelOpts" @change="onChannelChange" />
+              <div class="field-hint" style="margin-top:4px">
+                {{ selGroupId ? `仅显示分组内站点（${filteredChannels.length} 个）` : `全部站点（${filteredChannels.length} 个）` }}
+              </div>
             </div>
             <div class="field">
               <label class="field-label">分组（限定路由范围）</label>
-              <select v-model="req.group" class="select">
-                <option value="">不限定（全部站点）</option>
-                <option v-for="g in groups" :key="g.id" :value="g.name">{{ g.name }}（{{ g.channel_count }} 站点）</option>
-              </select>
+              <SelectBox v-model="selGroupId" :options="groupOpts" @change="onGroupChange" />
+              <div class="field-hint" style="margin-top:4px">选择分组后，上方站点列表只加载该分组内的站点</div>
             </div>
           </div>
 
@@ -194,11 +224,7 @@ function reset() {
             <label class="field-label">消息</label>
             <div v-for="(msg, i) in req.messages" :key="i" class="msg-box">
               <div class="row gap-2 msg-head">
-                <select v-model="msg.role" class="select" style="width:108px;padding:4px 26px 4px 10px;font-size:12px">
-                  <option value="system">system</option>
-                  <option value="user">user</option>
-                  <option value="assistant">assistant</option>
-                </select>
+                <SelectBox v-model="msg.role" :options="roleOpts" size="sm" width="112px" />
                 <span class="spacer" />
                 <button v-if="req.messages.length > 1" class="icon-btn" style="width:26px;height:26px" @click="removeMessage(i)"><Icon name="x" :size="13" /></button>
               </div>

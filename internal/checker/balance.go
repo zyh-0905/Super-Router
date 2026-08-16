@@ -24,16 +24,18 @@ type BalanceResult struct {
 
 // BalanceChecker 上游余额检测器（多协议自动探测）
 type BalanceChecker struct {
-	db     *store.DB
-	logger *zap.Logger
-	client *http.Client
+	db        *store.DB
+	logger    *zap.Logger
+	client    *http.Client
+	cryptoKey string
 }
 
-func NewBalanceChecker(db *store.DB, logger *zap.Logger) *BalanceChecker {
+func NewBalanceChecker(db *store.DB, logger *zap.Logger, cryptoKey string) *BalanceChecker {
 	return &BalanceChecker{
-		db:     db,
-		logger: logger,
-		client: &http.Client{Timeout: 10 * time.Second},
+		db:        db,
+		logger:    logger,
+		cryptoKey: cryptoKey,
+		client:    &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -71,6 +73,12 @@ func (b *BalanceChecker) FetchBalance(ctx context.Context, upstream Upstream) (*
 
 // fetch 多协议探测：站点自定义接口 → 类型默认接口 → one-api/new-api → OpenAI 官方
 func (b *BalanceChecker) fetch(ctx context.Context, upstream Upstream) (*BalanceResult, error) {
+	// P2-07：渠道 timeout_total_ms 映射为请求上下文超时（10s 客户端上限兜底；
+	// 多接口回退探测链共享该总预算）
+	reqCtx, cancel := withUpstreamTimeout(ctx, upstream, 10*time.Second)
+	defer cancel()
+	ctx = reqCtx
+
 	var attempts []string
 
 	// 站点余额凭证：独立令牌 > API Key > Access Token

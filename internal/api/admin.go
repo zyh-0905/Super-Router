@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"smart-router/internal/config"
+	"smart-router/internal/crypto"
 	"smart-router/internal/protocol"
 	"smart-router/internal/router"
+	"smart-router/internal/safenet"
 	"smart-router/internal/store"
 
 	"github.com/gin-gonic/gin"
@@ -29,6 +31,31 @@ type AdminHandler struct {
 	redis  *store.RedisClient
 	cfg    *config.Config
 	logger *zap.Logger
+}
+
+// safenetOptions 按配置构造 SSRF 校验选项（P2-04：仅开发配置可显式放宽）。
+func (h *AdminHandler) safenetOptions() safenet.Options {
+	return safenet.Options{
+		AllowHTTP:    h.cfg != nil && h.cfg.Server.AllowHTTPUpstream,
+		AllowPrivate: h.cfg != nil && h.cfg.Server.AllowPrivateUpstream,
+	}
+}
+
+// validateUpstreamURL 校验上游 URL（SSRF 防护），失败返回用户可读错误。
+func (h *AdminHandler) validateUpstreamURL(field, raw string) error {
+	if err := safenet.ValidateUpstreamURL(raw, h.safenetOptions()); err != nil {
+		return fmt.Errorf("%s: %v", field, err)
+	}
+	return nil
+}
+
+// encryptCred 加密凭据（未配置密钥时明文透传；P1-07）。
+func (h *AdminHandler) encryptCred(plain string) (string, error) {
+	key := ""
+	if h.cfg != nil {
+		key = h.cfg.Security.EncryptionKey
+	}
+	return crypto.Encrypt(plain, key)
 }
 
 type channelUpdateRequest struct {
@@ -50,6 +77,8 @@ type channelUpdateRequest struct {
 	BalanceAPIURL    *string           `json:"balance_api_url"`
 	BalanceAPIToken  *string           `json:"balance_api_token"`
 	GroupIDs         *[]int            `json:"group_ids"`
+	// ExpectedUpdatedAt 乐观锁（P1-08）：非空时与库中 updated_at 比较，不一致返回 409。
+	ExpectedUpdatedAt *string `json:"expected_updated_at"`
 }
 
 type keyUpdateRequest struct {
@@ -134,16 +163,69 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 		req.DailyProbeBudget = 0.5
 	}
 
-	ctx := context.Background()
+	// SSRF 防护（P2-04）：校验上游与余额接口地址
+	if err := h.validateUpstreamURL("base_url", req.BaseURL); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if req.BalanceAPIURL != "" {
+		if err := h.validateUpstreamURL("balance_api_url", req.BalanceAPIURL); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	// 凭据加密（P1-07）
+	encAccessToken, err := h.encryptCred(req.AccessToken)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to encrypt access token"})
+		return
+	}
+	encAPIKey, err := h.encryptCred(req.APIKey)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to encrypt api key"})
+		return
+	}
+	encBalanceToken, err := h.encryptCred(req.BalanceAPIToken)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to encrypt balance token"})
+		return
+	}
+
+	ctx := c.Request.Context()
 	modelMappingJSON, _ := json.Marshal(req.ModelMapping)
 	capabilitiesJSON, _ := json.Marshal(req.Capabilities)
 
+	// P1-08：渠道插入与分组归属同步在同一事务中完成，失败整体回滚。
+	tx, err := h.db.Pool.Begin(ctx)
+	if err != nil {
+		h.logger.Error("Failed to begin tx", zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to create channel"})
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	// 分组归属：未指定时归入默认分组；显式指定的组 ID 必须全部存在
+	groupIDs := req.GroupIDs
+	if len(groupIDs) == 0 {
+		if dgid, err := h.defaultGroupIDTx(ctx, tx); err == nil {
+			groupIDs = []int{dgid}
+		} else {
+			h.logger.Error("Failed to resolve default group", zap.Error(err))
+			c.JSON(500, gin.H{"error": "failed to resolve default group"})
+			return
+		}
+	} else if err := ensureGroupsExist(ctx, tx, groupIDs); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
 	var id int
-	err := h.db.Pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, protocol, relay_type, test_model, user_priority, weight, model_mapping, capabilities, daily_probe_budget, ratio_limit, balance_api_url, balance_api_token)
 		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING id
-	`, req.Name, req.BaseURL, req.AccessToken, req.APIKey, req.Role, req.Protocol, req.RelayType, req.TestModel, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, req.BalanceAPIToken).Scan(&id)
+	`, req.Name, req.BaseURL, encAccessToken, encAPIKey, req.Role, req.Protocol, req.RelayType, req.TestModel, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, encBalanceToken).Scan(&id)
 
 	if err != nil {
 		h.logger.Error("Failed to create channel", zap.Error(err))
@@ -151,15 +233,17 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 		return
 	}
 
-	// 同步分组归属（未指定时归入默认分组）
-	groupIDs := req.GroupIDs
-	if len(groupIDs) == 0 {
-		if dgid, err := h.defaultGroupID(ctx); err == nil {
-			groupIDs = []int{dgid}
-		}
+	// 同步分组归属（同一事务内）
+	if err := syncChannelGroupsTx(ctx, tx, id, groupIDs); err != nil {
+		h.logger.Error("Failed to sync channel groups", zap.Int("channel_id", id), zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to create channel (group sync)"})
+		return
 	}
-	if err := h.syncChannelGroups(ctx, id, groupIDs); err != nil {
-		h.logger.Warn("Failed to sync channel groups", zap.Int("channel_id", id), zap.Error(err))
+
+	if err := tx.Commit(ctx); err != nil {
+		h.logger.Error("Failed to commit channel creation", zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to create channel"})
+		return
 	}
 	h.invalidateSnapshot(ctx)
 
@@ -167,6 +251,56 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 		"id":      id,
 		"message": "channel created successfully",
 	})
+}
+
+// ensureGroupsExist 校验分组 ID 全部存在且启用（P1-08：拒绝不存在的组 ID）。
+func ensureGroupsExist(ctx context.Context, tx pgx.Tx, groupIDs []int) error {
+	for _, gid := range groupIDs {
+		var enabled bool
+		err := tx.QueryRow(ctx, `SELECT enabled FROM channel_groups WHERE id = $1`, gid).Scan(&enabled)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("group %d not found", gid)
+			}
+			return fmt.Errorf("query group %d: %v", gid, err)
+		}
+		if !enabled {
+			return fmt.Errorf("group %d is disabled", gid)
+		}
+	}
+	return nil
+}
+
+// syncChannelGroupsTx 在给定事务内全量同步站点的分组归属。
+func syncChannelGroupsTx(ctx context.Context, tx pgx.Tx, channelID int, groupIDs []int) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM channel_group_members WHERE channel_id = $1`, channelID); err != nil {
+		return err
+	}
+	for _, gid := range groupIDs {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO channel_group_members (channel_id, group_id) VALUES ($1, $2)
+			ON CONFLICT DO NOTHING
+		`, channelID, gid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// defaultGroupIDTx 在给定事务内返回「默认分组」的 ID（不存在时创建）。
+func (h *AdminHandler) defaultGroupIDTx(ctx context.Context, tx pgx.Tx) (int, error) {
+	var id int
+	err := tx.QueryRow(ctx, `SELECT id FROM channel_groups WHERE name = '默认分组' LIMIT 1`).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO channel_groups (name, description)
+		VALUES ('默认分组', '系统自动创建的默认分组')
+		ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+		RETURNING id
+	`).Scan(&id)
+	return id, err
 }
 
 // loadChannelGroupsMap 加载所有站点的分组归属：channelID → [{id,name}]
@@ -194,52 +328,14 @@ func (h *AdminHandler) loadChannelGroupsMap(ctx context.Context) (map[int][]map[
 	return m, rows.Err()
 }
 
-// syncChannelGroups 全量同步站点的分组归属
-func (h *AdminHandler) syncChannelGroups(ctx context.Context, channelID int, groupIDs []int) error {
-	tx, err := h.db.Pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err := tx.Exec(ctx, `DELETE FROM channel_group_members WHERE channel_id = $1`, channelID); err != nil {
-		return err
-	}
-	for _, gid := range groupIDs {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO channel_group_members (channel_id, group_id) VALUES ($1, $2)
-			ON CONFLICT DO NOTHING
-		`, channelID, gid); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
-}
-
-// defaultGroupID 返回「默认分组」的 ID（不存在时创建）
-func (h *AdminHandler) defaultGroupID(ctx context.Context) (int, error) {
-	var id int
-	err := h.db.Pool.QueryRow(ctx, `SELECT id FROM channel_groups WHERE name = '默认分组' LIMIT 1`).Scan(&id)
-	if err == nil {
-		return id, nil
-	}
-	err = h.db.Pool.QueryRow(ctx, `
-		INSERT INTO channel_groups (name, description)
-		VALUES ('默认分组', '系统自动创建的默认分组')
-		ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-		RETURNING id
-	`).Scan(&id)
-	return id, err
-}
-
-// ListChannels GET /admin/channels - 列出所有站点
+// ListChannels GET /admin/channels - 列出所有站点（不返回任何明文凭据，P1-07）
 func (h *AdminHandler) ListChannels(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, name, base_url, enabled, role, protocol, relay_type, test_model, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
-		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at
+		       daily_probe_budget, ratio_limit, balance_api_url, created_at, updated_at
 		FROM upstreams
 		ORDER BY id
 	`)
@@ -258,11 +354,11 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 		var enabled bool
 		var dailyProbeBudget, ratioLimit float64
 		var modelMappingJSON, capabilitiesJSON string
-		var balanceAPIURL, balanceAPIToken string
-		var createdAt time.Time
+		var balanceAPIURL string
+		var createdAt, updatedAt time.Time
 
 		if err := rows.Scan(&id, &name, &baseURL, &enabled, &role, &proto, &relayType, &testModel, &userPriority, &weight,
-			&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt); err != nil {
+			&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &createdAt, &updatedAt); err != nil {
 			h.logger.Warn("Failed to scan channel row", zap.Error(err))
 			continue
 		}
@@ -295,6 +391,7 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 			"balance_api_url":    balanceAPIURL,
 			"groups":             groups,
 			"created_at":         createdAt.Format(time.RFC3339),
+			"updated_at":         updatedAt.Format(time.RFC3339),
 		})
 	}
 
@@ -304,29 +401,29 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 	})
 }
 
-// GetChannel GET /admin/channels/:id - 站点详情
+// GetChannel GET /admin/channels/:id - 站点详情（凭据脱敏：余额令牌只返回配置状态与尾号，P1-07）
 func (h *AdminHandler) GetChannel(c *gin.Context) {
 	id := c.Param("id")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	var (
-		channelID, userPriority, weight        int
-		name, baseURL, role, proto, relayType  string
-		testModel                              string
-		enabled                                bool
-		dailyProbeBudget, ratioLimit           float64
-		modelMappingJSON, capabilitiesJSON     string
-		balanceAPIURL, balanceAPIToken         string
-		createdAt                              time.Time
+		channelID, userPriority, weight       int
+		name, baseURL, role, proto, relayType string
+		testModel                             string
+		enabled                               bool
+		dailyProbeBudget, ratioLimit          float64
+		modelMappingJSON, capabilitiesJSON    string
+		balanceAPIURL, balanceAPIToken        string
+		createdAt, updatedAt                  time.Time
 	)
 
 	err := h.db.Pool.QueryRow(ctx, `
 		SELECT id, name, base_url, enabled, role, protocol, relay_type, test_model, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
-		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at
+		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at, updated_at
 		FROM upstreams WHERE id = $1
 	`, id).Scan(&channelID, &name, &baseURL, &enabled, &role, &proto, &relayType, &testModel, &userPriority, &weight,
-		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt)
+		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt, &updatedAt)
 
 	if err != nil {
 		c.JSON(404, gin.H{"error": "channel not found"})
@@ -338,28 +435,42 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 	_ = json.Unmarshal([]byte(modelMappingJSON), &modelMapping)
 	_ = json.Unmarshal([]byte(capabilitiesJSON), &capabilities)
 
+	// 余额令牌脱敏：只返回是否配置与脱敏尾号（解密失败时也仅标记已配置，不泄露密文）
+	balanceTokenConfigured := balanceAPIToken != ""
+	balanceTokenSuffix := ""
+	if balanceTokenConfigured {
+		if plain, derr := crypto.Decrypt(balanceAPIToken, h.cfg.Security.EncryptionKey); derr == nil {
+			balanceTokenSuffix = crypto.MaskSuffix(plain)
+		} else {
+			balanceTokenSuffix = "****"
+		}
+	}
+
 	c.JSON(200, gin.H{
-		"id":                 channelID,
-		"name":               name,
-		"base_url":           baseURL,
-		"enabled":            enabled,
-		"role":               role,
-		"protocol":           proto,
-		"relay_type":         relayType,
-		"test_model":         testModel,
-		"user_priority":      userPriority,
-		"weight":             weight,
-		"model_mapping":      modelMapping,
-		"capabilities":       capabilities,
-		"daily_probe_budget": dailyProbeBudget,
-		"ratio_limit":        ratioLimit,
-		"balance_api_url":    balanceAPIURL,
-		"balance_api_token":  balanceAPIToken,
-		"created_at":         createdAt.Format(time.RFC3339),
+		"id":                           channelID,
+		"name":                         name,
+		"base_url":                     baseURL,
+		"enabled":                      enabled,
+		"role":                         role,
+		"protocol":                     proto,
+		"relay_type":                   relayType,
+		"test_model":                   testModel,
+		"user_priority":                userPriority,
+		"weight":                       weight,
+		"model_mapping":                modelMapping,
+		"capabilities":                 capabilities,
+		"daily_probe_budget":           dailyProbeBudget,
+		"ratio_limit":                  ratioLimit,
+		"balance_api_url":              balanceAPIURL,
+		"balance_api_token_configured": balanceTokenConfigured,
+		"balance_api_token_suffix":     balanceTokenSuffix,
+		"created_at":                   createdAt.Format(time.RFC3339),
+		"updated_at":                   updatedAt.Format(time.RFC3339),
 	})
 }
 
 // UpdateChannel PATCH /admin/channels/:id - 更新站点配置
+// P1-08：渠道字段更新与分组同步在同一事务内完成；支持 expected_updated_at 乐观锁。
 func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 	id := c.Param("id")
 
@@ -370,16 +481,23 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
-	// 校验站点存在
-	var exists bool
-	if err := h.db.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM upstreams WHERE id = $1)`, id).Scan(&exists); err != nil || !exists {
-		c.JSON(404, gin.H{"error": "channel not found"})
-		return
+	// SSRF 防护（P2-04）：更新地址字段时校验
+	if req.BaseURL != nil {
+		if err := h.validateUpstreamURL("base_url", *req.BaseURL); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.BalanceAPIURL != nil && *req.BalanceAPIURL != "" {
+		if err := h.validateUpstreamURL("balance_api_url", *req.BalanceAPIURL); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
-	// 构建动态更新语句
+	// 构建动态更新语句（凭据字段加密后入库，P1-07）
 	updates := []string{}
 	args := []interface{}{}
 
@@ -392,12 +510,22 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 		args = append(args, *req.BaseURL)
 	}
 	if req.AccessToken != nil {
+		enc, err := h.encryptCred(*req.AccessToken)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "failed to encrypt access token"})
+			return
+		}
 		updates = append(updates, "access_token = $"+strconv.Itoa(len(args)+1))
-		args = append(args, *req.AccessToken)
+		args = append(args, enc)
 	}
 	if req.APIKey != nil {
+		enc, err := h.encryptCred(*req.APIKey)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "failed to encrypt api key"})
+			return
+		}
 		updates = append(updates, "api_key = $"+strconv.Itoa(len(args)+1))
-		args = append(args, *req.APIKey)
+		args = append(args, enc)
 	}
 	if req.Protocol != nil {
 		if !protocol.ValidProtocol(*req.Protocol) {
@@ -458,13 +586,48 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 		args = append(args, *req.BalanceAPIURL)
 	}
 	if req.BalanceAPIToken != nil {
+		enc, err := h.encryptCred(*req.BalanceAPIToken)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "failed to encrypt balance token"})
+			return
+		}
 		updates = append(updates, "balance_api_token = $"+strconv.Itoa(len(args)+1))
-		args = append(args, *req.BalanceAPIToken)
+		args = append(args, enc)
 	}
 
 	if len(updates) == 0 && req.GroupIDs == nil {
 		c.JSON(400, gin.H{"error": "no fields to update"})
 		return
+	}
+
+	// P1-08：单事务（渠道字段 + 分组成员关系），并发修改用乐观锁防护
+	tx, err := h.db.Pool.Begin(ctx)
+	if err != nil {
+		h.logger.Error("Failed to begin tx", zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to update channel"})
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	// 校验站点存在并读取当前 updated_at（行锁）
+	var dbUpdatedAt time.Time
+	err = tx.QueryRow(ctx, `SELECT updated_at FROM upstreams WHERE id = $1 FOR UPDATE`, id).Scan(&dbUpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(404, gin.H{"error": "channel not found"})
+		} else {
+			c.JSON(500, gin.H{"error": "failed to update channel"})
+		}
+		return
+	}
+
+	// 乐观锁：客户端携带 expected_updated_at 时校验，避免覆盖并发修改
+	if req.ExpectedUpdatedAt != nil && *req.ExpectedUpdatedAt != "" {
+		exp, perr := time.Parse(time.RFC3339, *req.ExpectedUpdatedAt)
+		if perr != nil || !exp.Equal(dbUpdatedAt.Truncate(time.Microsecond)) {
+			c.JSON(409, gin.H{"error": "channel was modified concurrently, please refresh and retry"})
+			return
+		}
 	}
 
 	if len(updates) > 0 {
@@ -475,20 +638,30 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 		}
 		query += ", updated_at = NOW() WHERE id = $" + strconv.Itoa(len(args))
 
-		if _, err := h.db.Pool.Exec(ctx, query, args...); err != nil {
+		if _, err := tx.Exec(ctx, query, args...); err != nil {
 			h.logger.Error("Failed to update channel", zap.Error(err))
 			c.JSON(500, gin.H{"error": "failed to update channel"})
 			return
 		}
 	}
 
-	// 同步分组归属
+	// 同步分组归属（同一事务内；显式组 ID 必须全部存在）
 	if req.GroupIDs != nil {
-		if err := h.syncChannelGroups(ctx, mustAtoi(id), *req.GroupIDs); err != nil {
+		if err := ensureGroupsExist(ctx, tx, *req.GroupIDs); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		if err := syncChannelGroupsTx(ctx, tx, mustAtoi(id), *req.GroupIDs); err != nil {
 			h.logger.Error("Failed to sync channel groups", zap.Error(err))
 			c.JSON(500, gin.H{"error": "failed to update channel groups"})
 			return
 		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		h.logger.Error("Failed to commit channel update", zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to update channel"})
+		return
 	}
 	h.invalidateSnapshot(ctx)
 
@@ -504,7 +677,7 @@ func mustAtoi(s string) int {
 // DeleteChannel DELETE /admin/channels/:id - 删除站点
 func (h *AdminHandler) DeleteChannel(c *gin.Context) {
 	id := c.Param("id")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	ct, err := h.db.Pool.Exec(ctx, `DELETE FROM upstreams WHERE id = $1`, id)
 	if err != nil {
@@ -524,7 +697,7 @@ func (h *AdminHandler) DeleteChannel(c *gin.Context) {
 // GetChannelBalance GET /admin/channels/:id/balance - 当前余额与历史
 func (h *AdminHandler) GetChannelBalance(c *gin.Context) {
 	id := c.Param("id")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, balance, currency, source, error, checked_at
@@ -578,7 +751,7 @@ func (h *AdminHandler) GetChannelBalance(c *gin.Context) {
 
 // GetSettings GET /admin/settings - 读取系统设置
 func (h *AdminHandler) GetSettings(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	threshold := 1.0
 	var v string
@@ -605,7 +778,7 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	if req.LowBalanceThreshold != nil {
 		if *req.LowBalanceThreshold < 0 {
 			c.JSON(400, gin.H{"error": "threshold must be >= 0"})
@@ -651,13 +824,28 @@ type UpstreamModel struct {
 // fetchUpstreamModels 调用上游 GET /v1/models 并解析模型列表
 // 兼容 OpenAI / OneAPI 等格式：{data:[...]} 或 {models:[...]}；
 // anthropic 协议站点使用 x-api-key + anthropic-version 头。
-func fetchUpstreamModels(baseURL, apiKey, proto string) ([]UpstreamModel, error) {
+// P2-04：每次重定向后再次做 SSRF 校验，防止开放重定向绕过。
+func fetchUpstreamModels(baseURL, apiKey, proto string, netOpts safenet.Options) ([]UpstreamModel, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("base_url is empty")
 	}
+	if err := safenet.ValidateUpstreamURL(baseURL, netOpts); err != nil {
+		return nil, err
+	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			if err := safenet.ValidateRedirect(r.URL.String(), netOpts); err != nil {
+				return fmt.Errorf("redirect blocked: %w", err)
+			}
+			return nil
+		},
+	}
 	req, err := http.NewRequest("GET", protocol.ModelsEndpoint(baseURL), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -710,7 +898,7 @@ func fetchUpstreamModels(baseURL, apiKey, proto string) ([]UpstreamModel, error)
 // GetUpstreamModels GET /admin/channels/:id/models - 拉取已保存站点的上游模型列表
 func (h *AdminHandler) GetUpstreamModels(c *gin.Context) {
 	id := c.Param("id")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	var baseURL, accessToken, apiKey, proto string
 	err := h.db.Pool.QueryRow(ctx, `
@@ -721,13 +909,20 @@ func (h *AdminHandler) GetUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	// 优先 API Key，其次 Access Token
-	key := apiKey
+	// 优先 API Key，其次 Access Token（解密后使用，P1-07）
+	key, err := crypto.Decrypt(apiKey, h.cfg.Security.EncryptionKey)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to decrypt api key"})
+		return
+	}
 	if key == "" {
-		key = accessToken
+		if key, err = crypto.Decrypt(accessToken, h.cfg.Security.EncryptionKey); err != nil {
+			c.JSON(500, gin.H{"error": "failed to decrypt access token"})
+			return
+		}
 	}
 
-	models, err := fetchUpstreamModels(baseURL, key, proto)
+	models, err := fetchUpstreamModels(baseURL, key, proto, h.safenetOptions())
 	if err != nil {
 		c.JSON(502, gin.H{"error": err.Error()})
 		return
@@ -760,12 +955,18 @@ func (h *AdminHandler) ProbeUpstreamModels(c *gin.Context) {
 		return
 	}
 
+	// SSRF 防护（P2-04）：探测接口直接接受任意 URL，必须校验
+	if err := h.validateUpstreamURL("base_url", req.BaseURL); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
 	key := req.APIKey
 	if key == "" {
 		key = req.AccessToken
 	}
 
-	models, err := fetchUpstreamModels(req.BaseURL, key, req.Protocol)
+	models, err := fetchUpstreamModels(req.BaseURL, key, req.Protocol, h.safenetOptions())
 	if err != nil {
 		c.JSON(502, gin.H{"error": err.Error()})
 		return
@@ -781,7 +982,7 @@ func (h *AdminHandler) ProbeUpstreamModels(c *gin.Context) {
 
 // ListGroups GET /admin/groups - 列出所有分组（含站点数与统计）
 func (h *AdminHandler) ListGroups(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT g.id, g.name, g.description, g.enabled, g.default_strategy, g.group_priority,
@@ -869,7 +1070,7 @@ func (h *AdminHandler) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	var id int
 	err := h.db.Pool.QueryRow(ctx, `
 		INSERT INTO channel_groups (
@@ -931,7 +1132,7 @@ func (h *AdminHandler) UpdateGroup(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	updates := []string{}
 	args := []interface{}{}
 
@@ -1010,7 +1211,7 @@ func (h *AdminHandler) UpdateGroup(c *gin.Context) {
 // DeleteGroup DELETE /admin/groups/:id - 删除分组（成员关系级联删除）
 func (h *AdminHandler) DeleteGroup(c *gin.Context) {
 	id := c.Param("id")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	ct, err := h.db.Pool.Exec(ctx, `DELETE FROM channel_groups WHERE id = $1`, id)
 	if err != nil {
@@ -1032,7 +1233,7 @@ func (h *AdminHandler) DeleteGroup(c *gin.Context) {
 // GetHealth GET /admin/health/:channel_id - 查看站点健康数据
 func (h *AdminHandler) GetHealth(c *gin.Context) {
 	channelID := c.Param("channel_id")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, epoch, is_alive, latency_ms, checked_at
@@ -1104,7 +1305,7 @@ func (h *AdminHandler) GetDecisions(c *gin.Context) {
 	if limit > 500 {
 		limit = 500
 	}
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	gid := parseGroupIDParam(c)
 
 	// 渠道 ID → 名称映射
@@ -1168,18 +1369,22 @@ func (h *AdminHandler) GetDecisions(c *gin.Context) {
 		_ = json.Unmarshal([]byte(attemptsJSON), &attempts)
 		_ = json.Unmarshal([]byte(candidateDetailsJSON), &candidateDetails)
 
-		// 六维评分富化渠道名
+		// 六维评分富化渠道名（保留真实指标 raw，供前端直观展示）
 		detailsEnriched := []map[string]interface{}{}
 		for _, cd := range candidateDetails {
 			cid := 0
 			if v, ok := cd["channel_id"].(float64); ok {
 				cid = int(v)
 			}
-			detailsEnriched = append(detailsEnriched, map[string]interface{}{
+			entry := map[string]interface{}{
 				"channel_id": cid,
 				"channel":    nameMap[cid],
 				"dims":       cd["dims"],
-			})
+			}
+			if raw, ok := cd["raw"].(map[string]interface{}); ok {
+				entry["raw"] = raw
+			}
+			detailsEnriched = append(detailsEnriched, entry)
 		}
 
 		// 候选排序 → 带渠道名与得分
@@ -1290,15 +1495,17 @@ func (h *AdminHandler) groupNameMap(ctx context.Context) (map[int]string, error)
 // ==================== 熔断状态 ====================
 
 // GetCircuitStates GET /admin/circuit - 查看所有熔断状态（支持 ?group_id= 筛选）
+// P1-04：展示每个状态的所属分组桶（group_id = 0 为全局桶）。
 func (h *AdminHandler) GetCircuitStates(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	gid := parseGroupIDParam(c)
 
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT cs.channel_id, u.name, cs.model, cs.state, cs.failure_count, cs.success_count,
-		       cs.cooling_until, cs.updated_at
+		       cs.cooling_until, cs.updated_at, cs.group_id, COALESCE(g.name, '全局')
 		FROM circuit_states cs
 		JOIN upstreams u ON u.id = cs.channel_id
+		LEFT JOIN channel_groups g ON g.id = cs.group_id
 		WHERE $1::int IS NULL OR EXISTS (
 			SELECT 1 FROM channel_group_members cgm
 			WHERE cgm.channel_id = cs.channel_id AND cgm.group_id = $1
@@ -1313,12 +1520,12 @@ func (h *AdminHandler) GetCircuitStates(c *gin.Context) {
 
 	states := []map[string]interface{}{}
 	for rows.Next() {
-		var channelID, failureCount, successCount int
-		var channelName, model, state string
+		var channelID, failureCount, successCount, stateGroupID int
+		var channelName, model, state, groupName string
 		var coolingUntil *time.Time
 		var updatedAt time.Time
 
-		if err := rows.Scan(&channelID, &channelName, &model, &state, &failureCount, &successCount, &coolingUntil, &updatedAt); err != nil {
+		if err := rows.Scan(&channelID, &channelName, &model, &state, &failureCount, &successCount, &coolingUntil, &updatedAt, &stateGroupID, &groupName); err != nil {
 			h.logger.Warn("Failed to scan circuit row", zap.Error(err))
 			continue
 		}
@@ -1334,6 +1541,8 @@ func (h *AdminHandler) GetCircuitStates(c *gin.Context) {
 			"channel_name":  channelName,
 			"model":         model,
 			"state":         state,
+			"group_id":      stateGroupID,
+			"group_name":    groupName,
 			"failure_count": failureCount,
 			"success_count": successCount,
 			"cooling_until": coolingStr,
@@ -1350,7 +1559,7 @@ func (h *AdminHandler) GetCircuitStates(c *gin.Context) {
 // ResetCircuit POST /admin/circuit/:channel_id/reset - 手动重置熔断器
 func (h *AdminHandler) ResetCircuit(c *gin.Context) {
 	channelID := c.Param("channel_id")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	ct, err := h.db.Pool.Exec(ctx, `
 		UPDATE circuit_states
@@ -1387,7 +1596,7 @@ func parseGroupIDParam(c *gin.Context) *int {
 
 // GetStats GET /admin/stats - 24h 聚合统计（支持 ?group_id= 分组筛选）
 func (h *AdminHandler) GetStats(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	stats := gin.H{}
 
 	gid := parseGroupIDParam(c)
@@ -1961,7 +2170,7 @@ func formatAgo(t time.Time) string {
 
 // ListKeys GET /admin/keys - 列出所有 API Keys
 func (h *AdminHandler) ListKeys(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, key_prefix, role, enabled, created_at
@@ -2072,7 +2281,7 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 	}
 	apiKey := "sr-" + hex.EncodeToString(buf)
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	var id int
 	err := h.db.Pool.QueryRow(ctx, `
 		INSERT INTO api_keys (key_hash, key_prefix, role, enabled)
@@ -2111,7 +2320,7 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	if req.Enabled != nil {
 		ct, err := h.db.Pool.Exec(ctx, `UPDATE api_keys SET enabled = $1 WHERE id = $2`, *req.Enabled, id)
@@ -2143,7 +2352,7 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 // DeleteKey DELETE /admin/keys/:id - 撤销 Key
 func (h *AdminHandler) DeleteKey(c *gin.Context) {
 	id := c.Param("id")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	ct, err := h.db.Pool.Exec(ctx, `DELETE FROM api_keys WHERE id = $1`, id)
 	if err != nil {
@@ -2186,5 +2395,309 @@ func (h *AdminHandler) GetConfig(c *gin.Context) {
 			"max_ttft_ms":       h.cfg.Routing.Filter.MaxTTFTMS,
 			"open_failure_rate": h.cfg.Routing.CircuitBreaker.OpenFailureRate,
 		},
+	})
+}
+
+// ==================== 策略中心（系统默认策略） ====================
+
+// validStrategyNames 与 router 包内置的 5 种策略保持一致。
+var validStrategyNames = map[string]bool{
+	"custom_priority": true, "price_first": true, "latency_first": true,
+	"reliability_first": true, "balanced": true,
+}
+
+// normalizeBalancedWeights 归一化 balanced 权重（合计 = 1）。
+// 任一权重为负或全零 → 返回 nil（校验失败）；缺失键按 0 处理。
+func normalizeBalancedWeights(w map[string]float64) map[string]float64 {
+	if w == nil {
+		return nil
+	}
+	out := map[string]float64{"cost": 0, "reliability": 0, "latency": 0, "load": 0}
+	sum := 0.0
+	for k, v := range w {
+		if _, ok := out[k]; !ok {
+			continue // 忽略未知键
+		}
+		if v < 0 {
+			return nil
+		}
+		out[k] = v
+		sum += v
+	}
+	if sum <= 0 {
+		return nil
+	}
+	for k := range out {
+		out[k] = out[k] / sum
+	}
+	return out
+}
+
+// systemPolicyConfig 提取策略 JSON 中的 balanced_weights（兼容嵌套与扁平键）。
+func systemPolicyConfig(cfgJSON []byte) map[string]interface{} {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(cfgJSON, &raw); err != nil {
+		return map[string]interface{}{}
+	}
+	if raw == nil {
+		return map[string]interface{}{}
+	}
+	return raw
+}
+
+func extractBalancedWeights(cfgJSON []byte) map[string]float64 {
+	raw := systemPolicyConfig(cfgJSON)
+	weights := map[string]float64{"cost": 0, "reliability": 0, "latency": 0, "load": 0}
+	if nested, ok := raw["balanced_weights"].(map[string]interface{}); ok {
+		for _, k := range []string{"cost", "reliability", "latency", "load"} {
+			if v, ok := nested[k].(float64); ok && v > 0 {
+				weights[k] = v
+			}
+		}
+		return weights
+	}
+	// 扁平键：balanced_weights.cost 等
+	for _, k := range []string{"cost", "reliability", "latency", "load"} {
+		if v, ok := raw["balanced_weights."+k].(float64); ok && v > 0 {
+			weights[k] = v
+		}
+	}
+	return weights
+}
+
+// GetSystemPolicy GET /admin/policies - 当前生效的系统默认策略
+// （策略查找链最低一级：Token×模型 → Token → 分组默认 → 系统默认）。
+func (h *AdminHandler) GetSystemPolicy(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	var strategy string
+	var cfgJSON []byte
+	err := h.db.Pool.QueryRow(ctx, `
+		SELECT strategy, config
+		FROM routing_policies
+		WHERE token_id IS NULL AND model IS NULL
+		LIMIT 1
+	`).Scan(&strategy, &cfgJSON)
+
+	source := "database"
+	weights := map[string]float64{"cost": 0, "reliability": 0, "latency": 0, "load": 0}
+	if err != nil {
+		// 无数据库策略行：回退配置文件默认（仅展示，不落库）
+		source = "config_file"
+		strategy = h.cfg.Routing.DefaultStrategy
+		weights = map[string]float64{
+			"cost":        h.cfg.Routing.BalancedWeights.Cost,
+			"reliability": h.cfg.Routing.BalancedWeights.Reliability,
+			"latency":     h.cfg.Routing.BalancedWeights.Latency,
+			"load":        h.cfg.Routing.BalancedWeights.Load,
+		}
+	} else {
+		weights = extractBalancedWeights(cfgJSON)
+	}
+
+	// 归一化为百分比（前端滑块展示用）
+	percent := map[string]float64{}
+	sum := 0.0
+	for _, v := range weights {
+		sum += v
+	}
+	if sum <= 0 {
+		percent = map[string]float64{"cost": 25, "reliability": 25, "latency": 25, "load": 25}
+	} else {
+		for k, v := range weights {
+			percent[k] = round2(v / sum * 100)
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"strategy":         strategy,
+		"source":           source,
+		"balanced_weights": weights,
+		"balanced_percent": percent,
+		"available":        []string{"custom_priority", "price_first", "latency_first", "reliability_first", "balanced"},
+	})
+}
+
+// UpdateSystemPolicy PUT /admin/policies - 保存系统默认策略（写入 routing_policies 全局行）
+// body: {"strategy": "balanced", "balanced_weights": {"cost":..,"reliability":..,"latency":..,"load":..}}
+func (h *AdminHandler) UpdateSystemPolicy(c *gin.Context) {
+	var req struct {
+		Strategy        string             `json:"strategy"`
+		BalancedWeights map[string]float64 `json:"balanced_weights"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if !validStrategyNames[req.Strategy] {
+		c.JSON(400, gin.H{"error": "unknown strategy: " + req.Strategy})
+		return
+	}
+
+	cfgMap := map[string]interface{}{}
+	if req.Strategy == "balanced" {
+		weights := normalizeBalancedWeights(req.BalancedWeights)
+		if weights == nil {
+			c.JSON(400, gin.H{"error": "balanced_weights must be non-negative and sum greater than zero"})
+			return
+		}
+		cfgMap["balanced_weights"] = weights
+	}
+	cfgJSON, err := json.Marshal(cfgMap)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to marshal policy config"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	// 017 迁移后唯一约束为 NULLS NOT DISTINCT，(NULL, NULL) 行可稳定 upsert
+	_, err = h.db.Pool.Exec(ctx, `
+		INSERT INTO routing_policies (token_id, model, policy_version, strategy, config, activated_at)
+		VALUES (NULL, NULL, 'system', $1, $2, NOW())
+		ON CONFLICT (token_id, model)
+		DO UPDATE SET policy_version = 'system', strategy = $1, config = $2, activated_at = NOW()
+	`, req.Strategy, string(cfgJSON))
+	if err != nil {
+		h.logger.Error("Failed to update system policy", zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to update system policy"})
+		return
+	}
+
+	// 策略每次请求实时读取（不走快照缓存），立即生效
+	c.JSON(200, gin.H{
+		"message":  "system policy saved",
+		"strategy": req.Strategy,
+	})
+}
+
+// weightsToPercent 将权重（合计可不为 1）换算为百分比展示值（合计 100）。
+func weightsToPercent(weights map[string]float64) map[string]float64 {
+	percent := map[string]float64{"cost": 25, "reliability": 25, "latency": 25, "load": 25}
+	sum := 0.0
+	for _, v := range weights {
+		sum += v
+	}
+	if sum <= 0 {
+		return percent
+	}
+	for k, v := range weights {
+		percent[k] = round2(v / sum * 100)
+	}
+	return percent
+}
+
+// GetGroupStrategy GET /admin/groups/:id/strategy - 分组级策略视图。
+// 分组未单独配置（default_strategy 为空）时返回 inherited=true，
+// 并附带当前系统默认策略名，供前端展示「跟随系统默认」状态。
+func (h *AdminHandler) GetGroupStrategy(c *gin.Context) {
+	ctx := c.Request.Context()
+	groupID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || groupID <= 0 {
+		c.JSON(400, gin.H{"error": "invalid group id"})
+		return
+	}
+
+	var gid int
+	var name, defStrategy string
+	var cfgJSON []byte
+	err = h.db.Pool.QueryRow(ctx, `
+		SELECT id, name, default_strategy, COALESCE(strategy_config::text, '{}')
+		FROM channel_groups WHERE id = $1
+	`, groupID).Scan(&gid, &name, &defStrategy, &cfgJSON)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(404, gin.H{"error": "group not found"})
+			return
+		}
+		c.JSON(500, gin.H{"error": "failed to query group strategy"})
+		return
+	}
+
+	weights := extractBalancedWeights(cfgJSON)
+	resp := gin.H{
+		"group_id":         gid,
+		"group_name":       name,
+		"strategy":         defStrategy,
+		"inherited":        defStrategy == "",
+		"balanced_weights": weights,
+		"balanced_percent": weightsToPercent(weights),
+		"available":        []string{"custom_priority", "price_first", "latency_first", "reliability_first", "balanced"},
+	}
+
+	// 继承状态：附带系统默认策略名（前端展示「跟随系统默认（当前：xxx）」）
+	if defStrategy == "" {
+		var sysStrategy string
+		if err := h.db.Pool.QueryRow(ctx, `
+			SELECT strategy FROM routing_policies WHERE token_id IS NULL AND model IS NULL LIMIT 1
+		`).Scan(&sysStrategy); err == nil {
+			resp["inherited_strategy"] = sysStrategy
+		} else {
+			resp["inherited_strategy"] = h.cfg.Routing.DefaultStrategy
+		}
+	}
+
+	c.JSON(200, resp)
+}
+
+// UpdateGroupStrategy PUT /admin/groups/:id/strategy - 保存分组策略。
+// body: {"strategy": "balanced", "balanced_weights": {...}}；
+// strategy 为空字符串时清除分组配置，恢复「跟随系统默认」。
+func (h *AdminHandler) UpdateGroupStrategy(c *gin.Context) {
+	ctx := c.Request.Context()
+	groupID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || groupID <= 0 {
+		c.JSON(400, gin.H{"error": "invalid group id"})
+		return
+	}
+
+	var req struct {
+		Strategy        string             `json:"strategy"`
+		BalancedWeights map[string]float64 `json:"balanced_weights"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Strategy != "" && !validStrategyNames[req.Strategy] {
+		c.JSON(400, gin.H{"error": "unknown strategy: " + req.Strategy})
+		return
+	}
+
+	cfgMap := map[string]interface{}{}
+	if req.Strategy == "balanced" {
+		weights := normalizeBalancedWeights(req.BalancedWeights)
+		if weights == nil {
+			c.JSON(400, gin.H{"error": "balanced_weights must be non-negative and sum greater than zero"})
+			return
+		}
+		cfgMap["balanced_weights"] = weights
+	}
+	cfgJSON, err := json.Marshal(cfgMap)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to marshal strategy config"})
+		return
+	}
+
+	ct, err := h.db.Pool.Exec(ctx, `
+		UPDATE channel_groups
+		SET default_strategy = $1, strategy_config = $2, updated_at = NOW()
+		WHERE id = $3
+	`, req.Strategy, string(cfgJSON), groupID)
+	if err != nil {
+		h.logger.Error("Failed to update group strategy", zap.Int("group_id", groupID), zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to update group strategy"})
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		c.JSON(404, gin.H{"error": "group not found"})
+		return
+	}
+
+	// 分组策略每次请求实时读取（LoadGroup 不走快照缓存），立即生效
+	c.JSON(200, gin.H{
+		"message":   "group strategy saved",
+		"strategy":  req.Strategy,
+		"inherited": req.Strategy == "",
 	})
 }

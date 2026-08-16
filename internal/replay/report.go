@@ -27,8 +27,13 @@ func (r *Report) PrintMarkdown() string {
 	sb.WriteString(fmt.Sprintf("- **总请求数**: %d\n", r.TotalRequests))
 	sb.WriteString(fmt.Sprintf("- **成功重放**: %d\n", r.SuccessfulReplays))
 	sb.WriteString(fmt.Sprintf("- **失败重放**: %d\n", r.FailedReplays))
+	sb.WriteString(fmt.Sprintf("- **确定性重放**: %d（基于历史归档快照）\n", r.DeterministicCount))
+	sb.WriteString(fmt.Sprintf("- **环境模拟**: %d（快照/策略缺失，非确定性）\n", r.SimulatedCount))
 	sb.WriteString(fmt.Sprintf("- **渠道变化数**: %d\n", r.ChannelChangedCount))
 	sb.WriteString(fmt.Sprintf("- **渠道变化率**: %.2f%%\n", r.ChannelChangedRate*100))
+	if r.Note != "" {
+		sb.WriteString(fmt.Sprintf("- **⚠️ 说明**: %s\n", r.Note))
+	}
 	if r.StrategyUsed != "" {
 		sb.WriteString(fmt.Sprintf("- **测试策略**: %s\n", r.StrategyUsed))
 	}
@@ -83,7 +88,12 @@ func (r *Report) PrintTable() {
 	fmt.Printf("总请求数: %d\n", r.TotalRequests)
 	fmt.Printf("成功重放: %d\n", r.SuccessfulReplays)
 	fmt.Printf("失败重放: %d\n", r.FailedReplays)
+	fmt.Printf("确定性重放: %d（基于历史归档快照）\n", r.DeterministicCount)
+	fmt.Printf("环境模拟: %d（快照/策略缺失，非确定性）\n", r.SimulatedCount)
 	fmt.Printf("渠道变化: %d (%.2f%%)\n", r.ChannelChangedCount, r.ChannelChangedRate*100)
+	if r.Note != "" {
+		fmt.Printf("说明: %s\n", r.Note)
+	}
 	if r.StrategyUsed != "" {
 		fmt.Printf("测试策略: %s\n", r.StrategyUsed)
 	}

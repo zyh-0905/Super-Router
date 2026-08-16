@@ -6,6 +6,7 @@ import { store } from '../store'
 import RadarChart from '../components/RadarChart.vue'
 import EmptyState from '../components/EmptyState.vue'
 import GroupSwitcher from '../components/GroupSwitcher.vue'
+import SelectBox from '../components/SelectBox.vue'
 import Icon from '../components/Icon.vue'
 import { fmtDate, fmtTime, fmtScore, scoreWidth, downloadJSON } from '../utils'
 
@@ -35,6 +36,54 @@ function hexToRgba(hex, alpha) {
 
 const dimVal = (d, key) => Number(d?.dims?.[key] ?? 50)
 
+// ---- 真实指标（直观展示，替代抽象 0-100 分）----
+const roleLabel = r => ({ primary: '主力', backup: '备用', emergency: '应急' }[r] || r || '—')
+
+function realValue(d, key) {
+  const r = d?.raw || {}
+  switch (key) {
+    case 'cost': return r.cost_usd != null ? '$' + Number(r.cost_usd).toFixed(6) : '—'
+    case 'reliability': return r.reliability != null ? (Number(r.reliability) * 100).toFixed(1) + '%' : '—'
+    case 'latency': return r.ttft_ms != null ? r.ttft_ms + 'ms' : '无数据'
+    case 'load': return r.recent_attempts != null ? r.recent_attempts + ' 次' : '—'
+    case 'priority': return r.role ? roleLabel(r.role) + ' · ' + (r.user_priority ?? '—') : '—'
+    case 'composite': return '第 ' + (rankOf(d) != null ? rankOf(d) : '—') + ' 名'
+    default: return '—'
+  }
+}
+
+// 该候选在候选集中的综合排名（按候选顺序）
+function rankOf(d) {
+  if (!d) return null
+  const i = detailsList.value.findIndex(x => x.channel_id === d.channel_id)
+  return i >= 0 ? i + 1 : null
+}
+
+// 人话排名总结："在 3 个候选中：费用第 1 低 · 首字节第 2 快 · 成功率第 1 高"
+function rankSummary(d) {
+  if (!d?.raw) return ''
+  const list = detailsList.value
+  const n = list.length
+  if (n < 2) return `仅 ${n} 个候选通过筛选`
+  const parts = []
+  const rankOfKey = (key, asc) => {
+    const vals = list.map(x => x.raw?.[key]).filter(v => v != null)
+    if (vals.length < 2) return null
+    const mine = d.raw?.[key]
+    if (mine == null) return null
+    const sorted = [...vals].sort((a, b) => (asc ? a - b : b - a))
+    return sorted.indexOf(mine) + 1
+  }
+  const costRank = rankOfKey('cost_usd', true)
+  const latRank = rankOfKey('ttft_ms', true)
+  const relRank = rankOfKey('reliability', false)
+  if (costRank) parts.push(`费用第 ${costRank} 低`)
+  if (latRank) parts.push(`首字节第 ${latRank} 快`)
+  if (relRank) parts.push(`成功率第 ${relRank} 高`)
+  if (!parts.length) return ''
+  return `在 ${n} 个候选中：${parts.join(' · ')}`
+}
+
 const detailsList = computed(() => (selected.value?.candidate_details || []).filter(d => d.dims))
 const hoveredIdx = ref(null)
 watch(selected, () => { hoveredIdx.value = null })
@@ -54,6 +103,14 @@ const strategyFilter = ref('')
 const models = computed(() => [...new Set(decisions.value.map(d => d.model).filter(Boolean))])
 const channelNames = computed(() => [...new Set(decisions.value.map(d => d.selected_channel).filter(Boolean))])
 const strategies = ['custom_priority', 'price_first', 'latency_first', 'reliability_first', 'balanced']
+const strategyNames = {
+  custom_priority: '手动优先级', price_first: '低价优先', latency_first: '低延迟优先',
+  reliability_first: '高可靠优先', balanced: '加权均衡',
+}
+
+const modelOpts = computed(() => [{ value: '', label: '全部模型' }, ...models.value.map(m => ({ value: m, label: m }))])
+const channelOpts = computed(() => [{ value: '', label: '全部渠道' }, ...channelNames.value.map(c => ({ value: c, label: c }))])
+const strategyOpts = [{ value: '', label: '全部策略' }, ...strategies.map(s => ({ value: s, label: strategyNames[s] || s }))]
 
 const filtered = computed(() =>
   decisions.value.filter(d => {
@@ -124,9 +181,9 @@ watch(() => route.query.id, load)
               <span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--text-3);display:flex"><Icon name="search" :size="14" /></span>
               <input v-model="search" class="input mono" placeholder="搜索 Request ID" style="padding-left:33px">
             </div>
-            <select v-model="modelFilter" class="select" style="width:126px"><option value="">全部模型</option><option v-for="m in models" :key="m" :value="m">{{ m }}</option></select>
-            <select v-model="channelFilter" class="select" style="width:126px"><option value="">全部渠道</option><option v-for="c in channelNames" :key="c" :value="c">{{ c }}</option></select>
-            <select v-model="strategyFilter" class="select" style="width:150px"><option value="">全部策略</option><option v-for="s in strategies" :key="s" :value="s">{{ s }}</option></select>
+            <SelectBox v-model="modelFilter" :options="modelOpts" width="132px" />
+            <SelectBox v-model="channelFilter" :options="channelOpts" width="132px" />
+            <SelectBox v-model="strategyFilter" :options="strategyOpts" width="150px" />
           </div>
         </div>
 
@@ -179,11 +236,19 @@ watch(() => route.query.id, load)
                 <span style="font-weight:700;font-size:12.5px">{{ activeDetail.channel || ('#' + activeDetail.channel_id) }}</span>
                 <span class="badge" :class="isSelectedDetail ? 'badge-green' : 'badge-gray'">{{ isSelectedDetail ? '已选渠道' : '悬停预览' }}</span>
               </div>
+              <!-- 人话排名总结 -->
+              <div v-if="rankSummary(activeDetail)" class="summary-line">
+                <Icon name="check" :size="13" style="color:var(--green)" />
+                <span>{{ rankSummary(activeDetail) }}</span>
+              </div>
+              <div v-if="!activeDetail?.raw" class="text-3" style="font-size:11px">该记录来自旧版本，仅有抽象评分（无真实指标）</div>
+              <!-- 真实指标芯片（真实值为主，抽象分弱化为小字） -->
               <div class="dim-chips">
                 <div v-for="dl in dimMeta" :key="dl.key" class="dim-chip"
                   :style="{ background: hexToRgba(dl.color, 0.06 + dimVal(activeDetail, dl.key) / 100 * 0.5), borderColor: hexToRgba(dl.color, 0.55) }">
                   <span class="dim-chip-label">{{ dl.label }}</span>
-                  <span class="dim-chip-val" :style="{ color: dl.color }">{{ dimVal(activeDetail, dl.key).toFixed(1) }}</span>
+                  <span class="dim-chip-val" :style="{ color: dl.color }">{{ realValue(activeDetail, dl.key) }}</span>
+                  <span class="dim-chip-score mono" :title="'抽象评分（0-100）：' + dimVal(activeDetail, dl.key).toFixed(1)">{{ dimVal(activeDetail, dl.key).toFixed(0) }}分</span>
                 </div>
               </div>
             </div>
@@ -253,18 +318,27 @@ watch(() => route.query.id, load)
   border-top: 1px dashed var(--border);
   display: flex; flex-direction: column; gap: 8px;
 }
+.summary-line {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 11px;
+  background: rgba(48, 209, 88, 0.08);
+  border: 1px solid rgba(48, 209, 88, 0.25);
+  border-radius: var(--radius-md);
+  font-size: 12px; font-weight: 600; color: var(--text-1);
+}
 .dim-chips {
-  display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
 }
 .dim-chip {
-  display: flex; align-items: center; justify-content: space-between; gap: 4px;
-  padding: 6px 9px; border-radius: var(--radius-md);
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 8px 11px; border-radius: var(--radius-md);
   border: 1px solid transparent;
   transition: transform var(--dur) var(--ease);
 }
 .dim-chip:hover { transform: translateY(-1px); }
 .dim-chip-label { font-size: 10.5px; color: var(--text-2); }
-.dim-chip-val { font-size: 13px; font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.dim-chip-val { font-size: 13.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.dim-chip-score { font-size: 9.5px; color: var(--text-3); }
 
 @media (max-width: 1000px) {
   .dec-layout { grid-template-columns: 1fr; }

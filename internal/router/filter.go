@@ -32,6 +32,7 @@ type FilterRequest struct {
 	Capabilities   []string
 	EstimatedInput int
 	MaxOutput      int
+	GroupID        *int // 生效分组（显式指定或单组 Key 默认组）；nil = 全局桶
 }
 
 // HardFilter 硬过滤器
@@ -95,8 +96,8 @@ func (f *HardFilter) Filter(ch *ChannelHealth, req *FilterRequest) *Exclusion {
 		}
 	}
 
-	// 7. 熔断状态不允许正常流量
-	switch ch.CircuitState {
+	// 7. 熔断状态不允许正常流量（P1-04：按生效分组桶取状态）
+	switch ch.CircuitStateForGroup(req.GroupID) {
 	case "open":
 		// 冷却未到期的开闸：禁止流量（冷却到期后快照会将其视为 half_open）
 		return &Exclusion{

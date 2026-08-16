@@ -7,6 +7,29 @@ import BaseModal from '../components/BaseModal.vue'
 import EmptyState from '../components/EmptyState.vue'
 import BaseChart from '../components/BaseChart.vue'
 import Icon from '../components/Icon.vue'
+import SelectBox from '../components/SelectBox.vue'
+
+// ---- 下拉选项（统一 SelectBox 组件）----
+const filterOpts = [
+  { value: '', label: '全部' },
+  { value: 'closed', label: '正常' },
+  { value: 'open', label: '熔断' },
+  { value: 'disabled', label: '禁用' },
+]
+const relayTypeOpts = [
+  { value: 'custom', label: '自定义' },
+  { value: 'newapi', label: 'New API / One API 系' },
+  { value: 'sub2api', label: 'Sub2API' },
+]
+const protocolOpts = [
+  { value: 'openai', label: 'OpenAI 兼容' },
+  { value: 'anthropic', label: 'Claude 原生' },
+]
+const roleOpts = [
+  { value: 'primary', label: '主力' },
+  { value: 'backup', label: '备用' },
+  { value: 'emergency', label: '应急' },
+]
 import { fmtDate, fmtTime, fmtNum, fmtMs, fmtPct } from '../utils'
 
 const route = useRoute()
@@ -30,6 +53,9 @@ const saving = ref(false)
 const form = ref(emptyForm())
 const testResult = ref(null)
 const testing = ref(false)
+// 乐观锁：打开编辑弹窗时记录的 updated_at；余额令牌脱敏状态（后端不再返回明文）
+const editExpectedUpdatedAt = ref(null)
+const balanceTokenStatus = ref(null) // null=新建 | { configured: boolean, suffix: string }
 
 // 上游模型列表弹窗
 const showModels = ref(false)
@@ -56,6 +82,13 @@ function emptyGroupForm() {
     cb_initial_cooling_seconds: 0, cb_max_cooling_seconds: 0,
   }
 }
+
+// 策略 id → 中文名（分组列表徽标展示）
+const strategyNames = {
+  custom_priority: '手动优先级', price_first: '低价优先', latency_first: '低延迟优先',
+  reliability_first: '高可靠优先', balanced: '加权均衡',
+}
+function strategyLabel(id) { return strategyNames[id] || id }
 
 async function loadGroups() {
   try {
@@ -90,6 +123,8 @@ async function saveGroup() {
   savingGroup.value = true
   try {
     const p = { ...groupForm.value }
+    // 路由策略统一在「策略中心」配置，此弹窗不再提交策略字段（避免覆盖）
+    delete p.default_strategy
     // 数字字段归一
     for (const k of ['group_priority', 'alive_interval_seconds', 'pricing_interval_seconds', 'probe_interval_seconds', 'balance_interval_seconds', 'cb_min_samples', 'cb_open_min_failures', 'cb_initial_cooling_seconds', 'cb_max_cooling_seconds']) {
       p[k] = Number(p[k]) || 0
@@ -173,6 +208,11 @@ function circuitBadge(state) {
 function roleBadge(role) {
   return { primary: 'badge-blue', backup: 'badge-purple', emergency: 'badge-red' }[role] || 'badge-gray'
 }
+// 协议/类型/角色的展示标签（OpenAI/Anthropic 首字母大写、类型与角色中文标签）
+function protocolLabel(p) { return p === 'anthropic' ? 'Anthropic' : 'OpenAI' }
+function protocolBadge(p) { return p === 'anthropic' ? 'badge-purple' : 'badge-blue' }
+function relayTypeLabel(t) { return { newapi: 'New API', sub2api: 'Sub2API', custom: '自定义' }[t] || t || '' }
+function roleLabelCn(r) { return { primary: '主力', backup: '备用', emergency: '应急' }[r] || r || '' }
 
 function relayTypeBadge(t) {
   if (!t || t === 'custom') return null
@@ -262,6 +302,7 @@ const ratio = ref(null) // {declared, history, latest}
 const ratioLoading = ref(false)
 const probing = ref(false)
 const probeModel = ref('')
+const probeModelOpts = computed(() => modelKeys.value.map(m => ({ value: m, label: m })))
 const probeTokens = ref(64)
 const probeResult = ref(null) // 最近一次实测结果
 const modelPrices = ref([]) // 官方模型价格库
@@ -367,6 +408,7 @@ const showRatioGroupModal = ref(false)
 const editingRatioGroup = ref(null)
 const savingRatioGroup = ref(false)
 const ratioGroupForm = ref({ name: '', models: [], default_model: '' })
+const ratioDefaultModelOpts = computed(() => (ratioGroupForm.value.models || []).map(m => ({ value: m, label: m })))
 const probingGroupId = ref(null)
 const probingAll = ref(false)
 
@@ -476,11 +518,18 @@ function openAdd() {
   const dg = groups.value.find(g => g.name === '默认分组')
   form.value.group_ids = dg ? [dg.id] : []
   testResult.value = null
+  editExpectedUpdatedAt.value = null
+  balanceTokenStatus.value = null
   showModal.value = true
 }
 
 function openEdit(ch) {
   editing.value = ch
+  // 乐观锁：记录打开弹窗时看到的 updated_at（来自列表项或详情对象；若详情经 getChannel 刷新则以刷新值为准）
+  editExpectedUpdatedAt.value = ch.updated_at || null
+  balanceTokenStatus.value = ch.balance_api_token_configured != null
+    ? { configured: !!ch.balance_api_token_configured, suffix: ch.balance_api_token_suffix || '' }
+    : null
   form.value = {
     name: ch.name, base_url: ch.base_url, access_token: '', api_key: '',
     protocol: ch.protocol || 'openai',
@@ -535,13 +584,22 @@ async function save() {
     // 编辑时凭证留空 = 保持不变（后端不返回明文凭证）
     if (form.value.access_token) payload.access_token = form.value.access_token
     if (form.value.api_key) payload.api_key = form.value.api_key
-    if (editing.value) await api.updateChannel(editing.value.id, payload)
-    else await api.createChannel(payload)
+    if (editing.value) {
+      // 乐观锁：带上打开弹窗时的 updated_at，后端不一致时返回 409
+      if (editExpectedUpdatedAt.value) payload.expected_updated_at = editExpectedUpdatedAt.value
+      await api.updateChannel(editing.value.id, payload)
+    } else {
+      await api.createChannel(payload)
+    }
     toast(editing.value ? '站点已更新' : '站点已添加', 'success')
     showModal.value = false
     await load()
-  } catch { /* api 层已提示 */ }
-  finally { saving.value = false }
+  } catch (e) {
+    if (e?.status === 409) {
+      toast('该站点已被其他会话修改，请刷新后重试', 'error')
+      await load()
+    }
+  } finally { saving.value = false }
 }
 
 async function testConn() {
@@ -681,12 +739,7 @@ onMounted(() => { load(); loadGroups() })
             <span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--text-3);display:flex"><Icon name="search" :size="14" /></span>
             <input v-model="search" class="input" placeholder="搜索站点" style="padding-left:33px">
           </div>
-          <select v-model="filter" class="select" style="width:104px;flex-shrink:0">
-            <option value="">全部</option>
-            <option value="closed">正常</option>
-            <option value="open">熔断</option>
-            <option value="disabled">禁用</option>
-          </select>
+          <SelectBox v-model="filter" :options="filterOpts" width="104px" style="flex-shrink:0" />
         </div>
 
         <div v-if="loading" class="col" style="gap:10px">
@@ -701,9 +754,9 @@ onMounted(() => { load(); loadGroups() })
           <div class="row gap-2">
             <span :class="dotClass(ch)" />
             <span class="grow truncate" style="font-size:14px;font-weight:600">{{ ch.name }}</span>
-            <span v-if="ch.protocol === 'anthropic'" class="badge badge-purple" title="Claude 原生协议，网关自动转换">anthropic</span>
-            <span v-if="relayTypeBadge(ch.relay_type)" class="badge" :class="relayTypeBadge(ch.relay_type)">{{ ch.relay_type }}</span>
-            <span class="badge" :class="roleBadge(ch.role)">{{ ch.role }}</span>
+            <span class="badge" :class="protocolBadge(ch.protocol)" :title="ch.protocol === 'anthropic' ? 'Claude 原生协议，网关自动转换' : 'OpenAI 兼容协议'">{{ protocolLabel(ch.protocol) }}</span>
+            <span v-if="relayTypeBadge(ch.relay_type)" class="badge" :class="relayTypeBadge(ch.relay_type)">{{ relayTypeLabel(ch.relay_type) }}</span>
+            <span class="badge" :class="roleBadge(ch.role)">{{ roleLabelCn(ch.role) }}</span>
           </div>
           <div class="row gap-2 mt-1">
             <span class="ch-stat mono"><b>{{ fmtNum(ch.requests_24h) }}</b> 请求</span>
@@ -733,9 +786,9 @@ onMounted(() => { load(); loadGroups() })
             <div class="row gap-2">
               <span :class="dotClass(selected)" />
               <span style="font-size:17px;font-weight:700">{{ selected.name }}</span>
-              <span v-if="selected.protocol === 'anthropic'" class="badge badge-purple">anthropic</span>
-              <span v-if="relayTypeBadge(selected.relay_type)" class="badge" :class="relayTypeBadge(selected.relay_type)">{{ selected.relay_type }}</span>
-              <span class="badge" :class="roleBadge(selected.role)">{{ selected.role }}</span>
+              <span class="badge" :class="protocolBadge(selected.protocol)" :title="selected.protocol === 'anthropic' ? 'Claude 原生协议，网关自动转换' : 'OpenAI 兼容协议'">{{ protocolLabel(selected.protocol) }}</span>
+              <span v-if="relayTypeBadge(selected.relay_type)" class="badge" :class="relayTypeBadge(selected.relay_type)">{{ relayTypeLabel(selected.relay_type) }}</span>
+              <span class="badge" :class="roleBadge(selected.role)">{{ roleLabelCn(selected.role) }}</span>
             </div>
             <div class="row gap-2">
               <button class="btn btn-ghost btn-sm" @click="openEdit(selected)"><Icon name="pencil" :size="13" />编辑</button>
@@ -758,7 +811,7 @@ onMounted(() => { load(); loadGroups() })
               <div class="field"><label class="field-label">Base URL</label><div class="code">{{ selected.base_url }}</div></div>
               <div class="form-grid-2">
                 <div class="field"><label class="field-label">中转站类型</label><div class="code">{{ selected.relay_type === 'newapi' ? 'New API（new-api/one-api 系）' : selected.relay_type === 'sub2api' ? 'Sub2API' : '自定义' }}</div></div>
-                <div class="field"><label class="field-label">接口协议</label><div class="code">{{ selected.protocol === 'anthropic' ? 'anthropic · Claude 原生' : 'openai · OpenAI 兼容' }}</div></div>
+                <div class="field"><label class="field-label">接口协议</label><div class="code">{{ selected.protocol === 'anthropic' ? 'Anthropic · Claude 原生' : 'OpenAI · OpenAI 兼容' }}</div></div>
                 <div class="field"><label class="field-label">聊天端点</label><div class="code">{{ (selected.base_url || '').replace(/\/+$/, '') + (selected.protocol === 'anthropic' ? '/v1/messages' : '/v1/chat/completions') }}</div></div>
                 <div class="field"><label class="field-label">余额接口</label><div class="code">{{ selected.balance_api_url || '按类型默认' }}</div></div>
                 <div class="field"><label class="field-label">用户优先级</label><div class="code">{{ selected.user_priority }}</div></div>
@@ -857,9 +910,7 @@ onMounted(() => { load(); loadGroups() })
                 <div class="row gap-2 mb-3" style="flex-wrap:wrap;align-items:flex-end">
                   <div class="field" style="margin-bottom:0">
                     <label class="field-label">实测模型</label>
-                    <select v-model="probeModel" class="select" style="width:190px">
-                      <option v-for="m in modelKeys" :key="m" :value="m">{{ m }}</option>
-                    </select>
+                    <SelectBox v-model="probeModel" :options="probeModelOpts" width="190px" />
                   </div>
                   <div class="field" style="margin-bottom:0">
                     <label class="field-label">max_tokens</label>
@@ -1062,26 +1113,19 @@ onMounted(() => { load(); loadGroups() })
       <div class="form-grid-2">
         <div class="field">
           <label class="field-label">中转站类型</label>
-          <select v-model="form.relay_type" class="select" @change="onRelayTypeChange">
-            <option value="custom">custom · 自定义</option>
-            <option value="newapi">newapi · New API / One API 系</option>
-            <option value="sub2api">sub2api · Sub2API</option>
-          </select>
+          <SelectBox v-model="form.relay_type" :options="relayTypeOpts" @change="onRelayTypeChange" />
           <div class="field-hint">选择类型后自动填入对应的余额接口地址（可手动修改）。</div>
         </div>
         <div class="field">
           <label class="field-label">接口协议</label>
-          <select v-model="form.protocol" class="select">
-            <option value="openai">openai · OpenAI 兼容</option>
-            <option value="anthropic">anthropic · Claude 原生</option>
-          </select>
+          <SelectBox v-model="form.protocol" :options="protocolOpts" />
         </div>
       </div>
       <div class="field">
         <label class="field-label">聊天端点（自动推导）</label>
         <div class="code">{{ form.base_url ? form.base_url.replace(/\/+$/, '') + (form.protocol === 'anthropic' ? '/v1/messages' : '/v1/chat/completions') : '—' }}</div>
       </div>
-      <div class="field-hint" style="margin-top:-8px;margin-bottom:8px">anthropic 协议站点使用 x-api-key 认证，网关会自动完成 OpenAI↔Anthropic 请求/响应/流式转换；余额探测与健康检查不受影响。</div>
+      <div class="field-hint" style="margin-top:-8px;margin-bottom:8px">Anthropic 协议站点使用 x-api-key 认证，网关会自动完成 OpenAI↔Anthropic 请求/响应/流式转换；余额探测与健康检查不受影响。</div>
       <div class="form-grid-2">
         <div class="field"><label class="field-label">Access Token {{ editing ? '' : '*' }}</label><input v-model="form.access_token" type="password" class="input mono" :placeholder="editing ? '留空则保持不变' : 'Bearer sk-…'"></div>
         <div class="field"><label class="field-label">API Key {{ editing ? '' : '*' }}</label><input v-model="form.api_key" type="password" class="input mono" :placeholder="editing ? '留空则保持不变' : 'sk-…'"></div>
@@ -1089,11 +1133,7 @@ onMounted(() => { load(); loadGroups() })
       <div class="form-grid-2">
         <div class="field">
           <label class="field-label">角色</label>
-          <select v-model="form.role" class="select">
-            <option value="primary">primary · 主力</option>
-            <option value="backup">backup · 备用</option>
-            <option value="emergency">emergency · 应急</option>
-          </select>
+          <SelectBox v-model="form.role" :options="roleOpts" />
         </div>
         <div class="field"><label class="field-label">每日探针预算（$）</label><input v-model.number="form.daily_probe_budget" type="number" step="0.1" min="0" class="input"></div>
       </div>
@@ -1105,7 +1145,13 @@ onMounted(() => { load(); loadGroups() })
       <div class="field">
         <label class="field-label">余额接口令牌（可选）</label>
         <input v-model="form.balance_api_token" type="password" class="input mono" :placeholder="editing ? '留空则保持不变' : '余额接口的 Bearer 令牌（如控制台会话令牌/系统访问令牌）'">
-        <div class="field-hint">余额接口要求的 Bearer 令牌与站点调用凭证不同时填这里（F12 抓包该请求的 Authorization 头）。</div>
+        <div class="field-hint">
+          余额接口要求的 Bearer 令牌与站点调用凭证不同时填这里（F12 抓包该请求的 Authorization 头）。
+          <template v-if="editing && balanceTokenStatus">
+            <span v-if="balanceTokenStatus.configured" class="text-green">已配置（尾号 {{ balanceTokenStatus.suffix.replace(/^\*+/, '') }}）</span>
+            <span v-else class="text-3">未配置</span>
+          </template>
+        </div>
       </div>
       <div class="form-grid-2">
         <div class="field"><label class="field-label">用户优先级：{{ form.user_priority }}</label><input v-model.number="form.user_priority" type="range" min="1" max="200" style="width:100%;accent-color:var(--blue)"></div>
@@ -1215,7 +1261,7 @@ onMounted(() => { load(); loadGroups() })
         <div v-for="g in groups" :key="g.id" class="row gap-2 group-row" :class="{ active: editingGroup?.id === g.id }">
           <span class="dot" :class="g.enabled ? 'dot-green' : 'dot-gray'" />
           <span class="grow" style="font-weight:600;font-size:13.5px">{{ g.name }}</span>
-          <span v-if="g.default_strategy" class="badge badge-purple">{{ g.default_strategy }}</span>
+          <span v-if="g.default_strategy" class="badge badge-purple">{{ strategyLabel(g.default_strategy) }}</span>
           <span class="badge badge-gray">{{ g.channel_count }} 站点</span>
           <button class="btn btn-ghost btn-sm" @click="openGroupModal(g)">编辑</button>
           <button class="btn btn-danger btn-sm" @click="deleteGroup(g)">删除</button>
@@ -1231,15 +1277,11 @@ onMounted(() => { load(); loadGroups() })
       <div style="border-top:1px solid var(--border);padding-top:16px">
         <div class="form-grid-2">
           <div class="field"><label class="field-label">分组名称 *</label><input v-model="groupForm.name" class="input" placeholder="如：高优组"></div>
-          <div class="field"><label class="field-label">默认路由策略（空 = 系统默认）</label>
-            <select v-model="groupForm.default_strategy" class="select">
-              <option value="">跟随系统默认</option>
-              <option value="custom_priority">custom_priority · 自定义优先级</option>
-              <option value="price_first">price_first · 低价优先</option>
-              <option value="latency_first">latency_first · 延迟优先</option>
-              <option value="reliability_first">reliability_first · 成功率优先</option>
-              <option value="balanced">balanced · 综合平衡</option>
-            </select>
+          <div class="field" style="display:flex;flex-direction:column;justify-content:flex-end">
+            <label class="field-label">路由策略</label>
+            <div class="field-hint" style="padding:9px 0 3px">
+              已移至 <router-link to="/strategy" class="link" style="font-weight:600">策略中心</router-link> 配置（支持卡片选择与权重自定义）
+            </div>
           </div>
           <div class="field" style="grid-column:1/-1"><label class="field-label">描述</label><input v-model="groupForm.description" class="input" placeholder="分组用途说明（可选）"></div>
         </div>
@@ -1289,10 +1331,7 @@ onMounted(() => { load(); loadGroups() })
       </div>
       <div class="field">
         <label class="field-label">默认检测模型 *（实测该组倍率时使用的模型）</label>
-        <select v-model="ratioGroupForm.default_model" class="select" style="width:100%">
-          <option value="" disabled>选择默认检测模型</option>
-          <option v-for="m in ratioGroupForm.models" :key="m" :value="m">{{ m }}</option>
-        </select>
+        <SelectBox v-model="ratioGroupForm.default_model" :options="ratioDefaultModelOpts" placeholder="选择默认检测模型" />
       </div>
       <div class="row gap-2" style="justify-content:flex-end;margin-top:16px">
         <button class="btn btn-ghost" @click="showRatioGroupModal = false">取消</button>

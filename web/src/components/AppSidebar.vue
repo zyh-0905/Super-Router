@@ -8,6 +8,7 @@ const nav = [
   { to: '/channels', name: 'server', label: '站点' },
   { to: '/playground', name: 'beaker', label: '测试台' },
   { to: '/decisions', name: 'list', label: '决策' },
+  { to: '/strategy', name: 'gauge', label: '策略中心' },
   { to: '/circuit', name: 'bolt', label: '熔断' },
   { to: '/settings', name: 'gear', label: '设置' },
 ]

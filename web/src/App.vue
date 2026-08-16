@@ -4,20 +4,40 @@ import { useRoute } from 'vue-router'
 import { computed } from 'vue'
 import AppSidebar from './components/AppSidebar.vue'
 import ToastHost from './components/ToastHost.vue'
+import AlertPopupHost from './components/AlertPopupHost.vue'
 import Icon from './components/Icon.vue'
 import { api } from './api'
-import { store } from './store'
+import { store, feedAlerts } from './store'
 
 const route = useRoute()
 const title = computed(() => route.meta.title || 'Smart Router')
 
 let pingTimer = null
+let alertTimer = null
+
+// 告警轮询：30s 拉取 /admin/stats 的告警集合，交由 feedAlerts 做
+// 「新出现 / 严重度升级」diff 并弹窗。首次调用仅建立基线、不弹窗；
+// 静默失败（未配置 Key 或网络抖动不打扰用户，连接问题由离线横幅提示）。
+async function pollAlerts() {
+  if (!store.apiKey) return
+  try {
+    const g = store.currentGroup
+    const s = await api.get('/admin/stats' + (g ? `?group_id=${g}` : ''), { silent: true })
+    feedAlerts(s && s.alerts)
+  } catch { /* silent */ }
+}
 
 onMounted(() => {
   api.ping()
   pingTimer = setInterval(() => api.ping(), 20000)
+  alertTimer = setInterval(pollAlerts, 30000)
+  // 首屏（DashboardView 已建立基线）后再补一次，确保基线完整
+  setTimeout(pollAlerts, 5000)
 })
-onUnmounted(() => clearInterval(pingTimer))
+onUnmounted(() => {
+  clearInterval(pingTimer)
+  clearInterval(alertTimer)
+})
 </script>
 
 <template>
@@ -47,6 +67,7 @@ onUnmounted(() => clearInterval(pingTimer))
   </div>
 
   <ToastHost />
+  <AlertPopupHost />
 </template>
 
 <style scoped>

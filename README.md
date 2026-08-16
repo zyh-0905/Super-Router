@@ -8,17 +8,19 @@
 
 ### 🧭 智能路由引擎
 - 不可变健康快照（Redis 缓存 + SHA256 校验）+ 确定性决策（相同输入 = 相同输出）
+- **请求体透明转发**：网关只解析路由所需字段，其余字段（`top_p`/`stop`/`response_format`/`tool_choice`/多模态内容等）原样转发上游，仅移除网关扩展字段 `group`，OpenAI 兼容语义不被破坏
 - **5 种路由策略**：`custom_priority`（自定义优先级，默认）、`price_first`（低价）、`latency_first`（低延迟）、`reliability_first`（高成功率）、`balanced`（加权综合）
 - 策略查找链：Token×模型 → Token → **分组默认** → 系统默认
 - 硬过滤：禁用、模型不支持、能力缺失、超价格上限、熔断开闸/冷却中、超延迟上限等
-- 首字节前故障切换（最多 3 次候选）；四态熔断器 closed → open → half_open → degraded，指数退避冷却，冷却到期自动半开并按 `half_open_probe_count` 放行探测流量自愈
+- 首字节前故障切换（最多 3 次候选）；**TTFB 尝试级超时使用独立 sentinel 错误**，与客户端断开严格区分，超时自动切换下一个候选（P1-02 整改）；四态熔断器 closed → open → half_open → degraded，指数退避冷却，冷却到期自动半开并按 `half_open_probe_count` 放行探测流量自愈
+- **熔断状态按分组隔离**（P1-04 整改）：`circuit_states` 以分组为独立桶，一个分组的失败不会打开另一个分组的熔断
 - **决策可解释**：每个候选按成本/可靠性/延迟/负载/优先级/综合六维打分（0-100）写入决策日志，Web 决策页以雷达图呈现
 
 ### 🗂 中转站分组
 - 扁平**多对多分组**：一个站点可属于多个分组；站点/分组/Key 归属全部界面化管理
 - 请求通过 body `group` 字段或 `X-Group` 头指定分组，**网关只在组内站点中路由**
 - 分组级配置：默认策略、熔断参数、健康检测间隔、探针预算（0 = 跟随全局）
-- **API Key 分组绑定**：caller Key 可绑定分组——未指定组时自动限定绑定组并集内路由，越组请求 403；admin 不受限
+- **API Key 分组绑定**：caller Key 可绑定分组——未指定组时自动限定绑定组并集内路由，越组请求 403；**绑定恰好一个组时自动采用该组的默认策略/组级熔断并写入审计**；绑定多个组时为并集路由（策略按全局、group_ids 记入决策日志）；admin 不受限
 - 决策日志与请求历史记录 group_id，统计/决策/熔断接口支持按组筛选
 
 ### 🔌 接口协议与中转站类型
@@ -46,9 +48,10 @@
 
 ### 📊 可观测性
 - 全量决策日志（策略、分组、候选排序与得分、排除原因、快照校验和）
-- Prometheus 指标（9 个核心指标）+ Grafana 仪表板 + 13 条告警规则
+- Prometheus 指标（11 个核心指标）+ Grafana 仪表板 + 13 条告警规则
 - 结构化日志（Zap + trace_id 全链路）
 - 决策重放 CLI（`./bin/replay`）：历史决策回放与策略对比
+- **预警弹窗**：Web 控制台每 30 秒轮询系统告警（低余额/倍率超标/熔断开闸/站点禁用），新告警或严重度升级时从**右下角弹出预警卡片**（弹跳动效 + 倒计时进度条，自动消失），可一键跳转到对应处理页
 
 ### 🖥 Web 控制台（Vue 3 + Vite）
 苹果风格、明暗双主题（跟随系统）、全真实数据：
@@ -59,6 +62,7 @@
 | 站点 | 分组筛选、站点增删改（接口协议/中转站类型/默认测试模型）、健康/统计/余额/倍率详情、倍率检测分组、上游模型列表一键映射 |
 | 测试台 | 真流式请求、站点选择自动预填该站点默认测试模型、分组限定路由、路由决策信息（渠道/策略/分组/Trace ID） |
 | 决策 | 决策审计表格（分组列）、筛选、详情抽屉（候选六维评分雷达图/排除原因） |
+| 策略中心 | 路由策略按「系统默认」与「每个分组」分别配置；5 种内置策略做成可视化卡片（卡片内展示各因素权重），「加权均衡」支持成本/可靠性/延迟/负载四维权重滑块，未配置的分组一键恢复跟随系统默认，保存立即生效 |
 | 熔断 | 四态熔断器、分组切换、手动重置 |
 | 设置 | 连接配置、API Keys（分组绑定）、每站点默认测试模型、官方模型价格库、低余额阈值 |
 
@@ -86,7 +90,7 @@ docker compose -p smart-router up -d --build
 docker compose -p smart-router ps
 ```
 
-该命令会启动四个服务：PostgreSQL 16、Redis 7、Gateway 和 Checker。Gateway 对外提供 API/Web，Checker 在后台执行存活、价格、推理探针和余额检测，不占用宿主机端口。首次初始化数据库时会执行 `migrations/` 中的脚本。API Key 引导行为由 `configs/config.yaml` 的 `server.bootstrap_default_keys` 控制：
+该命令会启动四个服务：PostgreSQL 16、Redis 7、Gateway 和 Checker。Gateway 对外提供 API/Web，Checker 在后台执行存活、价格、推理探针和余额检测，不占用宿主机端口。**数据库迁移由应用启动时自动执行**（版本化迁移器，带 advisory lock 与 `schema_migrations` 记录；存量数据卷会自动识别已应用的迁移并补齐缺失版本，不再依赖 `/docker-entrypoint-initdb.d` 首次初始化）。API Key 引导行为由 `configs/config.yaml` 的 `server.bootstrap_default_keys` 控制：
 
 - **本地开发**（`config.local.yaml`，`bootstrap_default_keys: true`）：表为空时自动创建 `test-admin-key`（管理员）与 `test-caller-key`（调用方）；
 - **生产**（默认 `false`）：空库时生成一次性随机管理员 Key（`sr-` 前缀），只在启动日志打印一次，请立即妥善保存。
@@ -102,12 +106,21 @@ docker compose -p smart-router restart checker
 访问地址：
 
 - Web 控制台：<http://localhost:8080/>
-- Gateway 健康检查：<http://localhost:8080/health>
+- Gateway 健康检查（liveness）：<http://localhost:8080/health>
+- Gateway 就绪检查（readiness，检查 PostgreSQL/Redis）：<http://localhost:8080/ready>
 - Prometheus 指标：<http://localhost:8080/metrics>
 
-Checker 默认周期为存活 30 秒、价格 10 分钟、余额 10 分钟、推理探针 1 小时；失败的推理探针默认退避 6 小时后重试。推理探针会调用真实上游并可能产生费用，全局每日预算默认为 `$5`。如不希望产生探针费用，可在 `configs/config.yaml` 或分组设置中调整探针周期/预算。历史数据默认保留 30 天（`checker.retention_days`）。
+Checker 默认周期为存活 30 秒、价格 10 分钟、余额 10 分钟、推理探针 1 小时；失败的推理探针默认退避 6 小时后重试。推理探针会调用真实上游并可能产生费用，全局每日预算默认为 `$5`，按「全局/渠道/分组三重取最小值 + Redis 原子预留」执行（定时与手动探测共享同一预算记账）。如不希望产生探针费用，可在 `configs/config.yaml` 或分组设置中调整探针周期/预算。历史数据默认保留 30 天（`checker.retention_days`），快照归档随决策日志保留期同步回收。
 
-PostgreSQL 和 Redis 使用命名数据卷持久化。不要使用 `docker compose down -v`，除非确认要删除全部本地数据。`/docker-entrypoint-initdb.d` 只会在 PostgreSQL 数据卷首次初始化时自动执行；已有数据卷不会因为新增迁移文件而自动补跑，需要按迁移顺序手工执行未应用的 SQL。
+PostgreSQL 和 Redis 使用命名数据卷持久化。不要使用 `docker compose down -v`，除非确认要删除全部本地数据。
+
+### 可选：监控栈（Prometheus + Alertmanager）
+
+```bash
+docker compose --profile monitoring -p smart-router up -d
+```
+
+或使用脚本 `./start-monitoring.sh`（额外包含 Grafana）。Alertmanager 默认使用占位接收器，接入真实通知渠道请编辑 `alertmanager.yml`。
 
 ### 3. 管理 API 认证
 
@@ -169,6 +182,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | 倍率检测分组 | `POST/PATCH/DELETE /admin/channels/:id/ratio-groups[/:gid]` · `POST /admin/channels/:id/ratio-groups/:gid/probe`（每组自定义默认检测模型） |
 | 官方模型价格库 | `GET/POST /admin/model-prices` · `DELETE /admin/model-prices/:model` |
 | 分组 CRUD | `GET/POST /admin/groups` · `PATCH/DELETE /admin/groups/:id` |
+| 系统默认策略 | `GET/PUT /admin/policies`（策略中心：5 种内置策略选择 + balanced 四维权重） |
+| 分组策略 | `GET/PUT /admin/groups/:id/strategy`（每分组独立策略与权重；空 = 跟随系统默认） |
 | 统计聚合 | `GET /admin/stats[?group_id=]` · `GET /admin/channel-metrics`（站点综合指标） |
 | 决策日志 | `GET /admin/decisions?limit=[&group_id=]`（含候选六维评分与故障切换明细） |
 | 熔断 | `GET /admin/circuit[?group_id=]` · `POST /admin/circuit/:id/reset` |
@@ -184,7 +199,16 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ```yaml
 server:
   port: 8080
+  read_timeout: 30s
+  write_timeout: 0             # SSE 长流式不限写超时（首字节由 TTFB 计时器控制）
+  read_header_timeout: 10s     # 慢速请求防护
+  idle_timeout: 120s
+  max_header_bytes: 1048576
   bootstrap_default_keys: false  # 生产：空库生成随机管理员 Key（仅日志打印一次）
+  allowed_origins: []            # CORS 白名单（空 = 允许任意来源）；生产建议填写可信前端域名
+  metrics_token: ""              # 非空时 /metrics 要求 Bearer 认证
+  allow_private_upstream: false  # SSRF 防护：生产禁止私网/环回上游（开发配置可放宽）
+  allow_http_upstream: false     # SSRF 防护：生产仅允许 https 上游
 checker:
   alive_interval: 30s      # 存活探测
   pricing_interval: 10m    # 价格同步
@@ -197,13 +221,32 @@ checker:
 routing:
   default_strategy: custom_priority
   max_attempts: 3
-  total_budget_ms: 15000
+  total_budget_ms: 30000     # 总预算：容纳多候选各等首字节（每尝试上限 = max_ttft_ms + 连接超时）
   filter: { max_price_cap: 100.0, max_ttft_ms: 5000 }   # 硬过滤上限
-  circuit_breaker: {...}   # 熔断参数（分组可覆盖）
+  circuit_breaker: {...}   # 熔断参数（分组可覆盖；状态按分组隔离）
   balanced_weights: {...}  # balanced 策略权重（cost/reliability/latency/load）
+security:
+  encryption_key: ""       # 上游凭据信封加密密钥（base64 32 字节，生产用环境变量 SR_ENC_KEY 注入）
 ```
 
-环境变量覆盖：`DATABASE_HOST/PORT/USER/PASSWORD/NAME`、`REDIS_HOST/PORT`。
+环境变量覆盖：`DATABASE_HOST/PORT/USER/PASSWORD/NAME`、`REDIS_HOST/PORT`、`SR_ENC_KEY`。
+
+启动时会对配置做 schema/范围校验（端口、间隔、预算、权重、熔断参数等），非法配置直接 fail fast。
+
+### 上游凭据加密（P1-07 整改）
+
+生产环境请注入 AES-256 密钥后**轮换所有已存凭据**（在 Web 控制台重新保存一次即可，保存时自动加密入库）：
+
+```bash
+export SR_ENC_KEY=$(openssl rand -base64 32)   # 生成并保存到 Secret 管理方案
+docker compose up -d --build
+```
+
+未配置密钥时凭据按明文透传（仅限本地开发，启动日志会输出安全告警）。管理端详情接口只返回余额令牌的配置状态与脱敏尾号，不再回显明文。数据库层面按「KMS 集成」的过渡方案是应用层信封加密，迁移到云 KMS 时替换 `internal/crypto` 即可。
+
+### SSRF 防护（P2-04 整改）
+
+站点创建/更新与上游模型探测接口会校验 URL：生产仅允许 `https://` 且阻断环回、RFC1918 私网、链路本地、IPv6 ULA 与云元数据地址，重定向目标同样校验。本地开发可在 `config.local.yaml` 中设置 `allow_private_upstream: true` / `allow_http_upstream: true` 放宽。
 
 ## 决策重放（CLI）
 
@@ -212,6 +255,8 @@ go build -o bin/replay ./cmd/replay
 ./bin/replay --start "2026-08-13T00:00:00Z" --end "2026-08-13T23:59:59Z" --table
 # 完整参数见 ./bin/replay --help
 ```
+
+重放为**确定性**：决策日志保存了快照哈希、生效策略快照、能力、预算与分组上下文，历史健康快照按内容哈希归档于 `snapshot_archive`；重放时加载不可变归档数据重跑路由。若归档/策略快照缺失（如保留期已清理的旧数据），报告会将其标记为「环境模拟」并明确非确定性，不能作为审计证据。
 
 ## 项目结构
 

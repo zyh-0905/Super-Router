@@ -36,11 +36,12 @@ open http://localhost:5173/
 
 | 路由 | 页面 | 说明 |
 |---|---|---|
-| `#/` | 总览 | 24h 请求/成功率/延迟（同比）、趋势图、模型分布、告警、最近决策、**分组切换器**、站点综合信息抽屉 |
-| `#/channels` | 站点 | 站点列表（**分组筛选 chips**、**余额徽章**、协议/中转站类型徽章）、详情（信息/健康/统计/余额/**倍率**）、新增/编辑（**接口协议**、**中转站类型**、**默认测试模型**、多选分组）、**分组管理**、**倍率检测分组**、获取上游模型 |
-| `#/playground` | 测试台 | 真实流式请求、**站点选择自动预填该站点默认测试模型**、**分组选择**（限定路由范围）、路由决策信息 |
-| `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉（候选**六维评分雷达图**/排除原因/故障切换明细） |
-| `#/circuit` | 熔断 | 四态熔断器、**分组切换器**、重置 |
+| `#/` | 总览 | 24h 请求/成功率/延迟（同比）、趋势图、模型分布、告警、**决策雷达**（最近一次决策六维对比 + 近 10 次最优站点，可点击切换）、**分组切换器**、站点综合信息抽屉 |
+| `#/channels` | 站点 | 站点列表（**分组筛选**、**余额徽章**、OpenAI/Anthropic 协议徽章、中转站类型徽章、角色中文徽章）、详情（信息/健康/统计/余额/**倍率**）、新增/编辑（**接口协议**、**中转站类型**、**默认测试模型**、多选分组、乐观锁）、**分组管理**、**倍率检测分组**、获取上游模型 |
+| `#/playground` | 测试台 | 真实流式请求、**站点选择自动预填该站点默认测试模型**、**分组选择**（限定路由范围且站点列表联动过滤）、路由决策信息 |
+| `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉（候选**六维评分雷达图** + 真实指标/人话排名/排除原因/故障切换明细） |
+| `#/strategy` | 策略中心 | 路由策略按「系统默认」与**每个分组**分别配置；5 种策略可视化卡片（因素权重条）、「加权均衡」四维权重滑块、分组一键恢复跟随系统默认 |
+| `#/circuit` | 熔断 | 四态熔断器（分组隔离）、**分组切换器**、重置 |
 | `#/settings` | 设置 | 连接配置、API Keys（**分组绑定**）、**每站点默认测试模型**（表格逐站点设置）、**官方模型价格库**、**低余额告警阈值** |
 
 ## 项目结构
@@ -60,20 +61,23 @@ web/
     │   ├── tokens.css       # 设计令牌（明暗双主题）
     │   └── base.css         # 基础样式与通用类
     ├── components/
-    │   ├── AppSidebar.vue   # 毛玻璃侧边栏
-    │   ├── BaseModal.vue    # 弹窗
-    │   ├── BaseChart.vue    # ECharts 封装（主题自适应）
-    │   ├── RadarChart.vue   # 手绘 SVG 六维雷达图（决策候选评分）
-    │   ├── StatCard.vue     # 统计卡
-    │   ├── GroupSwitcher.vue# 分组切换器
-    │   ├── EmptyState.vue   # 空状态
-    │   ├── ToastHost.vue    # Toast 通知
-    │   └── Icon.vue         # SF Symbols 风格图标集
+    │   ├── AppSidebar.vue    # 毛玻璃侧边栏
+    │   ├── BaseModal.vue     # 弹窗
+    │   ├── BaseChart.vue     # ECharts 封装（主题自适应）
+    │   ├── RadarChart.vue    # 手绘 SVG 六维雷达图（决策候选评分/总览决策雷达）
+    │   ├── StatCard.vue      # 统计卡
+    │   ├── GroupSwitcher.vue # 分组切换器（胶囊模式 / compact 下拉模式）
+    │   ├── SelectBox.vue     # 通用下拉选择器（键盘导航/自适应弹层/选中对勾）
+    │   ├── AlertPopupHost.vue# 右下角预警弹窗（弹跳动效 + 倒计时 + 一键跳转）
+    │   ├── EmptyState.vue    # 空状态
+    │   ├── ToastHost.vue     # Toast 通知
+    │   └── Icon.vue          # SF Symbols 风格图标集
     └── views/
         ├── DashboardView.vue
         ├── ChannelsView.vue
         ├── PlaygroundView.vue
         ├── DecisionsView.vue
+        ├── StrategyView.vue
         ├── CircuitView.vue
         └── SettingsView.vue
 ```
@@ -84,6 +88,9 @@ web/
 - **明暗双主题**：跟随系统（`prefers-color-scheme`），侧边栏可循环切换「自动 → 浅色 → 深色」，选择持久化到 localStorage
 - **真数据无演示**：全部页面接真实后端接口（统计聚合、决策富化、熔断、API Keys CRUD）
 - **真流式**：测试台使用 fetch + ReadableStream 解析 SSE，逐字渲染
+- **统一下拉体验**：全站下拉选择器由 `SelectBox.vue` 统一提供（弹层式选项、键盘导航、自适应方向、选中对勾）
+- **告警弹窗**：全局轮询系统告警，新告警/严重度升级时从右下角弹出预警卡片（弹跳动效 + 倒计时进度条），可一键跳转处理页
+- **生产安全**：生产构建不预填开发 Key（凭据存 sessionStorage）；中文响应头由网关 URI 编码、前端解码还原
 
 ## 与后端的接口对照
 
@@ -95,6 +102,7 @@ web/
 | **实时倍率** | `GET /admin/channels/:id/ratio`（声明/实测/历史/**分组**） · `POST /admin/channels/:id/probe-ratio`（按需实测） · `POST/PATCH/DELETE /admin/channels/:id/ratio-groups[/:gid]` · `POST .../ratio-groups/:gid/probe` |
 | **官方价格库** | `GET/POST /admin/model-prices` · `DELETE /admin/model-prices/:model` |
 | **分组 CRUD** | `GET/POST /admin/groups` · `PATCH/DELETE /admin/groups/:id` |
+| **策略中心** | `GET/PUT /admin/policies`（系统默认策略） · `GET/PUT /admin/groups/:id/strategy`（每分组策略与权重） |
 | 统计聚合 | `GET /admin/stats[?group_id=]` · `GET /admin/channel-metrics` |
 | 决策日志 | `GET /admin/decisions?limit=[&group_id=]` |
 | 熔断 | `GET /admin/circuit[?group_id=]` · `POST /admin/circuit/:id/reset` |

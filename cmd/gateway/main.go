@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"smart-router/internal/config"
 	"smart-router/internal/logger"
 	"smart-router/internal/metrics"
+	"smart-router/internal/migrate"
 	"smart-router/internal/router"
 	"smart-router/internal/store"
 
@@ -38,7 +40,7 @@ func main() {
 	webDir := flag.String("web-dir", "web", "Web 前端目录路径")
 	flag.Parse()
 
-	// 加载配置
+	// 加载配置（含启动时 schema/范围校验，P2-13）
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -52,7 +54,7 @@ func main() {
 	defer zapLogger.Sync()
 
 	zapLogger.Info("Starting Smart Router Gateway",
-		zap.String("version", "0.1.0"),
+		zap.String("version", "0.2.0"),
 		zap.Int("port", cfg.Server.Port),
 	)
 
@@ -71,6 +73,24 @@ func main() {
 	defer redisClient.Close()
 
 	zapLogger.Info("Database and Redis connected")
+
+	// 启动时执行版本化迁移（P2-12：带 advisory lock，多实例并发安全；
+	// 存量 initdb 数据卷按迁移效果基线登记，未应用的迁移自动补齐）
+	mctx, mcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer mcancel()
+	if err := migrate.Up(mctx, db.Pool, zapLogger); err != nil {
+		zapLogger.Fatal("Failed to run migrations", zap.Error(err))
+	}
+
+	// 生产环境安全告警（P2-01/P1-07）
+	if !cfg.Server.BootstrapDefaultKeys {
+		if cfg.UsesInsecureDefaults() {
+			zapLogger.Warn("SECURITY: running with default database/redis credentials in production mode; use env overrides and set a redis password")
+		}
+		if cfg.Security.EncryptionKey == "" {
+			zapLogger.Warn("SECURITY: security.encryption_key is empty; upstream credentials stored in plaintext. Set SR_ENC_KEY (base64 32-byte key) and rotate existing credentials")
+		}
+	}
 
 	// 初始化管理员 Key（生产模式空库时生成随机 Key，仅打印一次）
 	generatedKey, err := api.EnsureDefaultKeys(db, cfg.Server.BootstrapDefaultKeys)
@@ -110,7 +130,7 @@ func main() {
 		},
 	})
 
-	// 初始化熔断管理器（分组级参数在请求时按 group 覆盖）
+	// 初始化熔断管理器（分组级参数在请求时按 group 覆盖；状态按分组桶隔离，P1-04）
 	circuitManager := api.NewCircuitBreakerManager(db, zapLogger.Named("circuit"), api.CircuitBreakerConfig{
 		MinSamples:               cfg.Routing.CircuitBreaker.MinSamples,
 		OpenFailureRate:          cfg.Routing.CircuitBreaker.OpenFailureRate,
@@ -124,11 +144,11 @@ func main() {
 	})
 
 	// 初始化处理器
-	proxyHandler := api.NewProxyHandler(routerEngine, db, zapLogger.Named("proxy"), circuitManager)
+	proxyHandler := api.NewProxyHandler(routerEngine, db, zapLogger.Named("proxy"), circuitManager, cfg.Security.EncryptionKey)
 	adminHandler := api.NewAdminHandler(db, redisClient, cfg, zapLogger.Named("admin"))
 
 	// 实时倍率：按需手动实测（复用 checker 探测逻辑，运行在 Gateway 内）
-	ratioProbe := checker.NewProbeChecker(db, zapLogger.Named("ratio-probe"))
+	ratioProbe := checker.NewProbeChecker(db, zapLogger.Named("ratio-probe"), cfg.Security.EncryptionKey)
 	ratioProbe.SetProbeModel(cfg.Checker.ProbeModel)
 	ratioHandler := api.NewRatioHandler(db, redisClient, cfg, ratioProbe, zapLogger.Named("ratio"))
 
@@ -150,25 +170,13 @@ func main() {
 		c.Next()
 	})
 
-	// 添加 Prometheus metrics 中间件
+	// 添加 Prometheus metrics 中间件（P2-08：业务指标与管理指标分离）
 	r.Use(metrics.PrometheusMiddleware())
 
-	// 添加 CORS 中间件
-	r.Use(func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization")
-		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Length, X-Trace-ID, X-Request-ID, X-Selected-Channel, X-Selected-Channel-Id, X-Strategy")
+	// 添加 CORS 中间件（P2-03：可信 Origin 白名单 + 分组头补全 + Vary）
+	r.Use(corsMiddleware(cfg))
 
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-
-		c.Next()
-	})
-
-	// 健康检查端点（无需认证）
+	// 健康检查端点（liveness，无需认证）
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"status":    "ok",
@@ -176,8 +184,15 @@ func main() {
 		})
 	})
 
-	// Prometheus metrics 端点（无需认证）
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	// 就绪检查端点（readiness，P2-09：检查 PostgreSQL/Redis 可用性）
+	r.GET("/ready", readinessHandler(db, redisClient, zapLogger))
+
+	// Prometheus metrics 端点（P2-09：配置 metrics_token 时要求 Bearer 认证）
+	metricsGroup := r.Group("/metrics")
+	if cfg.Server.MetricsToken != "" {
+		metricsGroup.Use(metricsAuthMiddleware(cfg.Server.MetricsToken))
+	}
+	metricsGroup.GET("", gin.WrapH(promhttp.Handler()))
 
 	// API 路由（需要认证）
 	apiGroup := r.Group("/v1")
@@ -225,6 +240,10 @@ func main() {
 		adminGroup.POST("/groups", adminHandler.CreateGroup)
 		adminGroup.PATCH("/groups/:id", adminHandler.UpdateGroup)
 		adminGroup.DELETE("/groups/:id", adminHandler.DeleteGroup)
+		adminGroup.GET("/policies", adminHandler.GetSystemPolicy)
+		adminGroup.PUT("/policies", adminHandler.UpdateSystemPolicy)
+		adminGroup.GET("/groups/:id/strategy", adminHandler.GetGroupStrategy)
+		adminGroup.PUT("/groups/:id/strategy", adminHandler.UpdateGroupStrategy)
 	}
 
 	// 静态托管 Web 管理界面（同一端口，免 CORS）
@@ -246,15 +265,19 @@ func main() {
 		zapLogger.Warn("Web dashboard directory not found, serving API only", zap.String("web_dir", *webDir))
 	}
 
-	// 启动服务器
+	// 启动服务器（P2-06：补充 header/idle/max-header 边界；WriteTimeout 保持 0，
+	// SSE 长流式的写超时由每尝试 TTFB 计时器 + 空闲连接策略控制）
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	zapLogger.Info("HTTP server starting", zap.String("addr", addr))
 
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  cfg.Server.ReadTimeout,
-		WriteTimeout: cfg.Server.WriteTimeout,
+		Addr:              addr,
+		Handler:           r,
+		ReadTimeout:       cfg.Server.ReadTimeout,
+		WriteTimeout:      cfg.Server.WriteTimeout,
+		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout,
+		IdleTimeout:       cfg.Server.IdleTimeout,
+		MaxHeaderBytes:    cfg.Server.MaxHeaderBytes,
 	}
 
 	// 优雅关闭
@@ -279,4 +302,78 @@ func main() {
 	}
 
 	zapLogger.Info("Server exited")
+}
+
+// corsMiddleware CORS 处理（P2-03）：
+//   - allowed_origins 为空（默认）时允许任意来源，但设置 Vary: Origin；
+//   - 配置白名单时仅回显受信来源，未受信来源不设置 ACAO（浏览器阻断）；
+//   - Allow-Headers / Expose-Headers 补全 X-Group、X-Request-ID。
+func corsMiddleware(cfg *config.Config) gin.HandlerFunc {
+	allowed := map[string]bool{}
+	for _, o := range cfg.Server.AllowedOrigins {
+		allowed[strings.TrimRight(o, "/")] = true
+	}
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin")
+		c.Writer.Header().Set("Vary", "Origin")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, X-Group, X-Request-ID")
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Length, X-Trace-ID, X-Request-ID, X-Selected-Channel, X-Selected-Channel-Id, X-Strategy, X-Group")
+
+		if len(allowed) > 0 {
+			if origin != "" && allowed[origin] {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+				c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+		} else {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+
+		if c.Request.Method == "OPTIONS" {
+			if len(allowed) > 0 && origin != "" && !allowed[origin] {
+				c.AbortWithStatus(403)
+				return
+			}
+			c.AbortWithStatus(204)
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// readinessHandler 就绪检查：PostgreSQL + Redis 均可用才返回 200（P2-09）。
+func readinessHandler(db *store.DB, redis *store.RedisClient, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := db.Pool.Ping(ctx); err != nil {
+			logger.Warn("Readiness failed: postgres", zap.Error(err))
+			c.JSON(503, gin.H{"status": "not_ready", "dependency": "postgres"})
+			return
+		}
+		if redis == nil || redis.Client == nil {
+			c.JSON(503, gin.H{"status": "not_ready", "dependency": "redis"})
+			return
+		}
+		if err := redis.Client.Ping(ctx).Err(); err != nil {
+			logger.Warn("Readiness failed: redis", zap.Error(err))
+			c.JSON(503, gin.H{"status": "not_ready", "dependency": "redis"})
+			return
+		}
+		c.JSON(200, gin.H{"status": "ready"})
+	}
+}
+
+// metricsAuthMiddleware /metrics Bearer 认证（配置 metrics_token 时启用）。
+func metricsAuthMiddleware(token string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+		if auth != "Bearer "+token {
+			c.AbortWithStatusJSON(401, gin.H{"error": "unauthorized"})
+			return
+		}
+		c.Next()
+	}
 }

@@ -40,10 +40,17 @@ func NewCircuitBreakerManager(db *store.DB, logger *zap.Logger, config CircuitBr
 // UpdateCircuitState 更新熔断状态（每次请求完成后调用）。
 // 使用事务 + SELECT ... FOR UPDATE 原子化「读-计数-状态转换-写」，
 // 避免并发请求丢失计数（退避档位/恢复阈值失真）。
-// groupID 非空时，分组级熔断参数覆盖全局配置。
+// P1-04：状态按分组桶隔离——groupID 非空时写入该分组专属桶，
+// nil 时写入全局桶（group_id = 0）。groupID 同时决定分组级熔断参数覆盖。
 func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelID int, model string, groupID *int, success bool, errorClass string) error {
 	// 生效配置：分组覆盖 > 全局（只读，事务外计算）
 	cfg := m.effectiveConfig(ctx, groupID)
+
+	// 分组桶：nil → 全局桶 0
+	bucket := 0
+	if groupID != nil {
+		bucket = *groupID
+	}
 
 	tx, err := m.db.Pool.Begin(ctx)
 	if err != nil {
@@ -51,7 +58,7 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 	}
 	defer tx.Rollback(ctx)
 
-	// 锁定行并读取当前状态（串行化同一 (渠道, 模型) 的并发更新）
+	// 锁定行并读取当前状态（串行化同一 (渠道, 模型, 分组桶) 的并发更新）
 	var currentState string
 	var failureCount, successCount int
 	var coolingUntil time.Time
@@ -59,9 +66,9 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 	err = tx.QueryRow(ctx, `
 		SELECT state, failure_count, success_count, COALESCE(cooling_until, '1970-01-01'::timestamp)
 		FROM circuit_states
-		WHERE channel_id = $1 AND model = $2 AND capability = ''
+		WHERE channel_id = $1 AND model = $2 AND capability = '' AND group_id = $3
 		FOR UPDATE
-	`, channelID, model).Scan(&currentState, &failureCount, &successCount, &coolingUntil)
+	`, channelID, model, bucket).Scan(&currentState, &failureCount, &successCount, &coolingUntil)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		// 没有记录：从 closed 开始
@@ -82,10 +89,10 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 		successCount = 0 // 失败后重置成功计数
 	}
 
-	// 应否开闸判定（仅 closed/degraded 需要样本统计）
+	// 应否开闸判定（仅 closed/degraded 需要样本统计；样本按分组桶过滤）
 	var shouldOpen bool
 	if currentState == "closed" || currentState == "degraded" {
-		shouldOpen = m.shouldOpen(ctx, channelID, model, cfg)
+		shouldOpen = m.shouldOpen(ctx, channelID, model, bucket, cfg)
 	}
 
 	newState, newCoolingUntil := transitionCircuitState(currentState, coolingUntil, success, failureCount, successCount, shouldOpen, cfg)
@@ -105,13 +112,13 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 		openedAt = &t
 	}
 
-	// 写入数据库（单一语句：指针为 nil 时写入 NULL）
+	// 写入数据库（单一语句：指针为 nil 时写入 NULL；按分组桶 upsert）
 	_, err = tx.Exec(ctx, `
-		INSERT INTO circuit_states (channel_id, model, capability, state, opened_at, cooling_until, failure_count, success_count, updated_at)
-		VALUES ($1, $2, '', $3, $4, $5, $6, $7, NOW())
-		ON CONFLICT (channel_id, model, capability)
-		DO UPDATE SET state = $3, opened_at = $4, cooling_until = $5, failure_count = $6, success_count = $7, updated_at = NOW()
-	`, channelID, model, newState, openedAt, newCoolingUntil, failureCount, successCount)
+		INSERT INTO circuit_states (channel_id, model, capability, group_id, state, opened_at, cooling_until, failure_count, success_count, updated_at)
+		VALUES ($1, $2, '', $3, $4, $5, $6, $7, $8, NOW())
+		ON CONFLICT (channel_id, model, capability, group_id)
+		DO UPDATE SET state = $4, opened_at = $5, cooling_until = $6, failure_count = $7, success_count = $8, updated_at = NOW()
+	`, channelID, model, bucket, newState, openedAt, newCoolingUntil, failureCount, successCount)
 	if err != nil {
 		return err
 	}
@@ -175,9 +182,10 @@ func nextCoolingDuration(failureCount int, cfg CircuitBreakerConfig) time.Durati
 	return time.Duration(seconds) * time.Second
 }
 
-func (m *CircuitBreakerManager) shouldOpen(ctx context.Context, channelID int, model string, cfg CircuitBreakerConfig) bool {
-	// 统计最近 10 分钟内最多 MinSamples 个样本的失败率
-	// （LIMIT 必须作用于样本子查询，否则聚合结果只有一行、LIMIT 无效）
+// shouldOpen 统计最近 10 分钟内最多 MinSamples 个样本的失败率。
+// P1-04：样本按分组桶过滤——bucket=0 匹配 request_history.group_id IS NULL 的全局流量，
+// 否则只统计该分组的流量，实现组间熔断隔离。
+func (m *CircuitBreakerManager) shouldOpen(ctx context.Context, channelID int, model string, bucket int, cfg CircuitBreakerConfig) bool {
 	var totalAttempts, failedAttempts int
 	err := m.db.Pool.QueryRow(ctx, `
 		SELECT
@@ -186,11 +194,13 @@ func (m *CircuitBreakerManager) shouldOpen(ctx context.Context, channelID int, m
 		FROM (
 			SELECT success
 			FROM request_history
-			WHERE channel_id = $1 AND model = $2 AND created_at >= NOW() - INTERVAL '10 minutes'
+			WHERE channel_id = $1 AND model = $2
+			  AND created_at >= NOW() - INTERVAL '10 minutes'
+			  AND (($3 = 0 AND group_id IS NULL) OR group_id = $3)
 			ORDER BY created_at DESC
-			LIMIT $3
+			LIMIT $4
 		) recent
-	`, channelID, model, cfg.MinSamples).Scan(&totalAttempts, &failedAttempts)
+	`, channelID, model, bucket, cfg.MinSamples).Scan(&totalAttempts, &failedAttempts)
 
 	if err != nil || totalAttempts < cfg.MinSamples {
 		// 样本不足，不触发熔断

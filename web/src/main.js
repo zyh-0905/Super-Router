@@ -13,12 +13,14 @@ import PlaygroundView from './views/PlaygroundView.vue'
 import DecisionsView from './views/DecisionsView.vue'
 import CircuitView from './views/CircuitView.vue'
 import SettingsView from './views/SettingsView.vue'
+import StrategyView from './views/StrategyView.vue'
 
 const routes = [
   { path: '/', name: 'dashboard', component: DashboardView, meta: { title: '总览' } },
   { path: '/channels', name: 'channels', component: ChannelsView, meta: { title: '站点' } },
   { path: '/playground', name: 'playground', component: PlaygroundView, meta: { title: '测试台' } },
   { path: '/decisions', name: 'decisions', component: DecisionsView, meta: { title: '决策' } },
+  { path: '/strategy', name: 'strategy', component: StrategyView, meta: { title: '策略中心' } },
   { path: '/circuit', name: 'circuit', component: CircuitView, meta: { title: '熔断' } },
   { path: '/settings', name: 'settings', component: SettingsView, meta: { title: '设置' } },
   { path: '/:pathMatch(.*)*', redirect: '/' },

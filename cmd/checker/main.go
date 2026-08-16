@@ -13,6 +13,7 @@ import (
 
 	"smart-router/internal/checker"
 	"smart-router/internal/config"
+	"smart-router/internal/migrate"
 	"smart-router/internal/store"
 
 	"go.uber.org/zap"
@@ -53,17 +54,43 @@ func main() {
 
 	logger.Info("Database connected")
 
+	// 启动时执行版本化迁移（P2-12：带 advisory lock，多实例并发安全）
+	mctx, mcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer mcancel()
+	if err := migrate.Up(mctx, db.Pool, logger); err != nil {
+		logger.Fatal("Failed to run migrations", zap.Error(err))
+	}
+
+	// 初始化 Redis（探针预算原子记账用；不可用时回退数据库汇总检查）
+	redisClient, err := store.NewRedis(cfg.Database.Redis)
+	if err != nil {
+		logger.Warn("Redis unavailable, probe budget falls back to DB summary checks", zap.Error(err))
+		redisClient = &store.RedisClient{}
+	} else {
+		defer redisClient.Close()
+	}
+
+	// 生产环境安全告警（P2-01）
+	if !cfg.Server.BootstrapDefaultKeys && cfg.UsesInsecureDefaults() {
+		logger.Warn("SECURITY: running with default database/redis credentials in production mode; use env overrides and set redis password",
+			zap.String("db_password_default", boolToStr(cfg.Database.Postgres.Password == "gateway_pass")),
+			zap.String("redis_password_empty", boolToStr(cfg.Database.Redis.Password == "")))
+	}
+	if !cfg.Server.BootstrapDefaultKeys && cfg.Security.EncryptionKey == "" {
+		logger.Warn("SECURITY: security.encryption_key is empty; upstream credentials stored in plaintext. Set SR_ENC_KEY (base64 32-byte key)")
+	}
+
 	// 初始化 checker
-	aliveChecker := checker.NewAliveChecker(db, logger.Named("alive"))
-	pricingChecker := checker.NewPricingChecker(db, logger.Named("pricing"))
-	probeChecker := checker.NewProbeChecker(db, logger.Named("probe"))
-	balanceChecker := checker.NewBalanceChecker(db, logger.Named("balance"))
+	aliveChecker := checker.NewAliveChecker(db, logger.Named("alive"), cfg.Security.EncryptionKey)
+	pricingChecker := checker.NewPricingChecker(db, logger.Named("pricing"), cfg.Security.EncryptionKey)
+	probeChecker := checker.NewProbeChecker(db, logger.Named("probe"), cfg.Security.EncryptionKey)
+	balanceChecker := checker.NewBalanceChecker(db, logger.Named("balance"), cfg.Security.EncryptionKey)
 	probeChecker.SetProbeModel(cfg.Checker.ProbeModel)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sched := newScheduler(db, logger, cfg, aliveChecker, pricingChecker, probeChecker, balanceChecker)
+	sched := newScheduler(db, redisClient, logger, cfg, aliveChecker, pricingChecker, probeChecker, balanceChecker)
 	go sched.run(ctx)
 
 	logger.Info("Scheduler started (tick 5s)")
@@ -79,6 +106,13 @@ func main() {
 	logger.Info("Checker exited")
 }
 
+func boolToStr(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
 // ============================================================
 // 分组感知调度器：每个渠道按其所属分组的有效间隔独立调度
 // ============================================================
@@ -92,6 +126,9 @@ type scheduler struct {
 	pricing *checker.PricingChecker
 	probe   *checker.ProbeChecker
 	balance *checker.BalanceChecker
+
+	// budget 探针预算原子记账（Redis；不可用时为 nil 走 DB 汇总回退，P1-06）
+	budget *checker.BudgetTracker
 
 	// 每个渠道每个任务的上次执行时间
 	lastRun map[int]map[string]time.Time
@@ -131,7 +168,7 @@ func accountProbeResult(current, cost float64, err error) (float64, bool) {
 	return remainingProbeBudget(current, cost), err != nil
 }
 
-func newScheduler(db *store.DB, logger *zap.Logger, cfg *config.Config,
+func newScheduler(db *store.DB, redis *store.RedisClient, logger *zap.Logger, cfg *config.Config,
 	alive *checker.AliveChecker, pricing *checker.PricingChecker,
 	probe *checker.ProbeChecker, balance *checker.BalanceChecker) *scheduler {
 	return &scheduler{
@@ -142,6 +179,7 @@ func newScheduler(db *store.DB, logger *zap.Logger, cfg *config.Config,
 		pricing: pricing,
 		probe:   probe,
 		balance: balance,
+		budget:  checker.NewBudgetTracker(redis),
 		lastRun: map[int]map[string]time.Time{},
 	}
 }
@@ -164,7 +202,8 @@ func (s *scheduler) run(ctx context.Context) {
 	}
 }
 
-// runCleanup 按保留策略清理过期历史数据（每日一次；表名/列名均为常量）
+// runCleanup 按保留策略清理过期历史数据（每日一次；表名/列名均为常量）。
+// 决策日志清理后同步删除无引用的快照归档行（P1-05 孤儿归档回收）。
 func (s *scheduler) runCleanup(ctx context.Context) {
 	if time.Since(s.lastCleanup) < 24*time.Hour {
 		return
@@ -190,13 +229,24 @@ func (s *scheduler) runCleanup(ctx context.Context) {
 		}
 		s.logger.Debug("Retention cleanup done", zap.String("table", t.table), zap.Int64("deleted", ct.RowsAffected()))
 	}
+
+	// 快照归档孤儿清理：仅保留仍被决策日志引用的归档
+	if _, err := s.db.Pool.Exec(ctx, `
+		DELETE FROM snapshot_archive a
+		WHERE NOT EXISTS (
+			SELECT 1 FROM decision_logs d WHERE d.snapshot_checksum = a.checksum
+		)`); err != nil {
+		s.logger.Warn("Snapshot archive cleanup failed", zap.Error(err))
+	}
+
 	s.lastCleanup = time.Now()
 }
 
 func (s *scheduler) runAliveForAll(ctx context.Context) {
 	schedules, err := checker.LoadSchedules(ctx, s.db,
 		s.cfg.Checker.AliveInterval, s.cfg.Checker.PricingInterval,
-		s.cfg.Checker.ProbeInterval, s.cfg.Checker.BalanceInterval, s.cfg.Checker.DailyProbeBudget)
+		s.cfg.Checker.ProbeInterval, s.cfg.Checker.BalanceInterval, s.cfg.Checker.DailyProbeBudget,
+		s.cfg.Security.EncryptionKey)
 	if err != nil {
 		s.logger.Error("Load schedules failed", zap.Error(err))
 		return
@@ -226,7 +276,8 @@ func (s *scheduler) runAliveForAll(ctx context.Context) {
 func (s *scheduler) tick(ctx context.Context) {
 	schedules, err := checker.LoadSchedules(ctx, s.db,
 		s.cfg.Checker.AliveInterval, s.cfg.Checker.PricingInterval,
-		s.cfg.Checker.ProbeInterval, s.cfg.Checker.BalanceInterval, s.cfg.Checker.DailyProbeBudget)
+		s.cfg.Checker.ProbeInterval, s.cfg.Checker.BalanceInterval, s.cfg.Checker.DailyProbeBudget,
+		s.cfg.Security.EncryptionKey)
 	if err != nil {
 		s.logger.Error("Load schedules failed", zap.Error(err))
 		return
@@ -238,7 +289,7 @@ func (s *scheduler) tick(ctx context.Context) {
 	now := time.Now()
 	s.runCleanup(ctx) // 自守卫：每日一次
 
-	// 全局探针预算检查
+	// 全局探针预算检查（DB 汇总，粗粒度闸门）
 	globalSpent, err := s.probe.TodaySpent(ctx)
 	globalBudgetLeft, globalBudgetAvailable := probeBudgetLeft(s.cfg.Checker.DailyProbeBudget, globalSpent, err)
 	if !globalBudgetAvailable {
@@ -296,24 +347,9 @@ func (s *scheduler) tick(ctx context.Context) {
 			last["pricing"] = now
 		}
 
-		// 推理探针（预算控制：全局 + 渠道/分组有效预算）
+		// 推理探针（预算控制：全局 + 渠道/分组有效预算，P1-06 原子预留）
 		if globalBudgetLeft > 0 && probeDue(now, last, sch.ProbeInterval, s.cfg.Checker.ProbeFailedBackoff) {
-			upstreamSpent, err := s.probe.UpstreamTodaySpent(ctx, sch.ID)
-			if err != nil {
-				s.logger.Error("Failed to read channel probe spending; paid probe skipped",
-					zap.String("channel", sch.Name), zap.Error(err))
-			} else if upstreamSpent < sch.EffectiveBudget {
-				cost, err := s.probe.ProbeChannel(ctx, sch.Upstream, s.epoch)
-				var failed bool
-				globalBudgetLeft, failed = accountProbeResult(globalBudgetLeft, cost, err)
-				if failed {
-					last["probe_failed"] = now
-					s.logger.Debug("Probe failed", zap.String("channel", sch.Name), zap.Error(err))
-				} else {
-					delete(last, "probe_failed")
-				}
-				last["probe"] = now
-			}
+			s.runProbe(ctx, sch, &globalBudgetLeft, last, now)
 		}
 
 		// 余额检测（轻量 GET，不花钱）
@@ -324,4 +360,72 @@ func (s *scheduler) tick(ctx context.Context) {
 			last["balance"] = now
 		}
 	}
+}
+
+// runProbe 执行单渠道推理探针（P1-06：预算原子预留 → 探测 → 按实际成本结算）。
+func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, globalBudgetLeft *float64, last map[string]time.Time, now time.Time) {
+	// DB 汇总粗闸门（渠道有效预算）
+	upstreamSpent, err := s.probe.UpstreamTodaySpent(ctx, sch.ID)
+	if err != nil {
+		s.logger.Error("Failed to read channel probe spending; paid probe skipped",
+			zap.String("channel", sch.Name), zap.Error(err))
+		return
+	}
+	if upstreamSpent >= sch.EffectiveBudget {
+		s.logger.Debug("Channel probe budget exceeded, skipped",
+			zap.String("channel", sch.Name),
+			zap.Float64("spent", upstreamSpent),
+			zap.Float64("budget", sch.EffectiveBudget))
+		last["probe"] = now
+		return
+	}
+
+	// 估算单次探测成本并做原子预留（Redis 可用时）
+	estCost, err := s.probe.EstimateProbeCost(ctx, s.cfg.Checker.ProbeModel, 16, 16)
+	if err != nil {
+		s.logger.Warn("Estimate probe cost failed, probe skipped", zap.String("channel", sch.Name), zap.Error(err))
+		last["probe"] = now
+		return
+	}
+	estimateCents := checker.ToCentsForBudget(estCost)
+	reserved := false
+	if s.budget != nil && s.budget.Available() {
+		ok, rerr := s.budget.Reserve(ctx, sch.ID, estimateCents,
+			checker.ToCentsForBudget(sch.EffectiveBudget),
+			checker.ToCentsForBudget(s.cfg.Checker.DailyProbeBudget))
+		if rerr != nil {
+			s.logger.Warn("Budget reservation failed, probe skipped", zap.String("channel", sch.Name), zap.Error(rerr))
+			last["probe"] = now
+			return
+		}
+		if !ok {
+			s.logger.Info("Probe budget exhausted (concurrent reservations), skipped",
+				zap.String("channel", sch.Name),
+				zap.Float64("effective_budget", sch.EffectiveBudget))
+			last["probe"] = now
+			return
+		}
+		reserved = true
+	}
+
+	// 执行探测
+	res, err := s.probe.ProbeChannel(ctx, sch.Upstream, s.epoch)
+	if reserved {
+		// 结算：实际成本 - 预留估算（失败全额退款）
+		actualCents := int64(0)
+		if res != nil && res.Cost > 0 {
+			actualCents = checker.ToCentsForBudget(res.Cost)
+		}
+		s.budget.Adjust(ctx, sch.ID, actualCents-estimateCents)
+	}
+	if err != nil {
+		last["probe_failed"] = now
+		s.logger.Debug("Probe failed", zap.String("channel", sch.Name), zap.Error(err))
+	} else {
+		delete(last, "probe_failed")
+		if res != nil {
+			*globalBudgetLeft -= res.Cost
+		}
+	}
+	last["probe"] = now
 }

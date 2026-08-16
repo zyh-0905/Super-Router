@@ -434,20 +434,20 @@ func TestGetConfigNestedFloat(t *testing.T) {
 func TestBalancedStrategyLoadScore(t *testing.T) {
 	candidates := []*ChannelHealth{
 		{
-			ID:              1,
-			Name:            "busy",
-			RecentAttempts:  500,
+			ID:               1,
+			Name:             "busy",
+			RecentAttempts:   500,
 			ReliabilityScore: 0.95,
-			TTFTP50:         map[string]int{"gpt-4o": 800},
-			RealRatio:       map[string]float64{"gpt-4o": 1.0},
+			TTFTP50:          map[string]int{"gpt-4o": 800},
+			RealRatio:        map[string]float64{"gpt-4o": 1.0},
 		},
 		{
-			ID:              2,
-			Name:            "idle",
-			RecentAttempts:  0,
+			ID:               2,
+			Name:             "idle",
+			RecentAttempts:   0,
 			ReliabilityScore: 0.95,
-			TTFTP50:         map[string]int{"gpt-4o": 800},
-			RealRatio:       map[string]float64{"gpt-4o": 1.0},
+			TTFTP50:          map[string]int{"gpt-4o": 800},
+			RealRatio:        map[string]float64{"gpt-4o": 1.0},
 		},
 	}
 
@@ -477,7 +477,7 @@ func TestBalancedStrategyLoadScore(t *testing.T) {
 // TestResolvePolicyDefaults 测试配置默认值合并（零值回退硬编码兜底）
 func TestResolvePolicyDefaults(t *testing.T) {
 	strategy, maxAttempts, totalBudgetMS, maxPriceCap, maxTTFTMS, halfOpenProbeCount, weights := resolvePolicyDefaults(nil)
-	if strategy != "custom_priority" || maxAttempts != 3 || totalBudgetMS != 15000 || maxPriceCap != 100.0 || maxTTFTMS != 5000 || halfOpenProbeCount != 1 {
+	if strategy != "custom_priority" || maxAttempts != 3 || totalBudgetMS != 30000 || maxPriceCap != 100.0 || maxTTFTMS != 5000 || halfOpenProbeCount != 1 {
 		t.Errorf("hardcoded fallback mismatch: %s %d %d %v %d %d", strategy, maxAttempts, totalBudgetMS, maxPriceCap, maxTTFTMS, halfOpenProbeCount)
 	}
 	if weights["cost"] != 0.35 || weights["load"] != 0.10 {

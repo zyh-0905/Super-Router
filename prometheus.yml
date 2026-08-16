@@ -7,12 +7,14 @@ global:
     cluster: 'smart-router'
     environment: 'production'
 
-# Alertmanager 配置（可选）
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets:
-#           - alertmanager:9093
+# Alertmanager 通知出口（P2-10）：
+# docker compose --profile monitoring 或 start-monitoring.sh 都会启动 alertmanager:9093；
+# 若单独运行 Prometheus 且无 Alertmanager，此处会重试告警投递但不影响抓取。
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - host.docker.internal:9093
 
 # 抓取配置
 scrape_configs:

@@ -13,7 +13,6 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U gateway"]
       interval: 10s
@@ -53,6 +52,10 @@ services:
       - DATABASE_NAME=smart_router
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      # 上游凭据信封加密密钥（base64 32 字节）。生产建议生成并注入：
+      #   openssl rand -base64 32
+      # 留空 = 明文存储（仅限本地开发，启动时会有安全告警）。
+      - SR_ENC_KEY=${SR_ENC_KEY:-}
     volumes:
       - ./configs:/app/configs:ro
     depends_on:
@@ -60,6 +63,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # readiness：检查 Gateway 进程及其对 PostgreSQL/Redis 的依赖（P2-09）
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/ready >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     networks:
       - router_net
     restart: unless-stopped
@@ -76,6 +86,7 @@ services:
       - DATABASE_NAME=smart_router
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - SR_ENC_KEY=${SR_ENC_KEY:-}
     volumes:
       - ./configs:/app/configs:ro
     depends_on:
@@ -83,6 +94,39 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - router_net
+    restart: unless-stopped
+
+  # ===== 监控（可选：docker compose --profile monitoring up -d）=====
+  # P2-10：Prometheus + Alertmanager 作为同一部署单元，规则文件随仓库挂载，
+  # 不再依赖外部脚本隐式补文件。
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: smart-router-prometheus
+    profiles: ["monitoring"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - alertmanager
+      - gateway
+    networks:
+      - router_net
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: smart-router-alertmanager
+    profiles: ["monitoring"]
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     networks:
       - router_net
     restart: unless-stopped

@@ -41,9 +41,29 @@ echo ""
 echo "🧹 Cleaning up existing containers..."
 docker stop smart-router-prometheus 2>/dev/null || true
 docker rm smart-router-prometheus 2>/dev/null || true
+docker stop smart-router-alertmanager 2>/dev/null || true
+docker rm smart-router-alertmanager 2>/dev/null || true
 docker stop smart-router-grafana 2>/dev/null || true
 docker rm smart-router-grafana 2>/dev/null || true
 echo -e "${GREEN}✓${NC} Cleanup complete"
+echo ""
+
+# 启动 Alertmanager（告警通知出口；接入真实渠道请编辑 alertmanager.yml）
+echo "🔔 Starting Alertmanager..."
+docker run -d \
+  --name smart-router-alertmanager \
+  -p 9093:9093 \
+  -v "$PROJECT_DIR/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro" \
+  --restart unless-stopped \
+  prom/alertmanager \
+  --config.file=/etc/alertmanager/alertmanager.yml
+
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓${NC} Alertmanager started on http://localhost:9093"
+else
+    echo -e "${RED}❌ Failed to start Alertmanager${NC}"
+    exit 1
+fi
 echo ""
 
 # 启动 Prometheus
@@ -102,6 +122,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "📊 Access URLs:"
 echo "   • Prometheus:     http://localhost:9090"
+echo "   • Alertmanager:   http://localhost:9093"
 echo "   • Grafana:        http://localhost:3001"
 echo "   • Gateway Metrics: http://localhost:8080/metrics"
 echo ""

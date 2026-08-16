@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"smart-router/internal/crypto"
 	"smart-router/internal/store"
 )
 
@@ -27,13 +28,40 @@ type ChannelSchedule struct {
 	PricingInterval time.Duration
 	ProbeInterval   time.Duration
 	BalanceInterval time.Duration
-	EffectiveBudget float64 // 单站点探针预算（渠道自身与分组取最小）
+	EffectiveBudget float64 // 单站点有效探针预算：min(全局, 渠道自身, 所有启用分组)（P1-06）
+}
+
+// DecryptCreds 解密上游凭据（P1-07）：未配置密钥时明文透传；解密失败返回错误。
+func DecryptCreds(u *Upstream, cryptoKey string) error {
+	var err error
+	if u.AccessToken, err = crypto.Decrypt(u.AccessToken, cryptoKey); err != nil {
+		return err
+	}
+	if u.APIKey, err = crypto.Decrypt(u.APIKey, cryptoKey); err != nil {
+		return err
+	}
+	if u.BalanceAPIToken, err = crypto.Decrypt(u.BalanceAPIToken, cryptoKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+// withUpstreamTimeout 将渠道 timeout_total_ms 映射到请求上下文（P2-07）：
+// 渠道配置了总超时且小于固定上限时使用渠道值，否则使用 checker 客户端固定上限。
+func withUpstreamTimeout(ctx context.Context, u Upstream, base time.Duration) (context.Context, context.CancelFunc) {
+	if u.TimeoutTotalMS > 0 {
+		t := time.Duration(u.TimeoutTotalMS) * time.Millisecond
+		if t < base {
+			return context.WithTimeout(ctx, t)
+		}
+	}
+	return context.WithTimeout(ctx, base)
 }
 
 // LoadSchedules 加载所有启用渠道及其分组调度配置
-// global* 为全局默认值（来自 config）
+// global* 为全局默认值（来自 config）；cryptoKey 用于解密渠道凭据。
 func LoadSchedules(ctx context.Context, db *store.DB,
-	globalAlive, globalPricing, globalProbe, globalBalance time.Duration, globalBudget float64) ([]ChannelSchedule, error) {
+	globalAlive, globalPricing, globalProbe, globalBalance time.Duration, globalBudget float64, cryptoKey string) ([]ChannelSchedule, error) {
 
 	// 1. 加载分组
 	rows, err := db.Pool.Query(ctx, `
@@ -105,6 +133,11 @@ func LoadSchedules(ctx context.Context, db *store.DB,
 			continue
 		}
 
+		// 凭据解密（P1-07）：解密失败时跳过该渠道，避免用错误凭据反复探测
+		if err := DecryptCreds(&u, cryptoKey); err != nil {
+			continue
+		}
+
 		s := ChannelSchedule{
 			Upstream:        u,
 			GroupIDs:        channelGroups[u.ID],
@@ -115,8 +148,8 @@ func LoadSchedules(ctx context.Context, db *store.DB,
 			EffectiveBudget: globalBudget,
 		}
 
-		// 渠道自身的探针预算优先（更具体）
-		if u.DailyProbeBudget > 0 {
+		// P1-06：预算取 min(全局, 渠道自身, 所有启用分组)，渠道默认 0.5 不再吞掉组预算
+		if u.DailyProbeBudget > 0 && u.DailyProbeBudget < s.EffectiveBudget {
 			s.EffectiveBudget = u.DailyProbeBudget
 		}
 
@@ -138,7 +171,7 @@ func LoadSchedules(ctx context.Context, db *store.DB,
 			if g.BalanceInterval > 0 && g.BalanceInterval < s.BalanceInterval {
 				s.BalanceInterval = g.BalanceInterval
 			}
-			if u.DailyProbeBudget <= 0 && g.DailyProbeBudget > 0 && g.DailyProbeBudget < s.EffectiveBudget {
+			if g.DailyProbeBudget > 0 && g.DailyProbeBudget < s.EffectiveBudget {
 				s.EffectiveBudget = g.DailyProbeBudget
 			}
 		}

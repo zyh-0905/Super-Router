@@ -41,8 +41,8 @@ func AuthMiddleware(db *store.DB) gin.HandlerFunc {
 		// 计算 key_hash
 		keyHash := hashAPIKey(apiKey)
 
-		// 从数据库验证
-		ctx := context.Background()
+		// 从数据库验证（使用请求上下文，客户端断开即取消，P2-05）
+		ctx := c.Request.Context()
 		var role string
 		var enabled bool
 		err := db.Pool.QueryRow(ctx, `
@@ -73,7 +73,7 @@ func AuthMiddleware(db *store.DB) gin.HandlerFunc {
 		c.Set("role", role)
 
 		// 加载 Key 绑定分组（空 = 不限制）
-		groupIDs, err := loadKeyGroupIDs(db, keyHash)
+		groupIDs, err := loadKeyGroupIDs(db, keyHash, c.Request.Context())
 		if err != nil {
 			c.JSON(500, gin.H{"error": "failed to load key groups"})
 			c.Abort()
@@ -86,8 +86,8 @@ func AuthMiddleware(db *store.DB) gin.HandlerFunc {
 }
 
 // loadKeyGroupIDs 读取 API Key 绑定的分组 ID 列表（空切片 = 不限制）
-func loadKeyGroupIDs(db *store.DB, keyHash string) ([]int, error) {
-	rows, err := db.Pool.Query(context.Background(), `
+func loadKeyGroupIDs(db *store.DB, keyHash string, ctx context.Context) ([]int, error) {
+	rows, err := db.Pool.Query(ctx, `
 		SELECT ag.group_id
 		FROM api_key_groups ag
 		JOIN api_keys k ON k.id = ag.api_key_id
@@ -140,9 +140,9 @@ func hashAPIKey(apiKey string) string {
 }
 
 // EnsureDefaultKeys 初始化管理员 Key：
-// - bootstrap=true（本地开发）：表为空时写入 test-admin-key / test-caller-key；
-// - bootstrap=false（生产）：表为空时生成随机管理员 Key，仅通过日志打印一次，
-//   返回该 Key 供启动日志展示，绝不写死公开凭据。
+//   - bootstrap=true（本地开发）：表为空时写入 test-admin-key / test-caller-key；
+//   - bootstrap=false（生产）：表为空时生成随机管理员 Key，仅通过日志打印一次，
+//     返回该 Key 供启动日志展示，绝不写死公开凭据。
 func EnsureDefaultKeys(db *store.DB, bootstrap bool) (string, error) {
 	ctx := context.Background()
 

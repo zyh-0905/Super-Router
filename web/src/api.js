@@ -63,6 +63,7 @@ async function request(path, { method = 'GET', body, headers = {}, timeout = 150
 export const api = {
   get: (path, opts) => request(path, { ...opts, method: 'GET' }),
   post: (path, body, opts) => request(path, { ...opts, method: 'POST', body }),
+  put: (path, body, opts) => request(path, { ...opts, method: 'PUT', body }),
   patch: (path, body, opts) => request(path, { ...opts, method: 'PATCH', body }),
   del: (path, opts) => request(path, { ...opts, method: 'DELETE' }),
 
@@ -100,7 +101,7 @@ export const api = {
       body.input_price_per_m = official.input
       body.output_price_per_m = official.output
     }
-    return api.post(`/admin/channels/${id}/probe-ratio`, body)
+    return api.post(`/admin/channels/${id}/probe-ratio`, body, { timeout: 120000 })
   },
   listModelPrices: () => api.get('/admin/model-prices'),
   upsertModelPrice: (p) => api.post('/admin/model-prices', p),
@@ -108,8 +109,8 @@ export const api = {
   createRatioGroup: (id, p) => api.post(`/admin/channels/${id}/ratio-groups`, p),
   updateRatioGroup: (id, gid, p) => api.patch(`/admin/channels/${id}/ratio-groups/${gid}`, p),
   deleteRatioGroup: (id, gid) => api.del(`/admin/channels/${id}/ratio-groups/${gid}`),
-  probeRatioGroup: (id, gid) => api.post(`/admin/channels/${id}/ratio-groups/${gid}/probe`, {}),
-  probeUpstreamModels: (base_url, api_key, protocol) => api.post('/admin/upstream/models', { base_url, api_key, protocol }),
+  probeRatioGroup: (id, gid) => api.post(`/admin/channels/${id}/ratio-groups/${gid}/probe`, {}, { timeout: 120000 }),
+  probeUpstreamModels: (base_url, api_key, protocol) => api.post('/admin/upstream/models', { base_url, api_key, protocol }, { timeout: 120000 }),
   getSettings: () => api.get('/admin/settings'),
   updateSettings: (p) => api.patch('/admin/settings', p),
 
@@ -139,6 +140,12 @@ export const api = {
   // ===== 运行配置 =====
   config: () => api.get('/admin/config'),
 
+  // ===== 策略中心 =====
+  getPolicy: () => api.get('/admin/policies'),
+  updatePolicy: (p) => api.put('/admin/policies', p),
+  getGroupStrategy: (id) => api.get(`/admin/groups/${id}/strategy`),
+  updateGroupStrategy: (id, p) => api.put(`/admin/groups/${id}/strategy`, p),
+
   // ===== 推理代理（请求测试台用，返回原始 Response 以支持流式） =====
   async chatCompletion(payload, { onDelta } = {}) {
     const ctrl = new AbortController()
@@ -158,12 +165,17 @@ export const api = {
     }
     clearTimeout(timer)
 
+    // 网关对可能含中文的响应头做了 URI 编码（HTTP 头按 Latin-1 解读会乱码），此处还原
+    const safeDecode = (v) => {
+      if (!v) return v
+      try { return decodeURIComponent(v) } catch { return v }
+    }
     const meta = {
       status: resp.status,
-      channel: resp.headers.get('x-selected-channel'),
+      channel: safeDecode(resp.headers.get('x-selected-channel')),
       channelId: resp.headers.get('x-selected-channel-id'),
       strategy: resp.headers.get('x-strategy'),
-      group: resp.headers.get('x-group'),
+      group: safeDecode(resp.headers.get('x-group')),
       traceId: resp.headers.get('x-trace-id'),
       requestId: resp.headers.get('x-request-id'),
     }

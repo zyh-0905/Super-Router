@@ -23,6 +23,8 @@ type ChannelGroup struct {
 	Enabled         bool
 	DefaultStrategy string
 	GroupPriority   int
+	// StrategyConfig 分组级策略配置（018 迁移，如 balanced_weights）；空时使用策略内置默认
+	StrategyConfig map[string]interface{}
 }
 
 // PolicyLoader 策略加载器
@@ -51,15 +53,21 @@ func (p *PolicyLoader) SetDefaults(d PolicyDefaults) {
 	p.defaults = &d
 }
 
-// LoadGroup 按 ID 加载分组（路由决策用）
+// LoadGroup 按 ID 加载分组（路由决策用，含分组级策略配置）
 func (p *PolicyLoader) LoadGroup(ctx context.Context, groupID int) (*ChannelGroup, error) {
 	var g ChannelGroup
+	var cfgJSON []byte
 	err := p.db.Pool.QueryRow(ctx, `
-		SELECT id, name, enabled, default_strategy, group_priority
+		SELECT id, name, enabled, default_strategy, group_priority,
+		       COALESCE(strategy_config::text, '{}')
 		FROM channel_groups WHERE id = $1
-	`, groupID).Scan(&g.ID, &g.Name, &g.Enabled, &g.DefaultStrategy, &g.GroupPriority)
+	`, groupID).Scan(&g.ID, &g.Name, &g.Enabled, &g.DefaultStrategy, &g.GroupPriority, &cfgJSON)
 	if err != nil {
 		return nil, err
+	}
+	g.StrategyConfig = map[string]interface{}{}
+	if len(cfgJSON) > 0 {
+		_ = json.Unmarshal(cfgJSON, &g.StrategyConfig)
 	}
 	return &g, nil
 }
@@ -79,12 +87,16 @@ func (p *PolicyLoader) LoadPolicy(ctx context.Context, tokenID, model string, gr
 		return policy, nil
 	}
 
-	// 3. 尝试分组默认策略
+	// 3. 尝试分组默认策略（含分组级策略配置：balanced 权重等）
 	if group != nil && group.DefaultStrategy != "" {
+		cfg := group.StrategyConfig
+		if cfg == nil {
+			cfg = map[string]interface{}{}
+		}
 		return &Policy{
 			Version:  fmt.Sprintf("group-%d", group.ID),
 			Strategy: group.DefaultStrategy,
-			Config:   map[string]interface{}{},
+			Config:   cfg,
 		}, nil
 	}
 
@@ -116,7 +128,7 @@ func (p *PolicyLoader) LoadPolicy(ctx context.Context, tokenID, model string, gr
 
 // resolvePolicyDefaults 合并配置默认值与硬编码兜底
 func resolvePolicyDefaults(d *PolicyDefaults) (strategy string, maxAttempts, totalBudgetMS int, maxPriceCap float64, maxTTFTMS int, halfOpenProbeCount int, weights map[string]float64) {
-	strategy, maxAttempts, totalBudgetMS = "custom_priority", 3, 15000
+	strategy, maxAttempts, totalBudgetMS = "custom_priority", 3, 30000
 	maxPriceCap, maxTTFTMS, halfOpenProbeCount = 100.0, 5000, 1
 	if d != nil {
 		if d.DefaultStrategy != "" {

@@ -38,7 +38,11 @@ func sanitizeModelLabel(model string) string {
 	return model
 }
 
-// PrometheusMiddleware 记录 HTTP 请求指标
+// PrometheusMiddleware 记录 HTTP 请求指标（P2-08）：
+//   - /v1/chat/completions：业务指标，状态取代理 handler 写入的 proxy_outcome
+//     （success / upstream_error / stream_interrupted / no_upstream），
+//     流式已写 200 后中断不再被误记为成功；
+//   - /admin、/health、/metrics 等：独立管理指标，不污染推理 QPS/成功率告警。
 func PrometheusMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -49,10 +53,30 @@ func PrometheusMiddleware() gin.HandlerFunc {
 		// 计算耗时
 		duration := time.Since(start).Seconds()
 
-		// 确定状态
-		status := "success"
-		if c.Writer.Status() >= 400 {
-			status = "error"
+		fullPath := c.FullPath()
+		if fullPath != "/v1/chat/completions" {
+			route := fullPath
+			if route == "" {
+				route = "unmatched"
+			}
+			status := "success"
+			if c.Writer.Status() >= 400 {
+				status = "error"
+			}
+			AdminRequestsTotal.WithLabelValues(route, status).Inc()
+			AdminRequestDuration.WithLabelValues(route).Observe(duration)
+			return
+		}
+
+		// 业务指标：优先使用代理 handler 明确记录的推理结果
+		status := c.GetString("proxy_outcome")
+		if status == "" {
+			// 兜底：无 outcome（如路由前即失败）时按 HTTP 状态
+			if c.Writer.Status() >= 400 {
+				status = "error"
+			} else {
+				status = "success"
+			}
 		}
 
 		// 从上下文中获取信息（由路由处理器设置）

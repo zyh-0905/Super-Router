@@ -5,73 +5,118 @@
     "title": "Smart Router Gateway Monitoring",
     "tags": ["smart-router", "gateway"],
     "timezone": "browser",
-    "schemaVersion": 16,
+    "schemaVersion": 39,
     "version": 0,
     "refresh": "10s",
+    "time": { "from": "now-6h", "to": "now" },
+    "timepicker": {},
+    "graphTooltip": 1,
+    "editable": true,
+    "fiscalYearStartMonth": 0,
     "panels": [
       {
         "id": 1,
         "title": "请求总数（QPS）",
-        "type": "graph",
+        "type": "timeseries",
         "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
         "targets": [
           {
             "expr": "rate(smart_router_requests_total[1m])",
-            "legendFormat": "{{model}} - {{channel}} - {{status}}"
+            "legendFormat": "{{model}} - {{channel}} - {{status}}",
+            "refId": "A"
           }
-        ]
+        ],
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+          "tooltip": {"mode": "multi", "sort": "desc"}
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "reqps"},
+          "overrides": []
+        }
       },
       {
         "id": 2,
         "title": "成功率",
-        "type": "graph",
+        "type": "timeseries",
         "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
         "targets": [
           {
             "expr": "rate(smart_router_requests_total{status=\"success\"}[5m]) / rate(smart_router_requests_total[5m])",
-            "legendFormat": "{{model}} - {{channel}}"
+            "legendFormat": "{{model}} - {{channel}}",
+            "refId": "A"
           }
-        ]
+        ],
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+          "tooltip": {"mode": "multi", "sort": "desc"}
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "percentunit", "min": 0, "max": 1},
+          "overrides": []
+        }
       },
       {
         "id": 3,
         "title": "请求延迟分位数",
-        "type": "graph",
+        "type": "timeseries",
         "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
         "targets": [
           {
             "expr": "histogram_quantile(0.50, sum(rate(smart_router_request_duration_seconds_bucket[5m])) by (le, model))",
-            "legendFormat": "P50 - {{model}}"
+            "legendFormat": "P50 - {{model}}",
+            "refId": "A"
           },
           {
             "expr": "histogram_quantile(0.95, sum(rate(smart_router_request_duration_seconds_bucket[5m])) by (le, model))",
-            "legendFormat": "P95 - {{model}}"
+            "legendFormat": "P95 - {{model}}",
+            "refId": "B"
           },
           {
             "expr": "histogram_quantile(0.99, sum(rate(smart_router_request_duration_seconds_bucket[5m])) by (le, model))",
-            "legendFormat": "P99 - {{model}}"
+            "legendFormat": "P99 - {{model}}",
+            "refId": "C"
           }
-        ]
+        ],
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+          "tooltip": {"mode": "multi", "sort": "desc"}
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "s"},
+          "overrides": []
+        }
       },
       {
         "id": 4,
         "title": "路由决策耗时",
-        "type": "graph",
+        "type": "timeseries",
         "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
         "targets": [
           {
             "expr": "histogram_quantile(0.50, rate(smart_router_routing_duration_seconds_bucket[5m]))",
-            "legendFormat": "P50"
+            "legendFormat": "P50",
+            "refId": "A"
           },
           {
             "expr": "histogram_quantile(0.95, rate(smart_router_routing_duration_seconds_bucket[5m]))",
-            "legendFormat": "P95"
+            "legendFormat": "P95",
+            "refId": "B"
           },
           {
             "expr": "histogram_quantile(0.99, rate(smart_router_routing_duration_seconds_bucket[5m]))",
-            "legendFormat": "P99"
+            "legendFormat": "P99",
+            "refId": "C"
           }
-        ]
+        ],
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+          "tooltip": {"mode": "multi", "sort": "desc"}
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "s"},
+          "overrides": []
+        }
       },
       {
         "id": 5,
@@ -81,29 +126,43 @@
         "targets": [
           {
             "expr": "smart_router_channel_success_rate",
-            "legendFormat": "Channel {{channel}} - {{model}}"
+            "legendFormat": "Channel {{channel}} - {{model}}",
+            "refId": "A"
           }
-        ]
+        ],
+        "options": {
+          "calculate": false,
+          "cellGap": 2,
+          "color": {"mode": "scheme", "scheme": "Spectral", "reverse": true},
+          "exemplars": {"color": "rgba(255,0,0,0.9)"}
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "percentunit", "min": 0, "max": 1},
+          "overrides": []
+        }
       },
       {
         "id": 6,
         "title": "熔断状态",
-        "type": "graph",
+        "type": "timeseries",
         "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
         "targets": [
           {
             "expr": "smart_router_circuit_breaker_state",
-            "legendFormat": "Channel {{channel}} - {{model}}"
+            "legendFormat": "Channel {{channel}} - {{model}}",
+            "refId": "A"
           }
         ],
-        "yaxes": [
-          {
-            "label": "State",
-            "format": "short",
-            "min": 0,
-            "max": 3
-          }
-        ]
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+          "tooltip": {"mode": "multi", "sort": "desc"}
+        },
+        "fieldConfig": {
+          "defaults": {"min": 0, "max": 3, "mappings": [
+            {"options": {"0": {"text": "closed"}, "1": {"text": "open"}, "2": {"text": "half_open"}, "3": {"text": "degraded"}}, "type": "value"}
+          ]},
+          "overrides": []
+        }
       },
       {
         "id": 7,
@@ -113,33 +172,62 @@
         "targets": [
           {
             "expr": "sum(rate(smart_router_requests_total[5m])) by (channel)",
-            "legendFormat": "Channel {{channel}}"
+            "legendFormat": "Channel {{channel}}",
+            "refId": "A"
           }
-        ]
+        ],
+        "options": {
+          "displayLabels": ["name", "percent"],
+          "legend": {"displayMode": "list", "placement": "right", "showLegend": true},
+          "pieType": "pie",
+          "tooltip": {"mode": "single", "sort": "none"}
+        },
+        "fieldConfig": {
+          "defaults": {},
+          "overrides": []
+        }
       },
       {
         "id": 8,
         "title": "故障切换次数",
-        "type": "graph",
+        "type": "timeseries",
         "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
         "targets": [
           {
             "expr": "rate(smart_router_failover_total[5m])",
-            "legendFormat": "{{from_channel}} -> {{to_channel}} ({{reason}})"
+            "legendFormat": "{{from_channel}} -> {{to_channel}} ({{reason}})",
+            "refId": "A"
           }
-        ]
+        ],
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+          "tooltip": {"mode": "multi", "sort": "desc"}
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "ops"},
+          "overrides": []
+        }
       },
       {
         "id": 9,
         "title": "代理请求延迟",
-        "type": "graph",
+        "type": "timeseries",
         "gridPos": {"h": 8, "w": 24, "x": 0, "y": 32},
         "targets": [
           {
             "expr": "histogram_quantile(0.95, sum(rate(smart_router_proxy_duration_seconds_bucket[5m])) by (le, channel))",
-            "legendFormat": "P95 - Channel {{channel}}"
+            "legendFormat": "P95 - Channel {{channel}}",
+            "refId": "A"
           }
-        ]
+        ],
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+          "tooltip": {"mode": "multi", "sort": "desc"}
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "s"},
+          "overrides": []
+        }
       }
     ]
   }

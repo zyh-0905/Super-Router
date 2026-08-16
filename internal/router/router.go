@@ -38,10 +38,14 @@ type RouteRequest struct {
 	EstimatedInput int
 	MaxOutput      int
 	TimeoutMS      int
-	GroupID        *int  // 可选：限定在指定分组内路由
+	GroupID        *int  // 可选：限定在指定分组内路由（显式指定或单组 Key 默认组）
 	GroupIDs       []int // 可选：限定在多个分组的并集内路由（Key 绑定组场景）
 	// OverrideStrategy 非空时覆盖策略查找链的结果（决策重放对比用）
 	OverrideStrategy string
+	// OverridePolicy 非空时跳过策略查找链，直接使用该策略（确定性重放：来自决策日志的生效策略快照）
+	OverridePolicy *Policy
+	// ReplaySnapshot 非空时跳过当前快照加载，使用历史归档快照（确定性重放）
+	ReplaySnapshot *HealthSnapshot
 }
 
 // AttemptRecord 请求尝试记录
@@ -68,6 +72,8 @@ type RouteResult struct {
 	SnapshotChecksum string
 	GroupID          *int
 	GroupName        string
+	// 已生效策略（写入决策日志，供确定性重放，P1-05）
+	Policy *Policy
 	// 有效策略的执行参数（已应用默认值）
 	MaxAttempts        int
 	TotalBudgetMS      int
@@ -113,17 +119,27 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 	if req.GroupID != nil {
 		g, err := r.policyLoader.LoadGroup(ctx, *req.GroupID)
 		if err != nil {
-			return nil, fmt.Errorf("load group: %w", err)
+			// 确定性重放时分组可能已被删除：仅当显式指定分组（非重放）才视为硬错误
+			if req.OverridePolicy == nil {
+				return nil, fmt.Errorf("load group: %w", err)
+			}
+		} else {
+			if !g.Enabled {
+				return nil, fmt.Errorf("group %s is disabled", g.Name)
+			}
+			group = g
 		}
-		if !g.Enabled {
-			return nil, fmt.Errorf("group %s is disabled", g.Name)
-		}
-		group = g
 	}
 
-	policy, err := r.policyLoader.LoadPolicy(ctx, req.TokenID, req.Model, group)
-	if err != nil {
-		return nil, fmt.Errorf("load policy: %w", err)
+	var policy *Policy
+	var err error
+	if req.OverridePolicy != nil {
+		policy = req.OverridePolicy // 确定性重放：使用决策日志中的生效策略快照
+	} else {
+		policy, err = r.policyLoader.LoadPolicy(ctx, req.TokenID, req.Model, group)
+		if err != nil {
+			return nil, fmt.Errorf("load policy: %w", err)
+		}
 	}
 
 	// 重放对比：显式覆盖策略名（保持原策略配置）
@@ -131,13 +147,18 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 		policy.Strategy = req.OverrideStrategy
 	}
 
-	// 阶段 C：构建手动候选集（从快照读取）
-	snapshotStart := time.Now()
-	snapshot, err := LoadSnapshot(ctx, r.db, r.redis)
-	if err != nil {
-		return nil, fmt.Errorf("load snapshot: %w", err)
+	// 阶段 C：构建候选集（重放时使用历史归档快照）
+	var snapshot *HealthSnapshot
+	if req.ReplaySnapshot != nil {
+		snapshot = req.ReplaySnapshot
+	} else {
+		snapshotStart := time.Now()
+		snapshot, err = LoadSnapshot(ctx, r.db, r.redis)
+		if err != nil {
+			return nil, fmt.Errorf("load snapshot: %w", err)
+		}
+		recordSnapshotLoadDuration(time.Since(snapshotStart).Seconds())
 	}
-	recordSnapshotLoadDuration(time.Since(snapshotStart).Seconds())
 
 	// 阶段 D：硬过滤
 	filter := NewHardFilter(policy, snapshot.ModelPrices)
@@ -146,6 +167,7 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 		Capabilities:   req.Capabilities,
 		EstimatedInput: req.EstimatedInput,
 		MaxOutput:      req.MaxOutput,
+		GroupID:        req.GroupID,
 	}
 
 	// 允许的分组集合（nil = 不限制）
@@ -188,6 +210,7 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 		return &RouteResult{
 			Excluded:         excluded,
 			PolicyVersion:    policy.Version,
+			Policy:           policy,
 			Epoch:            snapshot.Epoch,
 			SnapshotChecksum: snapshot.ContentHash,
 			GroupID:          req.GroupID,
@@ -201,18 +224,19 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 
 	// 构建结果
 	result := &RouteResult{
-		SelectedChannel:  scored[0].Channel,
-		AllScores:        make(map[int]float64),
-		CandidateOrder:   make([]int, 0, len(scored)),
-		Candidates:       make(map[int]*ChannelHealth, len(scored)),
-		Excluded:         excluded,
-		Strategy:         policy.Strategy,
-		PolicyVersion:    policy.Version,
-		Epoch:            snapshot.Epoch,
-		SnapshotChecksum: snapshot.ContentHash,
+		SelectedChannel:    scored[0].Channel,
+		AllScores:          make(map[int]float64),
+		CandidateOrder:     make([]int, 0, len(scored)),
+		Candidates:         make(map[int]*ChannelHealth, len(scored)),
+		Excluded:           excluded,
+		Strategy:           policy.Strategy,
+		PolicyVersion:      policy.Version,
+		Policy:             policy,
+		Epoch:              snapshot.Epoch,
+		SnapshotChecksum:   snapshot.ContentHash,
 		GroupID:            req.GroupID,
 		MaxAttempts:        policy.GetConfigInt("max_attempts", 3),
-		TotalBudgetMS:      policy.GetConfigInt("total_budget_ms", 15000),
+		TotalBudgetMS:      policy.GetConfigInt("total_budget_ms", 30000),
 		HalfOpenProbeCount: policy.GetConfigInt("half_open_probe_count", 1),
 	}
 
@@ -248,7 +272,7 @@ func groupSuffix(group *ChannelGroup) string {
 	return fmt.Sprintf(", group=%s(id=%d)", group.Name, group.ID)
 }
 
-// LogDecision 记录决策日志到数据库
+// LogDecision 记录决策日志到数据库（含完整重放上下文，P1-05）
 func (r *Router) LogDecision(ctx context.Context, req RouteRequest, result *RouteResult) error {
 	// 序列化为 JSON
 	candidateOrderJSON, _ := toJSON(result.CandidateOrder)
@@ -256,6 +280,9 @@ func (r *Router) LogDecision(ctx context.Context, req RouteRequest, result *Rout
 	allScoresJSON, _ := toJSON(result.AllScores)
 	candidateDetailsJSON, _ := toJSON(result.CandidateDetails)
 	attemptsJSON := `[]` // 尝试记录在实际调用时填充
+	capabilitiesJSON, _ := toJSON(req.Capabilities)
+	groupIDsJSON, _ := toJSON(req.GroupIDs)
+	effectivePolicyJSON, _ := toJSON(result.Policy)
 
 	var selectedChannelID *int
 	if result.SelectedChannel != nil {
@@ -268,8 +295,10 @@ func (r *Router) LogDecision(ctx context.Context, req RouteRequest, result *Rout
 			request_id, token_id_hash, model, is_stream,
 			policy_version, strategy, epoch, snapshot_checksum,
 			candidate_order, excluded, all_scores, candidate_details,
-			attempts, selected_channel, decision_reason, group_id, decided_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
+			attempts, selected_channel, decision_reason, group_id,
+			capabilities, estimated_input, max_output, timeout_ms,
+			group_ids, effective_policy, decided_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, NOW())
 	`,
 		req.RequestID,
 		hashTokenID(req.TokenID),
@@ -287,6 +316,12 @@ func (r *Router) LogDecision(ctx context.Context, req RouteRequest, result *Rout
 		selectedChannelID,
 		result.DecisionReason,
 		result.GroupID,
+		capabilitiesJSON,
+		req.EstimatedInput,
+		req.MaxOutput,
+		req.TimeoutMS,
+		groupIDsJSON,
+		effectivePolicyJSON,
 	)
 
 	return err

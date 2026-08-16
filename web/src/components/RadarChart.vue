@@ -18,6 +18,20 @@ const R = 116
 const LABEL_R = 140
 
 const dimVal = (d, key) => Number(d?.dims?.[key] ?? 50)
+
+// 悬停提示优先显示真实指标（费用/延迟/成功率等），无真实指标时回退抽象分
+const roleLabel = r => ({ primary: '主力', backup: '备用', emergency: '应急' }[r] || r || '—')
+function fmtTipVal(d, key) {
+  const r = d?.raw || {}
+  switch (key) {
+    case 'cost': return r.cost_usd != null ? '$' + Number(r.cost_usd).toFixed(6) : dimVal(d, key).toFixed(1)
+    case 'reliability': return r.reliability != null ? (Number(r.reliability) * 100).toFixed(1) + '%' : dimVal(d, key).toFixed(1)
+    case 'latency': return r.ttft_ms != null ? r.ttft_ms + 'ms' : '无数据'
+    case 'load': return r.recent_attempts != null ? r.recent_attempts + ' 次' : dimVal(d, key).toFixed(1)
+    case 'priority': return r.role ? roleLabel(r.role) + '·' + (r.user_priority ?? '') : dimVal(d, key).toFixed(1)
+    default: return dimVal(d, key).toFixed(1)
+  }
+}
 const angle = i => (-90 + i * 60) * Math.PI / 180
 const pt = (r, i) => [C + r * Math.cos(angle(i)), C + r * Math.sin(angle(i))]
 const rFor = v => Math.max(8, Math.min(R, (v / 100) * R))
@@ -166,7 +180,7 @@ const tipDetail = computed(() => shapes.value[tip.value.idx] || null)
           </div>
           <div v-for="dl in dims" :key="dl.key" class="tip-row">
             <span class="tip-label" :style="{ color: dl.color }">{{ dl.label }}</span>
-            <span class="tip-val">{{ dimVal(tipDetail, dl.key).toFixed(1) }}</span>
+            <span class="tip-val">{{ fmtTipVal(tipDetail, dl.key) }}</span>
           </div>
         </div>
       </Transition>

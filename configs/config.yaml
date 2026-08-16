@@ -2,7 +2,14 @@ server:
   port: 8080
   read_timeout: 30s
   write_timeout: 0        # 0 = 不限：SSE 流式与长推理响应不能被 30s 写超时掐断
+  read_header_timeout: 10s   # 慢速请求防护（P2-06）
+  idle_timeout: 120s
+  max_header_bytes: 1048576  # 1 MiB
   bootstrap_default_keys: false  # 生产关闭：空库时生成随机管理员 Key（仅日志打印一次）
+  allowed_origins: []         # CORS 白名单；空 = 允许任意来源（本地开发）。生产建议填写可信前端域名
+  metrics_token: ""           # 非空时 /metrics 需要 Authorization: Bearer <token>（P2-09）
+  allow_private_upstream: false  # SSRF 防护：生产禁止私网/环回上游
+  allow_http_upstream: false     # SSRF 防护：生产仅允许 https 上游
 
 database:
   postgres:
@@ -17,6 +24,13 @@ database:
     password: ""
     db: 0
 
+security:
+  # 上游凭据信封加密密钥（base64 编码的 32 字节 AES-256 密钥）。
+  # 生产请通过环境变量 SR_ENC_KEY 注入；生成方式：
+  #   openssl rand -base64 32
+  # 留空 = 明文存储（仅限本地开发，启动时会有安全告警）。
+  encryption_key: ""
+
 checker:
   alive_interval: 30s
   pricing_interval: 10m
@@ -30,7 +44,7 @@ checker:
 routing:
   default_strategy: custom_priority
   max_attempts: 3
-  total_budget_ms: 15000
+  total_budget_ms: 30000
   retry_before_first_byte_only: true
   allow_emergency_pool: false
   tie_breaker: stable

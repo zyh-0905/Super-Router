@@ -89,4 +89,24 @@ var (
 		},
 		[]string{"from_channel", "to_channel", "reason"},
 	)
+
+	// AdminRequestsTotal 管理/健康/指标等非推理 HTTP 请求数（P2-08：与业务指标分离，
+	// 避免 /admin、/health、/metrics 污染推理 QPS/成功率告警）
+	AdminRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "smart_router_admin_requests_total",
+			Help: "Total number of non-inference HTTP requests (admin/health/metrics)",
+		},
+		[]string{"route", "status"},
+	)
+
+	// AdminRequestDuration 管理/健康/指标请求延迟
+	AdminRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "smart_router_admin_request_duration_seconds",
+			Help:    "Duration of non-inference HTTP requests in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"route"},
+	)
 )

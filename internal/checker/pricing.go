@@ -13,15 +13,17 @@ import (
 )
 
 type PricingChecker struct {
-	db     *store.DB
-	logger *zap.Logger
-	client *http.Client
+	db        *store.DB
+	logger    *zap.Logger
+	client    *http.Client
+	cryptoKey string
 }
 
-func NewPricingChecker(db *store.DB, logger *zap.Logger) *PricingChecker {
+func NewPricingChecker(db *store.DB, logger *zap.Logger, cryptoKey string) *PricingChecker {
 	return &PricingChecker{
-		db:     db,
-		logger: logger,
+		db:        db,
+		logger:    logger,
+		cryptoKey: cryptoKey,
 		client: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -98,6 +100,12 @@ func (p *PricingChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) 
 		); err != nil {
 			return nil, err
 		}
+		// 凭据解密（P1-07）：失败时跳过该渠道
+		if err := DecryptCreds(&u, p.cryptoKey); err != nil {
+			p.logger.Warn("Decrypt upstream credentials failed, channel skipped",
+				zap.Int("channel_id", u.ID), zap.Error(err))
+			continue
+		}
 		upstreams = append(upstreams, u)
 	}
 
@@ -110,9 +118,13 @@ func (p *PricingChecker) SyncChannel(ctx context.Context, upstream Upstream, epo
 }
 
 func (p *PricingChecker) syncOne(ctx context.Context, upstream Upstream, epoch int64) error {
+	// P2-07：渠道 timeout_total_ms 映射为请求上下文超时（15s 客户端上限兜底）
+	reqCtx, cancel := withUpstreamTimeout(ctx, upstream, 15*time.Second)
+	defer cancel()
+
 	// 尝试 GET /api/pricing（需要 Access Token）
 	url := fmt.Sprintf("%s/api/pricing", upstream.BaseURL)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}

@@ -33,15 +33,17 @@ type Upstream struct {
 }
 
 type AliveChecker struct {
-	db     *store.DB
-	logger *zap.Logger
-	client *http.Client
+	db        *store.DB
+	logger    *zap.Logger
+	client    *http.Client
+	cryptoKey string
 }
 
-func NewAliveChecker(db *store.DB, logger *zap.Logger) *AliveChecker {
+func NewAliveChecker(db *store.DB, logger *zap.Logger, cryptoKey string) *AliveChecker {
 	return &AliveChecker{
-		db:     db,
-		logger: logger,
+		db:        db,
+		logger:    logger,
+		cryptoKey: cryptoKey,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -104,6 +106,12 @@ func (a *AliveChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 		); err != nil {
 			return nil, err
 		}
+		// 凭据解密（P1-07）：失败时跳过该渠道
+		if err := DecryptCreds(&u, a.cryptoKey); err != nil {
+			a.logger.Warn("Decrypt upstream credentials failed, channel skipped",
+				zap.Int("channel_id", u.ID), zap.Error(err))
+			continue
+		}
 		upstreams = append(upstreams, u)
 	}
 
@@ -120,9 +128,13 @@ func (a *AliveChecker) checkOne(ctx context.Context, upstream Upstream, epoch in
 	isAlive := false
 	var latencyMS int
 
+	// P2-07：渠道 timeout_total_ms 映射为请求上下文超时（10s 客户端上限兜底）
+	reqCtx, cancel := withUpstreamTimeout(ctx, upstream, 10*time.Second)
+	defer cancel()
+
 	// 尝试 GET /v1/models
 	url := protocol.ModelsEndpoint(upstream.BaseURL)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}

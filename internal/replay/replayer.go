@@ -2,6 +2,7 @@ package replay
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -30,7 +31,8 @@ func (r *Replayer) SetPolicyDefaults(d router.PolicyDefaults) {
 	r.router.SetPolicyDefaults(d)
 }
 
-// Replay 执行重放
+// Replay 执行重放（P1-05：优先使用历史归档快照与生效策略快照做确定性重放；
+// 归档/策略缺失的决策标记为当前环境模拟，并在报告中明确非确定性）。
 func (r *Replayer) Replay(ctx context.Context, req ReplayRequest) (*Report, error) {
 	// 1. 加载历史决策日志
 	decisions, err := r.loadDecisions(ctx, req)
@@ -52,6 +54,7 @@ func (r *Replayer) Replay(ctx context.Context, req ReplayRequest) (*Report, erro
 	successCount := 0
 	failedCount := 0
 	changedCount := 0
+	deterministicCount := 0
 
 	for _, decision := range decisions {
 		result, err := r.replayOne(ctx, decision, req.NewStrategy)
@@ -65,6 +68,9 @@ func (r *Replayer) Replay(ctx context.Context, req ReplayRequest) (*Report, erro
 		if result.ChannelChanged {
 			changedCount++
 		}
+		if result.Deterministic {
+			deterministicCount++
+		}
 		results = append(results, *result)
 	}
 
@@ -72,6 +78,11 @@ func (r *Replayer) Replay(ctx context.Context, req ReplayRequest) (*Report, erro
 	changedRate := 0.0
 	if successCount > 0 {
 		changedRate = float64(changedCount) / float64(successCount)
+	}
+
+	note := ""
+	if deterministicCount < successCount {
+		note = fmt.Sprintf("其中 %d 条决策因历史快照归档/策略快照缺失而基于当前环境模拟，其结果不可作为当时决策的审计证据（非确定性）", successCount-deterministicCount)
 	}
 
 	report := &Report{
@@ -83,18 +94,24 @@ func (r *Replayer) Replay(ctx context.Context, req ReplayRequest) (*Report, erro
 		StrategyUsed:        req.NewStrategy,
 		TimeRange:           fmt.Sprintf("%s to %s", req.StartTime.Format(time.RFC3339), req.EndTime.Format(time.RFC3339)),
 		GeneratedAt:         time.Now(),
+		DeterministicCount:  deterministicCount,
+		SimulatedCount:      successCount - deterministicCount,
+		Note:                note,
 		Details:             results,
 	}
 
 	return report, nil
 }
 
-// loadDecisions 从数据库加载历史决策
+// loadDecisions 从数据库加载历史决策（含重放上下文）
 func (r *Replayer) loadDecisions(ctx context.Context, req ReplayRequest) ([]DecisionLog, error) {
 	query := `
 		SELECT id, request_id, token_id_hash, model, is_stream,
 		       policy_version, strategy, epoch, snapshot_checksum,
-		       candidate_order, selected_channel, decision_reason, decided_at
+		       candidate_order, selected_channel, decision_reason, group_id,
+		       COALESCE(capabilities::text, '[]'), estimated_input, max_output, timeout_ms,
+		       COALESCE(group_ids::text, '[]'), COALESCE(effective_policy::text, '{}'),
+		       decided_at
 		FROM decision_logs
 		WHERE 1=1
 	`
@@ -137,7 +154,7 @@ func (r *Replayer) loadDecisions(ctx context.Context, req ReplayRequest) ([]Deci
 	var decisions []DecisionLog
 	for rows.Next() {
 		var d DecisionLog
-		var candidateOrder []byte
+		var candidateOrder, capabilitiesJSON, groupIDsJSON, effectivePolicyJSON []byte
 
 		err := rows.Scan(
 			&d.ID,
@@ -152,16 +169,30 @@ func (r *Replayer) loadDecisions(ctx context.Context, req ReplayRequest) ([]Deci
 			&candidateOrder,
 			&d.SelectedChannel,
 			&d.DecisionReason,
+			&d.GroupID,
+			&capabilitiesJSON,
+			&d.EstimatedInput,
+			&d.MaxOutput,
+			&d.TimeoutMS,
+			&groupIDsJSON,
+			&effectivePolicyJSON,
 			&d.DecidedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan: %w", err)
 		}
 
-		// 解析 candidate_order JSON
+		// 解析 JSON 字段
 		if err := parseJSONArray(candidateOrder, &d.CandidateOrder); err != nil {
 			return nil, fmt.Errorf("parse candidate_order: %w", err)
 		}
+		if err := parseJSONArray(capabilitiesJSON, &d.Capabilities); err != nil {
+			return nil, fmt.Errorf("parse capabilities: %w", err)
+		}
+		if err := parseJSONArray(groupIDsJSON, &d.GroupIDs); err != nil {
+			return nil, fmt.Errorf("parse group_ids: %w", err)
+		}
+		d.EffectivePolicy = effectivePolicyJSON
 
 		decisions = append(decisions, d)
 	}
@@ -173,17 +204,62 @@ func (r *Replayer) loadDecisions(ctx context.Context, req ReplayRequest) ([]Deci
 	return decisions, nil
 }
 
-// replayOne 重放单个决策
+// loadArchivedSnapshot 按内容哈希加载历史归档快照（P1-05）。
+// 未找到时返回 nil（调用方标记为当前环境模拟）。
+func (r *Replayer) loadArchivedSnapshot(ctx context.Context, checksum string) *router.HealthSnapshot {
+	if checksum == "" {
+		return nil
+	}
+	var payload []byte
+	err := r.db.Pool.QueryRow(ctx, `
+		SELECT payload::text FROM snapshot_archive WHERE checksum = $1
+	`, checksum).Scan(&payload)
+	if err != nil {
+		return nil
+	}
+	var snapshot router.HealthSnapshot
+	if err := json.Unmarshal(payload, &snapshot); err != nil {
+		return nil
+	}
+	return &snapshot
+}
+
+// replayOne 重放单个决策（确定性：历史归档快照 + 生效策略快照 + 完整路由上下文）
 func (r *Replayer) replayOne(ctx context.Context, decision DecisionLog, newStrategy string) (*ReplayResult, error) {
-	// 构建路由请求（使用历史数据）
-	// 说明：决策日志只存 token 的 SHA256 哈希，无法还原原始 token，
-	// 因此 Token 级专属策略在重放时查不到（会落到分组/系统默认）——已知限制。
+	deterministic := true
+
+	// 历史归档快照（不可变）；缺失 → 当前环境模拟
+	archived := r.loadArchivedSnapshot(ctx, decision.SnapshotChecksum)
+	if archived == nil {
+		deterministic = false
+	}
+
+	// 生效策略快照；缺失 → 回退当前策略查找链（非确定性）
+	var overridePolicy *router.Policy
+	if len(decision.EffectivePolicy) > 0 {
+		var p router.Policy
+		if err := json.Unmarshal(decision.EffectivePolicy, &p); err == nil && p.Strategy != "" {
+			overridePolicy = &p
+		} else {
+			deterministic = false
+		}
+	} else {
+		deterministic = false
+	}
+
 	routeReq := router.RouteRequest{
 		RequestID:        decision.RequestID + "-replay",
 		Model:            decision.Model,
 		IsStream:         decision.IsStream,
+		Capabilities:     decision.Capabilities,
+		EstimatedInput:   decision.EstimatedInput,
+		MaxOutput:        decision.MaxOutput,
+		TimeoutMS:        decision.TimeoutMS,
+		GroupID:          decision.GroupID,
+		GroupIDs:         decision.GroupIDs,
+		OverridePolicy:   overridePolicy,
 		OverrideStrategy: newStrategy,
-		// 其他字段（能力/预算/分组）决策日志未记录，使用默认值
+		ReplaySnapshot:   archived,
 	}
 
 	// 重新执行路由决策
@@ -213,6 +289,7 @@ func (r *Replayer) replayOne(ctx context.Context, decision DecisionLog, newStrat
 		Epoch:           decision.Epoch,
 		Model:           decision.Model,
 		Strategy:        decision.Strategy,
+		Deterministic:   deterministic,
 		DecidedAt:       decision.DecidedAt,
 	}
 

@@ -28,10 +28,12 @@ docker compose -p smart-router logs -f gateway checker
 | 服务 | 地址 | 说明 |
 |-----|------|------|
 | Web 控制台 | http://localhost:8080/ | Gateway 同端口托管 |
-| Gateway Health | http://localhost:8080/health | 健康检查（无认证） |
-| Metrics | http://localhost:8080/metrics | Prometheus 指标 |
+| Gateway Health | http://localhost:8080/health | liveness（无认证） |
+| Gateway Ready | http://localhost:8080/ready | readiness（检查 PostgreSQL/Redis） |
+| Metrics | http://localhost:8080/metrics | Prometheus 指标（配置 metrics_token 后需 Bearer） |
 | Admin API | http://localhost:8080/admin/* | 管理接口（`Authorization: Bearer test-admin-key`） |
-| Prometheus | http://localhost:9090 | 监控（`./start-monitoring.sh`） |
+| Prometheus | http://localhost:9090 | 监控（`./start-monitoring.sh` 或 compose `--profile monitoring`） |
+| Alertmanager | http://localhost:9093 | 告警通知出口（编辑 `alertmanager.yml` 接入渠道） |
 | Grafana | http://localhost:3001 | 仪表板 |
 
 ## 🔑 默认凭证
@@ -66,7 +68,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 | 操作 | 方式 |
 |-----|------|
-| 创建/配置分组 | Web「站点 → 管理分组」（策略/熔断/检测间隔全覆盖，0=跟随全局） |
+| 创建/配置分组 | Web「站点 → 管理分组」（健康检测/熔断参数全覆盖） |
+| **路由策略** | Web「策略中心」：按「系统默认」或每个分组配置；卡片选择 + 加权均衡权重滑块；分组可一键恢复跟随系统默认 |
 | 站点归属分组 | 站点编辑表单（多选）；新建默认归入「默认分组」 |
 | 请求指定分组 | body `"group":"组名"` 或 `X-Group` 头（支持名称/ID） |
 | Key 绑定分组 | Web「设置 → API Keys → 分组」；未指定组时自动限定绑定组并集 |
@@ -96,14 +99,16 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ## 🛠 常用运维命令
 
 ```bash
-# 决策重放
+# 决策重放（确定性：基于历史归档快照；缺失时标记为环境模拟）
 go build -o bin/replay ./cmd/replay
 ./bin/replay --start "2026-08-13T00:00:00Z" --end "2026-08-13T23:59:59Z"
 
-# 监控（Prometheus + Grafana）
+# 监控（Prometheus + Alertmanager + Grafana）
 ./start-monitoring.sh
+# 或仅 Prometheus + Alertmanager：
+docker compose --profile monitoring -p smart-router up -d
 
-# 数据库直连
+# 数据库直连（迁移由应用启动时自动执行，无需手工跑 SQL）
 docker exec -it smart-router-db psql -U gateway -d smart_router
 
 # Compose 日志

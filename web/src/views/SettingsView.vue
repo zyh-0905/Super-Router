@@ -7,6 +7,9 @@ import EmptyState from '../components/EmptyState.vue'
 import Icon from '../components/Icon.vue'
 import { fmtDate, maskKey } from '../utils'
 
+// 开发环境标识（模板中 import.meta 表达式不可用，统一在此取值）
+const isDev = import.meta.env.DEV
+
 // ===== 连接 =====
 const connTest = ref(null)
 const testing = ref(false)
@@ -267,8 +270,8 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
         </div>
         <div class="field">
           <label class="field-label">API Key（Bearer Token）</label>
-          <input v-model="keyDraft" type="password" class="input mono" placeholder="test-admin-key" @keyup.enter="saveConn">
-          <div class="field-hint">本地开发默认 Key：<span class="mono">test-admin-key</span>（仅 config.local.yaml 开启引导时自动创建；生产环境使用启动日志中生成的一次性管理员 Key）</div>
+          <input v-model="keyDraft" type="password" class="input mono" :placeholder="isDev ? 'test-admin-key' : '请输入管理员 API Key'" @keyup.enter="saveConn">
+          <div v-if="isDev" class="field-hint">本地开发默认 Key：<span class="mono">test-admin-key</span>（仅 config.local.yaml 开启引导时自动创建；生产环境使用启动日志中生成的一次性管理员 Key）</div>
         </div>
         <div class="row gap-2">
           <button class="btn btn-ghost" @click="testConn" :disabled="testing"><Icon name="plug" :size="14" />{{ testing ? '测试中…' : '测试连接' }}</button>

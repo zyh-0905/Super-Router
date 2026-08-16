@@ -9,9 +9,12 @@ import (
 	"time"
 
 	"smart-router/internal/config"
+	"smart-router/internal/migrate"
 	"smart-router/internal/replay"
 	"smart-router/internal/router"
 	"smart-router/internal/store"
+
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -42,6 +45,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+
+	// 启动时执行版本化迁移（P2-12）
+	mctx, mcancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer mcancel()
+	if err := migrate.Up(mctx, db.Pool, zap.NewNop()); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: 数据库迁移失败: %v\n", err)
+		os.Exit(1)
+	}
 
 	redis, err := store.NewRedis(cfg.Database.Redis)
 	if err != nil {

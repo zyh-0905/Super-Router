@@ -34,14 +34,20 @@ end
 return 0
 `)
 
-func halfOpenProbeKey(channelID int, model string) string {
-	return fmt.Sprintf("circuit:probe:%d:%s", channelID, model)
+// halfOpenProbeKey 半开探测名额键：按 (渠道, 模型, 分组桶) 隔离（P1-04），
+// 分组桶 0 = 全局。groupID 为 nil 时使用全局桶。
+func halfOpenProbeKey(channelID int, model string, groupID *int) string {
+	bucket := 0
+	if groupID != nil {
+		bucket = *groupID
+	}
+	return fmt.Sprintf("circuit:probe:%d:%s:%d", channelID, model, bucket)
 }
 
 // ReserveHalfOpenProbe 为半开渠道预约一个探测名额，返回是否预约成功。
 // limit <= 0 表示不允许探测；Redis 完全不可用时返回错误（调用方应保守跳过该候选），
 // 仅当本进程未配置 Redis（nil）时退化为放行，避免半开渠道永久无法恢复。
-func (r *Router) ReserveHalfOpenProbe(ctx context.Context, channelID int, model string, limit int) (bool, error) {
+func (r *Router) ReserveHalfOpenProbe(ctx context.Context, channelID int, model string, groupID *int, limit int) (bool, error) {
 	if limit <= 0 {
 		return false, nil
 	}
@@ -49,7 +55,7 @@ func (r *Router) ReserveHalfOpenProbe(ctx context.Context, channelID int, model 
 		return true, nil
 	}
 	n, err := reserveHalfOpenProbeScript.Run(ctx, r.redis.Client,
-		[]string{halfOpenProbeKey(channelID, model)},
+		[]string{halfOpenProbeKey(channelID, model, groupID)},
 		int(halfOpenProbeTTL.Seconds()), limit).Int()
 	if err != nil {
 		return false, err
@@ -58,10 +64,10 @@ func (r *Router) ReserveHalfOpenProbe(ctx context.Context, channelID int, model 
 }
 
 // ReleaseHalfOpenProbe 释放半开探测名额（探测结束后调用，幂等）
-func (r *Router) ReleaseHalfOpenProbe(ctx context.Context, channelID int, model string) {
+func (r *Router) ReleaseHalfOpenProbe(ctx context.Context, channelID int, model string, groupID *int) {
 	if r.redis == nil || r.redis.Client == nil {
 		return
 	}
 	_, _ = releaseHalfOpenProbeScript.Run(ctx, r.redis.Client,
-		[]string{halfOpenProbeKey(channelID, model)}).Result()
+		[]string{halfOpenProbeKey(channelID, model, groupID)}).Result()
 }

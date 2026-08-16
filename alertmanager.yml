@@ -1,0 +1,27 @@
+# Alertmanager 配置（P2-10：告警通知出口）
+# 当前接收器为占位（告警只进入 Alertmanager 内部状态与 UI），
+# 接入真实通知渠道时取消注释并填写 webhook / email 等配置，
+# 完成一次告警演练后再投入生产。
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname', 'component']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'default'
+
+receivers:
+  - name: 'default'
+    # 示例：企业微信/钉钉/Slack webhook
+    # webhook_configs:
+    #   - url: 'https://your-webhook.example.com/alert'
+    #     send_resolved: true
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'component']

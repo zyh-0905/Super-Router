@@ -7,25 +7,30 @@
 ```bash
 docker compose -p smart-router up -d --build
 
-# 确认 Gateway 已暴露 /metrics 后，再启动 Prometheus + Grafana
+# 确认 Gateway 已暴露 /metrics 后，再启动监控：
+# 方式 A：脚本（Prometheus + Alertmanager + Grafana）
 ./start-monitoring.sh
+# 方式 B：Compose profile（Prometheus + Alertmanager）
+docker compose --profile monitoring -p smart-router up -d
 ```
 
-`start-monitoring.sh` 是 Bash 脚本。Windows 请在 Git Bash 或 WSL 中执行；也可以按脚本内容使用 Docker Desktop 手工启动两个监控容器。脚本会停止并删除同名的 Prometheus/Grafana 容器后重建，但不会触碰 Smart Router 数据卷。
+`start-monitoring.sh` 是 Bash 脚本。Windows 请在 Git Bash 或 WSL 中执行；也可以按脚本内容使用 Docker Desktop 手工启动监控容器。脚本会停止并删除同名的 Prometheus/Alertmanager/Grafana 容器后重建，但不会触碰 Smart Router 数据卷。
 
 | 服务 | URL | 凭证 |
 |-----|-----|------|
-| Gateway Health | http://localhost:8080/health | - |
-| Metrics | http://localhost:8080/metrics | - |
+| Gateway Health (liveness) | http://localhost:8080/health | - |
+| Gateway Ready (readiness) | http://localhost:8080/ready | 检查 PostgreSQL/Redis |
+| Metrics | http://localhost:8080/metrics | 配置 `metrics_token` 后需 Bearer |
 | Admin API | http://localhost:8080/admin/* | Bearer test-admin-key |
 | Prometheus | http://localhost:9090 | - |
+| Alertmanager | http://localhost:9093 | 接收器在 `alertmanager.yml` 配置 |
 | Grafana | http://localhost:3001 | admin / admin |
 
-## 📊 核心指标（9 个）
+## 📊 核心指标（11 个）
 
 | 指标 | 类型 | 说明 |
 |-----|------|------|
-| `smart_router_requests_total` | Counter | 总请求数（按渠道/模型/结果） |
+| `smart_router_requests_total` | Counter | 推理请求数（按渠道/模型/结果；结果含 success/upstream_error/stream_interrupted/no_upstream） |
 | `smart_router_request_duration_seconds` | Histogram | 端到端延迟 |
 | `smart_router_routing_duration_seconds` | Histogram | 路由决策耗时 |
 | `smart_router_snapshot_load_duration_seconds` | Histogram | 快照加载耗时 |
@@ -34,6 +39,8 @@ docker compose -p smart-router up -d --build
 | `smart_router_proxy_requests_total` | Counter | 上游调用数 |
 | `smart_router_proxy_duration_seconds` | Histogram | 上游延迟 |
 | `smart_router_failover_total` | Counter | 故障切换次数 |
+| `smart_router_admin_requests_total` | Counter | 管理/健康/指标请求数（与业务指标分离，不污染告警） |
+| `smart_router_admin_request_duration_seconds` | Histogram | 管理请求延迟 |
 
 ## 🚨 告警规则（13 条）
 

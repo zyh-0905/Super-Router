@@ -25,30 +25,6 @@ const (
 	maxManualProbeTokens     = 256
 )
 
-// 手动探测预算原子预留（Redis，按自然日键）：防止并发探测 check-then-act 超支
-var reserveProbeBudgetScript = redis.NewScript(`
-local ch = tonumber(redis.call('get', KEYS[1]) or '0')
-local gl = tonumber(redis.call('get', KEYS[2]) or '0')
-local r = tonumber(ARGV[1])
-if ch + r > tonumber(ARGV[2]) or gl + r > tonumber(ARGV[3]) then
-	return 0
-end
-redis.call('set', KEYS[1], ch + r, 'EX', 172800)
-redis.call('set', KEYS[2], gl + r, 'EX', 172800)
-return 1
-`)
-
-var refundProbeBudgetScript = redis.NewScript(`
-local ch = tonumber(redis.call('get', KEYS[1]) or '0')
-local gl = tonumber(redis.call('get', KEYS[2]) or '0')
-local r = tonumber(ARGV[1])
-ch = math.max(0, ch - r)
-gl = math.max(0, gl - r)
-redis.call('set', KEYS[1], ch, 'EX', 172800)
-redis.call('set', KEYS[2], gl, 'EX', 172800)
-return 1
-`)
-
 // 带所有权的锁释放：仅当 token 匹配才删除，避免误删他方持有的锁
 var releaseOwnedLockScript = redis.NewScript(`
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -56,12 +32,6 @@ if redis.call('get', KEYS[1]) == ARGV[1] then
 end
 return 0
 `)
-
-func probeBudgetKeys(channelID int) (string, string) {
-	day := time.Now().Format("2006-01-02")
-	return fmt.Sprintf("ratio:budget:%d:%s", channelID, day),
-		fmt.Sprintf("ratio:budget:global:%s", day)
-}
 
 // RatioHandler 实时倍率：声明/实测查询 + 按需手动实测
 type RatioHandler struct {
@@ -95,6 +65,10 @@ func (h *RatioHandler) loadUpstream(ctx context.Context, channelID int) (*checke
 	if err != nil {
 		return nil, nil, err
 	}
+	// 凭据解密（P1-07）
+	if err := checker.DecryptCreds(&u, h.cfg.Security.EncryptionKey); err != nil {
+		return nil, nil, err
+	}
 	mapping := map[string]string{}
 	_ = json.Unmarshal(mmJSON, &mapping)
 	return &u, mapping, nil
@@ -111,12 +85,13 @@ func clampProbeTokens(n int) int {
 	return n
 }
 
-// channelEffectiveBudget 站点有效探测预算：站点自身 > 所属分组最小值 > 全局。
+// channelEffectiveBudget 站点有效探测预算：min(全局, 渠道自身, 所属分组)（P1-06）。
 // 禁用站点不在调度表内（LoadSchedules 仅加载启用站点），回退全局预算。
 func (h *RatioHandler) channelEffectiveBudget(ctx context.Context, channelID int, globalBudget float64) float64 {
 	schedules, err := checker.LoadSchedules(ctx, h.db,
 		h.cfg.Checker.AliveInterval, h.cfg.Checker.PricingInterval,
-		h.cfg.Checker.ProbeInterval, h.cfg.Checker.BalanceInterval, globalBudget)
+		h.cfg.Checker.ProbeInterval, h.cfg.Checker.BalanceInterval, globalBudget,
+		h.cfg.Security.EncryptionKey)
 	if err != nil {
 		return globalBudget
 	}
@@ -147,12 +122,12 @@ func (h *RatioHandler) latestDeclared(ctx context.Context, channelID int, model 
 
 func declaredEntry(model string, promptRatio, completionRatio float64, checkedAt time.Time) map[string]interface{} {
 	return map[string]interface{}{
-		"model":                 model,
-		"prompt_ratio":          promptRatio,
-		"completion_ratio":      completionRatio,
-		"prompt_price_per_m":    round2(promptRatio * 10.0), // 基准 $10/1M
+		"model":                  model,
+		"prompt_ratio":           promptRatio,
+		"completion_ratio":       completionRatio,
+		"prompt_price_per_m":     round2(promptRatio * 10.0), // 基准 $10/1M
 		"completion_price_per_m": round2(completionRatio * 10.0),
-		"checked_at":            checkedAt.Format(time.RFC3339),
+		"checked_at":             checkedAt.Format(time.RFC3339),
 	}
 }
 
@@ -482,34 +457,38 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		}, 429
 	}
 
-	// 原子预留预算（Redis）：按预估单次成本预留，探测结束后按实际成本退还，
-	// 防止并发探测 check-then-act 导致超支。
+	// 原子预留预算（Redis，与定时探针共享记账器，P1-06）：按预估单次成本预留，
+	// 探测结束后按实际成本结算，防止并发探测 check-then-act 导致超支。
 	priceIn, priceOut := h.modelPriceValues(ctx, model)
 	estCost := estimateProbeCost(maxTokens, priceIn, priceOut)
 	reserve := math.Min(estCost, math.Min(remainingGlobal, remainingChannel))
 	if reserve <= 0 {
 		return gin.H{"error": "今日探测预算已用完", "remaining_budget": round2(math.Min(remainingGlobal, remainingChannel))}, 429
 	}
-	budgetKeyCh, budgetKeyGl := probeBudgetKeys(channelID)
+	tracker := checker.NewBudgetTracker(h.redis)
 	reserved := false
-	refund := 0.0
-	if h.redis != nil && h.redis.Client != nil {
-		n, rerr := reserveProbeBudgetScript.Run(ctx, h.redis.Client,
-			[]string{budgetKeyCh, budgetKeyGl},
-			reserve, remainingChannel, remainingGlobal).Int()
+	var res *checker.ProbeResult
+	if tracker.Available() {
+		ok, rerr := tracker.Reserve(ctx, channelID,
+			checker.ToCentsForBudget(reserve),
+			checker.ToCentsForBudget(effectiveBudget),
+			checker.ToCentsForBudget(globalBudget))
 		if rerr != nil {
 			return gin.H{"error": "预算预留失败，探测已取消"}, 500
 		}
-		if n == 0 {
+		if !ok {
 			return gin.H{"error": "今日探测预算已用完（并发探测占用中）", "remaining_budget": round2(math.Min(remainingGlobal, remainingChannel))}, 429
 		}
 		reserved = true
-		refund = reserve
 	}
-	// 探测结束后按实际成本退还（失败全额退还；成功分支会把 refund 改写为 reserve-cost）
+	// 探测结束后按实际成本结算（失败全额退款；成功分支结算实际成本）
 	defer func() {
 		if reserved {
-			refundProbeBudgetScript.Run(ctx, h.redis.Client, []string{budgetKeyCh, budgetKeyGl}, refund)
+			actualCents := int64(0)
+			if res != nil && res.Cost > 0 {
+				actualCents = checker.ToCentsForBudget(res.Cost)
+			}
+			tracker.Adjust(ctx, channelID, actualCents-checker.ToCentsForBudget(reserve))
 		}
 	}()
 
@@ -518,7 +497,7 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		return gin.H{"error": "无法读取 epoch"}, 500
 	}
 
-	res, err := h.probe.ProbeModel(ctx, *upstream, epoch, model, maxTokens, checker.ProbeSourceManual)
+	res, err = h.probe.ProbeModel(ctx, *upstream, epoch, model, maxTokens, checker.ProbeSourceManual)
 	if err != nil {
 		h.logger.Warn("Manual ratio probe failed",
 			zap.Int("channel_id", channelID), zap.String("model", model), zap.Error(err))
@@ -538,14 +517,8 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		return gin.H{"error": msg, "stage": res.Stage}, 502
 	}
 
-	// 实测成功：失效快照缓存，让新倍率立即参与路由；按实际成本退还预留差额
+	// 实测成功：失效快照缓存，让新倍率立即参与路由（预算结算由 defer 完成）
 	router.InvalidateSnapshotCache(ctx, h.redis)
-	if reserved {
-		refund = reserve - res.Cost
-		if refund < 0 {
-			refund = 0
-		}
-	}
 
 	resp := gin.H{
 		"channel_id":        channelID,
@@ -874,12 +847,12 @@ func (h *RatioHandler) ListModelPrices(c *gin.Context) {
 // UpsertModelPrice POST /admin/model-prices - 添加/更新官方模型价格（路由立即生效）
 func (h *RatioHandler) UpsertModelPrice(c *gin.Context) {
 	var req struct {
-		Model            string  `json:"model" binding:"required"`
-		InputPricePerM   float64 `json:"input_price_per_m"`
-		OutputPricePerM  float64 `json:"output_price_per_m"`
-		CachedReadPerM   float64 `json:"cached_read_per_m"`
-		CachedWritePerM  float64 `json:"cached_write_per_m"`
-		Note             string  `json:"note"`
+		Model           string  `json:"model" binding:"required"`
+		InputPricePerM  float64 `json:"input_price_per_m"`
+		OutputPricePerM float64 `json:"output_price_per_m"`
+		CachedReadPerM  float64 `json:"cached_read_per_m"`
+		CachedWritePerM float64 `json:"cached_write_per_m"`
+		Note            string  `json:"note"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})

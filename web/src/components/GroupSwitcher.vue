@@ -4,6 +4,7 @@ import { computed, onMounted } from 'vue'
 import { store } from '../store'
 import { api } from '../api'
 import Icon from './Icon.vue'
+import SelectBox from './SelectBox.vue'
 
 const props = defineProps({
   compact: { type: Boolean, default: false },
@@ -11,6 +12,11 @@ const props = defineProps({
 const emit = defineEmits(['change'])
 
 const groups = computed(() => store.groups || [])
+
+const groupOpts = computed(() => [
+  { value: null, label: '全部' },
+  ...groups.value.map(g => ({ value: g.id, label: `${g.name}（${g.channel_count}）` })),
+])
 
 async function ensureGroups() {
   if (!groups.value.length) {
@@ -34,14 +40,12 @@ onMounted(ensureGroups)
 <template>
   <div class="group-switch">
     <template v-if="compact">
-      <select
-        class="select" style="width:140px"
-        :value="store.currentGroup ?? ''"
-        @change="pick(groups.find(g => g.id === Number($event.target.value)) || null)"
-      >
-        <option value="">全部</option>
-        <option v-for="g in groups" :key="g.id" :value="g.id">{{ g.name }}（{{ g.channel_count }}）</option>
-      </select>
+      <SelectBox
+        :model-value="store.currentGroup"
+        :options="groupOpts"
+        width="140px"
+        @update:model-value="pick(groups.find(g => g.id === $event) || null)"
+      />
     </template>
     <template v-else>
       <div class="row gap-2" style="flex-wrap:wrap">

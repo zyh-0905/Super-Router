@@ -21,9 +21,9 @@ type HealthSnapshot struct {
 
 // ModelPrice 官方模型价格（$/1M）
 type ModelPrice struct {
-	Model       string  `json:"model"`
-	InputPerM   float64 `json:"input_per_m"`
-	OutputPerM  float64 `json:"output_per_m"`
+	Model      string  `json:"model"`
+	InputPerM  float64 `json:"input_per_m"`
+	OutputPerM float64 `json:"output_per_m"`
 }
 
 // ChannelHealth 单个渠道的健康数据
@@ -32,7 +32,7 @@ type ChannelHealth struct {
 	Name         string            `json:"name"`
 	BaseURL      string            `json:"base_url"`
 	Role         string            `json:"role"`
-	Protocol     string            `json:"protocol"` // openai（默认）| anthropic
+	Protocol     string            `json:"protocol"`   // openai（默认）| anthropic
 	RelayType    string            `json:"relay_type"` // newapi | sub2api | custom
 	Enabled      bool              `json:"enabled"`
 	UserPriority int               `json:"user_priority"`
@@ -41,25 +41,60 @@ type ChannelHealth struct {
 	Weight       int               `json:"weight"`
 	GroupIDs     []int             `json:"group_ids"`
 
+	// 数据库中的渠道级超时配置（代理层映射为 per-request 超时，P2-07）
+	TimeoutConnectMS   int `json:"timeout_connect_ms"`
+	TimeoutFirstByteMS int `json:"timeout_first_byte_ms"`
+	TimeoutTotalMS     int `json:"timeout_total_ms"`
+
 	// 从健康检测子系统读取
-	IsAlive       bool                     `json:"is_alive"`
-	DeclaredPrice map[string]*PriceProfile `json:"declared_price"`
-	RealRatio     map[string]float64       `json:"real_ratio"`
-	RealRatioBasis map[string]string       `json:"real_ratio_basis"` // official | baseline
+	IsAlive        bool                     `json:"is_alive"`
+	DeclaredPrice  map[string]*PriceProfile `json:"declared_price"`
+	RealRatio      map[string]float64       `json:"real_ratio"`
+	RealRatioBasis map[string]string        `json:"real_ratio_basis"` // official | baseline
 	// 探测当时使用的官网价快照（价格库调整后历史倍率仍保持一致）
 	RealRatioOfficialInPerM  map[string]float64 `json:"real_ratio_official_in_per_m"`
 	RealRatioOfficialOutPerM map[string]float64 `json:"real_ratio_official_out_per_m"`
-	TTFTP50       map[string]int           `json:"ttft_p50"`
-	TTFTP95       map[string]int           `json:"ttft_p95"`
+	TTFTP50                  map[string]int     `json:"ttft_p50"`
+	TTFTP95                  map[string]int     `json:"ttft_p95"`
 
 	// 从请求历史计算（滑动窗口）
 	RecentAttempts   int     `json:"recent_attempts"`
 	RecentSuccesses  int     `json:"recent_successes"`
 	ReliabilityScore float64 `json:"reliability_score"`
 
-	// 熔断状态
+	// 熔断状态（渠道级聚合，供仪表盘/指标使用）
 	CircuitState string    `json:"circuit_state"`
 	CoolingUntil time.Time `json:"cooling_until"`
+
+	// 分组级熔断状态（P1-04）：key 为 "0"（全局桶）或分组 ID 字符串。
+	// 每个分组桶内聚合该组所有模型行的最严重状态（已折算冷却到期 → half_open）。
+	CircuitStates map[string]string `json:"circuit_states"`
+}
+
+// circuitGroupKey 熔断分组桶键：nil → 全局桶 "0"。
+func circuitGroupKey(groupID *int) string {
+	if groupID == nil {
+		return "0"
+	}
+	return fmt.Sprintf("%d", *groupID)
+}
+
+// CircuitStateForGroup 取指定分组桶的熔断状态：
+// 优先分组专属桶，缺失时回退全局桶，再回退 closed。
+func (ch *ChannelHealth) CircuitStateForGroup(groupID *int) string {
+	if ch.CircuitStates == nil {
+		if ch.CircuitState == "" {
+			return "closed"
+		}
+		return ch.CircuitState
+	}
+	if s, ok := ch.CircuitStates[circuitGroupKey(groupID)]; ok {
+		return s
+	}
+	if s, ok := ch.CircuitStates["0"]; ok {
+		return s
+	}
+	return "closed"
 }
 
 // PriceProfile 价格配置
@@ -83,7 +118,8 @@ func InvalidateSnapshotCache(ctx context.Context, redis *store.RedisClient) {
 	redis.Client.Del(ctx, snapshotCacheKey)
 }
 
-// LoadSnapshot 加载当前快照（带 Redis 缓存）
+// LoadSnapshot 加载当前快照（带 Redis 缓存）。
+// 缓存未命中重建后，将快照按内容哈希归档到 snapshot_archive（供确定性重放，P1-05）。
 func LoadSnapshot(ctx context.Context, db *store.DB, redis *store.RedisClient) (*HealthSnapshot, error) {
 	// 1. 尝试从 Redis 读取缓存
 	if redis != nil {
@@ -102,16 +138,35 @@ func LoadSnapshot(ctx context.Context, db *store.DB, redis *store.RedisClient) (
 		return nil, err
 	}
 
-	// 3. 计算内容哈希
+	// 3. 计算内容哈希（不含 epoch：相同内容共享哈希，归档去重）
 	snapshot.ContentHash = computeSnapshotHash(snapshot)
 
-	// 4. 写入 Redis 缓存
+	// 4. 归档历史快照（best-effort：归档失败不影响路由，仅影响重放确定性）
+	archiveSnapshot(ctx, db, snapshot)
+
+	// 5. 写入 Redis 缓存
 	if redis != nil {
 		data, _ := json.Marshal(snapshot)
 		redis.Client.Set(ctx, snapshotCacheKey, data, snapshotCacheTTL)
 	}
 
 	return snapshot, nil
+}
+
+// archiveSnapshot 将快照写入 snapshot_archive（按内容哈希去重）。
+func archiveSnapshot(ctx context.Context, db *store.DB, snapshot *HealthSnapshot) {
+	if snapshot == nil || snapshot.ContentHash == "" || db == nil || db.Pool == nil {
+		return
+	}
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return
+	}
+	_, _ = db.Pool.Exec(ctx, `
+		INSERT INTO snapshot_archive (checksum, payload)
+		VALUES ($1, $2)
+		ON CONFLICT (checksum) DO NOTHING
+	`, snapshot.ContentHash, string(payload))
 }
 
 func buildSnapshot(ctx context.Context, db *store.DB) (*HealthSnapshot, error) {
@@ -172,11 +227,12 @@ func buildSnapshot(ctx context.Context, db *store.DB) (*HealthSnapshot, error) {
 	return snapshot, nil
 }
 
-// loadChannels 读取所有渠道配置及其分组归属
+// loadChannels 读取所有渠道配置及其分组归属（含渠道级超时配置）
 func loadChannels(ctx context.Context, db *store.DB) ([]*ChannelHealth, error) {
 	rows, err := db.Pool.Query(ctx, `
 		SELECT id, name, base_url, enabled, role, protocol, relay_type, user_priority,
-		       model_mapping, capabilities, weight
+		       model_mapping, capabilities, weight,
+		       timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms
 		FROM upstreams
 	`)
 	if err != nil {
@@ -187,20 +243,22 @@ func loadChannels(ctx context.Context, db *store.DB) ([]*ChannelHealth, error) {
 	var channels []*ChannelHealth
 	for rows.Next() {
 		ch := &ChannelHealth{
-			DeclaredPrice: make(map[string]*PriceProfile),
-			RealRatio:     make(map[string]float64),
-			RealRatioBasis: make(map[string]string),
+			DeclaredPrice:            make(map[string]*PriceProfile),
+			RealRatio:                make(map[string]float64),
+			RealRatioBasis:           make(map[string]string),
 			RealRatioOfficialInPerM:  make(map[string]float64),
 			RealRatioOfficialOutPerM: make(map[string]float64),
-			TTFTP50:       make(map[string]int),
-			TTFTP95:       make(map[string]int),
-			GroupIDs:      []int{},
+			TTFTP50:                  make(map[string]int),
+			TTFTP95:                  make(map[string]int),
+			GroupIDs:                 []int{},
+			CircuitStates:            make(map[string]string),
 		}
 
 		var modelMappingJSON, capabilitiesJSON []byte
 		if err := rows.Scan(
 			&ch.ID, &ch.Name, &ch.BaseURL, &ch.Enabled, &ch.Role, &ch.Protocol, &ch.RelayType, &ch.UserPriority,
 			&modelMappingJSON, &capabilitiesJSON, &ch.Weight,
+			&ch.TimeoutConnectMS, &ch.TimeoutFirstByteMS, &ch.TimeoutTotalMS,
 		); err != nil {
 			return nil, err
 		}
@@ -366,33 +424,65 @@ func loadRequestHistory(ctx context.Context, db *store.DB, ch *ChannelHealth) er
 	return nil
 }
 
-// loadCircuitState 读取渠道级熔断状态（取该渠道所有模型行中的最严重状态）。
-// 说明：UpdateCircuitState 按 (channel_id, model) 写入各行，而快照/过滤器是渠道粒度的，
-// 因此聚合最严重状态作为渠道状态（open > degraded > half_open > closed）。
-// open 且冷却到期 → 视为 half_open（时间驱动转换，探测流量由代理层按名额限流）。
+// loadCircuitState 读取渠道的熔断状态（P1-04：按分组桶聚合）。
+// 每个分组桶（含全局桶 "0"）取该组所有模型行中的最严重状态
+// （open > degraded > half_open > closed），冷却到期折算为 half_open。
+// 同时保留渠道级最严重状态（CircuitState）供仪表盘/指标使用。
 func loadCircuitState(ctx context.Context, db *store.DB, ch *ChannelHealth) error {
-	err := db.Pool.QueryRow(ctx, `
-		SELECT
-			CASE
-				WHEN COUNT(*) FILTER (WHERE state = 'open') > 0 THEN 'open'
-				WHEN COUNT(*) FILTER (WHERE state = 'degraded') > 0 THEN 'degraded'
-				WHEN COUNT(*) FILTER (WHERE state = 'half_open') > 0 THEN 'half_open'
-				ELSE 'closed'
-			END AS worst_state,
-			COALESCE(MAX(cooling_until) FILTER (WHERE state = 'open'), '1970-01-01'::timestamp) AS cooling_until
+	rows, err := db.Pool.Query(ctx, `
+		SELECT COALESCE(group_id, 0) AS group_id, state, cooling_until
 		FROM circuit_states
 		WHERE channel_id = $1 AND capability = ''
-	`, ch.ID).Scan(&ch.CircuitState, &ch.CoolingUntil)
-
+	`, ch.ID)
 	if err != nil {
-		// 没有记录时默认 closed
-		ch.CircuitState = "closed"
-		ch.CoolingUntil = time.Time{}
-		return nil
+		return err
+	}
+	defer rows.Close()
+
+	// groupBucket: key → {worstState, maxCooling(open 行中最大值)}
+	type bucketAgg struct {
+		worstState string
+		maxCooling time.Time
+	}
+	groups := map[string]*bucketAgg{}
+
+	stateRank := map[string]int{"closed": 0, "half_open": 1, "degraded": 2, "open": 3}
+	consider := func(key, state string, cooling time.Time) {
+		b := groups[key]
+		if b == nil {
+			b = &bucketAgg{}
+			groups[key] = b
+		}
+		if stateRank[state] > stateRank[b.worstState] {
+			b.worstState = state
+		}
+		if state == "open" && (b.maxCooling.IsZero() || cooling.After(b.maxCooling)) {
+			b.maxCooling = cooling
+		}
 	}
 
-	ch.CircuitState = EffectiveCircuitState(ch.CircuitState, ch.CoolingUntil, time.Now())
-	return nil
+	for rows.Next() {
+		var groupID int
+		var state string
+		var coolingUntil time.Time
+		if err := rows.Scan(&groupID, &state, &coolingUntil); err != nil {
+			continue
+		}
+		consider(fmt.Sprintf("%d", groupID), state, coolingUntil)
+	}
+
+	ch.CircuitStates = make(map[string]string, len(groups))
+	overall := "closed"
+	for key, b := range groups {
+		eff := EffectiveCircuitState(b.worstState, b.maxCooling, time.Now())
+		ch.CircuitStates[key] = eff
+		if stateRank[eff] > stateRank[overall] {
+			overall = eff
+		}
+	}
+	ch.CircuitState = overall
+
+	return rows.Err()
 }
 
 // EffectiveCircuitState 时间驱动的状态换算：open 且冷却到期 → half_open。
@@ -404,14 +494,14 @@ func EffectiveCircuitState(state string, coolingUntil, now time.Time) string {
 	return state
 }
 
+// computeSnapshotHash 计算快照内容哈希（仅渠道与价格，不含 epoch 与时间戳）：
+// 相同内容共享哈希，snapshot_archive 以此去重，确定性重放按此查档。
 func computeSnapshotHash(snapshot *HealthSnapshot) string {
-	// 序列化快照内容（不包括 generated_at 和 content_hash 本身）
+	// 序列化快照内容（不包括 epoch/generated_at/content_hash 本身）
 	data, _ := json.Marshal(struct {
-		Epoch       int64                  `json:"epoch"`
 		Channels    map[int]*ChannelHealth `json:"channels"`
 		ModelPrices map[string]*ModelPrice `json:"model_prices"`
 	}{
-		Epoch:       snapshot.Epoch,
 		Channels:    snapshot.Channels,
 		ModelPrices: snapshot.ModelPrices,
 	})

@@ -2,11 +2,12 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '../api'
-import { store, toast } from '../store'
+import { store, toast, feedAlerts } from '../store'
 import StatCard from '../components/StatCard.vue'
 import BaseChart from '../components/BaseChart.vue'
 import EmptyState from '../components/EmptyState.vue'
 import GroupSwitcher from '../components/GroupSwitcher.vue'
+import RadarChart from '../components/RadarChart.vue'
 import Icon from '../components/Icon.vue'
 import { fmtTime, fmtNum, fmtMs, fmtPct, fmtAgo, fmtDate } from '../utils'
 
@@ -15,6 +16,30 @@ const loading = ref(true)
 const stats = ref(null)
 const decisions = ref([])
 const lastRefresh = ref('')
+
+// ---- 决策雷达（最近一次决策六维对比 + 近 10 次最优站点）----
+const radarDims = [
+  { key: 'cost', label: '成本', color: '#30d158' },
+  { key: 'reliability', label: '可靠性', color: '#0a84ff' },
+  { key: 'latency', label: '延迟', color: '#ff9f0a' },
+  { key: 'load', label: '负载', color: '#bf5af2' },
+  { key: 'priority', label: '优先级', color: '#ff375f' },
+  { key: 'composite', label: '综合', color: '#64d2ff' },
+]
+const latestDecision = computed(() => decisions.value[0] || null)
+// 当前雷达展示的决策：默认最近一次；点击右侧列表可切换任意一次
+const selectedDecisionId = ref(null)
+const activeDecision = computed(() =>
+  decisions.value.find(d => d.request_id === selectedDecisionId.value) || latestDecision.value || null)
+const activeDetails = computed(() => (activeDecision.value?.candidate_details || []).filter(d => d.dims))
+const activeIsLatest = computed(() =>
+  decisions.value.length > 0 && activeDecision.value?.request_id === decisions.value[0].request_id)
+const activeOrdinal = computed(() => {
+  const i = decisions.value.findIndex(d => d.request_id === activeDecision.value?.request_id)
+  return i >= 0 ? i + 1 : 1
+})
+const recentBest = computed(() => decisions.value.slice(0, 10))
+function selectDecision(d) { selectedDecisionId.value = d.request_id }
 
 const totals = computed(() => stats.value?.totals || {})
 
@@ -239,7 +264,7 @@ async function load() {
     stats.value = s
     store.stats = s
     store.groups = s.groups || []
-    store.alerts = s.alerts || []
+    feedAlerts(s.alerts || [])
     store.epoch = s.epoch != null ? String(s.epoch) : null
     decisions.value = d.decisions || []
     metrics.value = m
@@ -307,6 +332,61 @@ onMounted(load)
           <BaseChart v-if="!loading && (stats?.models || []).length" :option="modelOption" height="210px" />
           <div v-else-if="loading" class="skeleton" style="height:210px" />
           <EmptyState v-else icon="layers" title="暂无模型数据" style="padding:36px 0" />
+        </div>
+      </div>
+    </div>
+
+    <!-- 决策雷达：最近一次决策六维对比 + 近 10 次最优站点 -->
+    <div class="card mb-4">
+      <div class="card-head" style="flex-wrap:wrap;gap:8px">
+        决策雷达
+        <span class="sub">最近一次决策的六维对比 · 近 10 次最优站点{{ store.currentGroup ? '（当前分组内）' : '' }}</span>
+        <span class="spacer" />
+        <button class="btn btn-ghost btn-sm" @click="router.push('/decisions')">全部决策</button>
+      </div>
+      <div class="card-pad" style="padding-top:14px">
+        <div v-if="loading" class="skeleton" style="height:430px" />
+        <EmptyState v-else-if="!activeDetails.length" icon="gauge" title="暂无决策数据"
+          desc="在「测试台」发送请求后，这里会展示最近一次决策的六维对比与近 10 次最优站点" style="padding:36px 0" />
+        <div v-else class="radar-layout">
+          <!-- 左：当前选中决策 -->
+          <div class="radar-main">
+            <div class="row gap-2 mb-2" style="align-items:center;flex-wrap:wrap">
+              <span class="field-label" style="margin:0">{{ activeIsLatest ? '最近一次决策' : '第 ' + activeOrdinal + ' 次决策' }}</span>
+              <span class="badge badge-blue">{{ activeDecision.model }}</span>
+              <span class="badge badge-purple">{{ activeDecision.strategy || activeDecision.policy_version || '—' }}</span>
+              <span v-if="activeDecision.group_name" class="badge badge-teal">{{ activeDecision.group_name }}</span>
+              <span class="text-3" style="font-size:11.5px;margin-left:auto">{{ fmtTime(activeDecision.decided_at) }} · 选中 {{ activeDecision.selected_channel || '—' }}</span>
+            </div>
+            <RadarChart :details="activeDetails" :dims="radarDims" />
+            <div class="field-hint" style="text-align:center;margin-top:2px">光晕为选中渠道 · 悬停雷达或图例查看真实指标（$费用 / ms / 成功率）</div>
+          </div>
+          <!-- 右：近 10 次最优站点（点击切换左侧六维图） -->
+          <div class="best-panel">
+            <div class="field-label">近 10 次决策 · 最优站点</div>
+            <div class="best-list">
+              <button v-for="(d, i) in recentBest" :key="d.request_id" class="best-row"
+                :class="{ active: d.request_id === activeDecision?.request_id }"
+                @click="selectDecision(d)">
+                <span class="best-rank">{{ i + 1 }}</span>
+                <div class="grow" style="min-width:0">
+                  <div class="row gap-2" style="align-items:center">
+                    <span class="truncate" style="font-weight:600;font-size:12.5px">{{ d.selected_channel || '—' }}</span>
+                    <span class="badge badge-blue" style="font-size:9.5px">{{ d.model }}</span>
+                  </div>
+                  <div class="text-3" style="font-size:10.5px;margin-top:1px">{{ fmtTime(d.decided_at) }} · {{ d.strategy || '—' }}</div>
+                </div>
+                <button
+                  v-if="d.request_id === activeDecision?.request_id"
+                  class="btn btn-ghost btn-sm" style="flex-shrink:0"
+                  :title="'在决策页查看完整详情'"
+                  @click.stop="router.push({ path: '/decisions', query: { id: d.request_id } })">
+                  <Icon name="list" :size="12" />详情
+                </button>
+              </button>
+            </div>
+            <div class="field-hint" style="margin-top:8px">点击任意一条，左侧即展示该次决策的六维对比</div>
+          </div>
         </div>
       </div>
     </div>
@@ -419,6 +499,38 @@ onMounted(load)
 </template>
 
 <style scoped>
+/* 决策雷达布局 */
+.radar-layout {
+  display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; align-items: start;
+}
+.radar-main { min-width: 0; }
+.best-panel {
+  padding: 14px 16px;
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.best-list { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; max-height: 400px; overflow-y: auto; }
+.best-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid transparent; border-radius: var(--radius-md);
+  background: transparent; font-family: inherit; text-align: left;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.best-row:hover { background: var(--surface-hover); border-color: var(--border); }
+.best-row.active { background: var(--blue-soft); border-color: var(--blue); }
+.best-rank {
+  width: 20px; height: 20px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 800; color: var(--text-3);
+  background: var(--surface-raised); border: 1px solid var(--border); border-radius: 6px;
+}
+.best-row:first-child .best-rank { color: #fff; background: var(--blue); border-color: var(--blue); }
+@media (max-width: 1000px) {
+  .radar-layout { grid-template-columns: 1fr; }
+}
 .alert-row { padding: 9px 0; border-bottom: 1px solid var(--border); }
 .alert-row:last-child { border-bottom: none; }
 .alert-row:first-child { padding-top: 2px; }
