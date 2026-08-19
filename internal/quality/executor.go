@@ -239,12 +239,17 @@ func progressOf(step, total int) int {
 	return step * 100 / total
 }
 
-// stageRegistry 阶段注册表（Task 4 的 chat/behavior 阶段在 executor_chat.go 中扩展）。
+// stageRegistry 阶段注册表：connectivity + 复用证据的 protocol/stream/usage/behavior。
+// 一次 full 任务最多执行两次聊天请求：protocol 发起非流式，stream 发起流式，
+// usage/behavior 复用非流式证据，不额外发起第三次请求。
 func (e *Executor) stageRegistry() map[string]Stage {
-	registry := map[string]Stage{
+	return map[string]Stage{
 		StageConnectivity: connectivityStage{executor: e},
+		StageProtocol:     protocolStage{executor: e},
+		StageStream:       streamStage{executor: e},
+		StageUsage:        usageStage{executor: e},
+		StageBehavior:     behaviorStage{executor: e},
 	}
-	return registry
 }
 
 // connectivityStage 包装 RunConnectivity。
