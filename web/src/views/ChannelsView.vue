@@ -169,22 +169,49 @@ function emptyForm() {
     daily_probe_budget: 1.0,
     balance_api_url: '',
     balance_api_token: '',
+    balance_login_email: '',
+    balance_login_password: '',
     model_pairs: [{ from: 'gpt-4o', to: 'gpt-4o' }],
     capabilities: ['tools'],
     group_ids: [],
   }
 }
 
-// 中转站类型 → 默认余额接口路径
+// 中转站类型 → 默认余额接口路径（相对 base_url，与后端 DefaultBalanceEndpoint 一致）
 const relayTypeDefaults = {
   newapi: '/api/user/self',
-  sub2api: '/api/v1/auth/me',
+  sub2api: '/api/v1/auth/me?timezone=Asia%2FShanghai',
   custom: '',
 }
-// 用户在表单里手动切换中转站类型时，自动填入对应余额接口地址（可手动再改）
-function onRelayTypeChange() {
+// 最近一次自动补全余额接口时使用的 base_url（用于判断 base_url 变化后是否跟随更新）
+let autoBalanceBase = ''
+
+// 按类型自动补全余额接口完整 URL（站点 base_url + 类型默认路径）
+function composeAutoBalanceURL(base) {
+  const b = (base || '').trim().replace(/\/+$/, '')
   const ep = relayTypeDefaults[form.value.relay_type]
-  if (ep) form.value.balance_api_url = ep
+  if (!b || !ep) return ''
+  return b + ep
+}
+
+function applyAutoBalanceURL() {
+  const url = composeAutoBalanceURL(form.value.base_url)
+  if (!url) return
+  autoBalanceBase = (form.value.base_url || '').trim().replace(/\/+$/, '')
+  form.value.balance_api_url = url
+}
+
+// 用户在表单里选择中转站类型时，自动补全余额接口完整 URL（custom 保留手动填写，可再改）
+function onRelayTypeChange() {
+  if (relayTypeDefaults[form.value.relay_type]) applyAutoBalanceURL()
+}
+
+// base_url 变化时：若余额接口为空或是此前自动生成的，跟随 base_url 重新补全
+function onBaseUrlChange() {
+  if (!relayTypeDefaults[form.value.relay_type]) return
+  const cur = (form.value.balance_api_url || '').trim()
+  if (cur && (!autoBalanceBase || cur !== autoBalanceBase + relayTypeDefaults[form.value.relay_type])) return
+  applyAutoBalanceURL()
 }
 
 const filtered = computed(() =>
@@ -555,11 +582,15 @@ function openEdit(ch) {
     daily_probe_budget: ch.daily_probe_budget || 0,
     balance_api_url: ch.balance_api_url || '',
     balance_api_token: '',
+    balance_login_email: ch.balance_login_email || '',
+    balance_login_password: '',
     model_pairs: Object.entries(ch.model_mapping || {}).map(([k, v]) => ({ from: k, to: v })),
     capabilities: ch.capabilities || [],
     group_ids: (ch.groups || []).map(g => g.id),
   }
   if (!form.value.model_pairs.length) form.value.model_pairs.push({ from: '', to: '' })
+  // 记录打开时余额接口对应的 base_url，用于判断后续 base_url 修改时是否跟随重新补全
+  autoBalanceBase = (ch.base_url || '').trim().replace(/\/+$/, '')
   testResult.value = null
   showModal.value = true
 }
@@ -593,10 +624,15 @@ async function save() {
       role: form.value.role, user_priority: form.value.user_priority, weight: form.value.weight,
       daily_probe_budget: form.value.daily_probe_budget, model_mapping: mm, capabilities: form.value.capabilities,
       balance_api_url: form.value.balance_api_url || '',
+      balance_login_email: form.value.balance_login_email || '',
       group_ids: form.value.group_ids,
     }
     if (!editing.value || form.value.balance_api_token) {
       payload.balance_api_token = form.value.balance_api_token || ''
+    }
+    // 余额自动登录密码：编辑时留空 = 保持不变（后端不返回明文密码）
+    if (!editing.value || form.value.balance_login_password) {
+      payload.balance_login_password = form.value.balance_login_password || ''
     }
     // 编辑时凭证留空 = 保持不变（后端不返回明文凭证）
     if (form.value.access_token) payload.access_token = form.value.access_token
@@ -631,17 +667,38 @@ async function save() {
   } finally { saving.value = false }
 }
 
+// 编辑已保存站点且未改动连接配置、未填写新凭据 → 可用后端已保存凭据测试/拉取（凭据不回显前端）
+function usingSavedCreds() {
+  return !!editing.value && !form.value.api_key && !form.value.access_token
+    && form.value.base_url === editing.value.base_url
+    && (form.value.protocol || 'openai') === (editing.value.protocol || 'openai')
+}
+
 async function testConn() {
   testing.value = true
   testResult.value = null
   try {
-    const isAnthropic = form.value.protocol === 'anthropic'
-    const headers = isAnthropic
-      ? { 'x-api-key': form.value.api_key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
-      : { Authorization: `Bearer ${form.value.api_key}` }
-    const resp = await fetch(form.value.base_url.replace(/\/+$/, '') + '/v1/models', { headers })
-    if (resp.ok) testResult.value = { ok: true, msg: '上游连接成功' }
-    else testResult.value = { ok: false, msg: `HTTP ${resp.status}` }
+    if (!form.value.base_url) { testResult.value = { ok: false, msg: '请先填写 Base URL' }; return }
+    let n
+    if (usingSavedCreds()) {
+      // 未改动连接配置且未填写新凭据 → 用站点已保存凭据经后端测试
+      const r = await api.channelModels(editing.value.id)
+      n = r.count ?? r.models?.length ?? 0
+    } else {
+      if (!form.value.api_key && !form.value.access_token) {
+        testResult.value = { ok: false, msg: editing.value ? '连接配置已修改：请填写 API Key 后测试' : '请先填写 API Key 或 Access Token' }
+        return
+      }
+      // 经后端探测（避免浏览器 CORS 限制，与「从上游获取」同一通道）
+      const r = await api.probeUpstreamModels(
+        form.value.base_url,
+        form.value.api_key,
+        form.value.protocol || 'openai',
+        form.value.access_token
+      )
+      n = r.count ?? r.models?.length ?? 0
+    }
+    testResult.value = { ok: true, msg: `上游连接成功（${n} 个模型）` }
   } catch (e) {
     testResult.value = { ok: false, msg: e.message }
   }
@@ -661,8 +718,18 @@ async function fetchUpstreamModels() {
     } else {
       // 表单模式：用表单里的地址与凭据经后端探测（避免浏览器 CORS 限制）
       if (!form.value.base_url) { modelsError.value = '请先填写 Base URL'; return }
-      const r = await api.probeUpstreamModels(form.value.base_url, form.value.api_key, form.value.protocol || 'openai')
-      list = r.models || []
+      if (usingSavedCreds()) {
+        // 编辑未改配置且未填写新凭据 → 用站点已保存凭据拉取
+        const r = await api.channelModels(editing.value.id)
+        list = r.models || []
+      } else {
+        if (!form.value.api_key && !form.value.access_token) {
+          modelsError.value = editing.value ? '连接配置已修改，请先填写 API Key' : '请先填写 API Key 或 Access Token'
+          return
+        }
+        const r = await api.probeUpstreamModels(form.value.base_url, form.value.api_key, form.value.protocol || 'openai', form.value.access_token)
+        list = r.models || []
+      }
     }
     upstreamModels.value = list
     if (!list.length) modelsError.value = '上游未返回任何模型'
@@ -1146,7 +1213,7 @@ onMounted(() => { load(); loadGroups() })
     <!-- 新增/编辑弹窗 -->
     <BaseModal v-if="showModal" :title="editing ? '编辑站点' : '添加站点'" width="560px" @close="showModal = false">
       <div class="field"><label class="field-label">站点名称 *</label><input v-model="form.name" class="input" placeholder="channel-primary-01"></div>
-      <div class="field"><label class="field-label">Base URL *</label><input v-model="form.base_url" class="input mono" placeholder="https://api.example-relay.com"></div>
+      <div class="field"><label class="field-label">Base URL *</label><input v-model="form.base_url" class="input mono" placeholder="https://api.example-relay.com" @change="onBaseUrlChange"></div>
       <div class="form-grid-2">
         <div class="field">
           <label class="field-label">中转站类型</label>
@@ -1177,7 +1244,7 @@ onMounted(() => { load(); loadGroups() })
       <div class="field">
         <label class="field-label">余额接口地址</label>
         <input v-model="form.balance_api_url" class="input mono" placeholder="按中转站类型自动填入；也可手动填写完整 URL 或路径">
-        <div class="field-hint">选择「中转站类型」后自动填入默认地址：New API → /api/user/self，Sub2API → /api/v1/auth/me。特殊部署可在网页控制台 F12 → Network 抓包后手动修改。</div>
+        <div class="field-hint">选择「中转站类型」后自动按「Base URL + 类型默认路径」补全完整地址（Sub2API 自动带 timezone 参数）；修改 Base URL 时会跟随更新。特殊部署可在网页控制台 F12 → Network 抓包后手动修改。</div>
       </div>
       <div class="field">
         <label class="field-label">余额接口令牌（可选）</label>
@@ -1188,6 +1255,19 @@ onMounted(() => { load(); loadGroups() })
             <span v-if="balanceTokenStatus.configured" class="text-green">已配置（尾号 {{ balanceTokenStatus.suffix.replace(/^\*+/, '') }}）</span>
             <span v-else class="text-3">未配置</span>
           </template>
+        </div>
+      </div>
+      <div v-if="form.relay_type === 'sub2api'" class="form-grid-2" style="margin-top:-6px">
+        <div class="field">
+          <label class="field-label">余额登录邮箱</label>
+          <input v-model="form.balance_login_email" type="email" class="input mono" placeholder="登录控制台的邮箱">
+        </div>
+        <div class="field">
+          <label class="field-label">余额登录密码</label>
+          <input v-model="form.balance_login_password" type="password" class="input mono" :placeholder="editing ? '留空则保持不变' : '登录控制台的密码'">
+        </div>
+        <div class="field-hint" style="grid-column:1/-1;margin-top:-8px">
+          填写后系统自动登录换取会话令牌查询余额，无需手动抓包；留空则回退使用上方余额接口令牌。
         </div>
       </div>
       <div class="form-grid-2">
