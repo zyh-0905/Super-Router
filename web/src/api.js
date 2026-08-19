@@ -154,6 +154,77 @@ export const api = {
   sendTelegramSubscriberTest: (id) => api.post(`/admin/telegram/subscribers/${id}/test`, {}),
   getTelegramDeliveryLogs: () => api.get('/admin/telegram/delivery-logs'),
 
+  // ===== API 接口质量检测 =====
+  createQualityCheck: (channelId, payload) => api.post(`/admin/channels/${channelId}/quality-checks`, payload),
+  listQualityChecks: (channelId, limit = 5) => api.get(`/admin/channels/${channelId}/quality-checks?limit=${limit}`),
+  getQualityCheck: (runId) => api.get(`/admin/quality-checks/${runId}`),
+  cancelQualityCheck: (runId) => api.post(`/admin/quality-checks/${runId}/cancel`, {}),
+
+  /**
+   * 带认证的 fetch SSE 流（原生 EventSource 无法携带 Bearer Header）。
+   * 返回 { stop }；事件经 onEvent({event, data}) 回调，断开经 onDisconnect()。
+   */
+  async streamQualityEvents(runId, { signal, onEvent, onDisconnect } = {}) {
+    const ctrl = new AbortController()
+    const abortFromSignal = () => ctrl.abort()
+    if (signal) {
+      if (signal.aborted) ctrl.abort()
+      else signal.addEventListener('abort', abortFromSignal, { once: true })
+    }
+    const stop = () => ctrl.abort()
+
+    let resp
+    try {
+      resp = await fetch(base() + `/admin/quality-checks/${runId}/events`, {
+        headers: { ...authHeaders(), Accept: 'text/event-stream' },
+        signal: ctrl.signal,
+      })
+    } catch (e) {
+      if (!ctrl.signal.aborted) store.connected = false
+      if (signal) signal.removeEventListener('abort', abortFromSignal)
+      if (onDisconnect) onDisconnect()
+      throw e
+    }
+    if (!resp.ok || !resp.body) {
+      if (signal) signal.removeEventListener('abort', abortFromSignal)
+      if (onDisconnect) onDisconnect()
+      throw new Error(`SSE ${resp.status}`)
+    }
+
+    const reader = resp.body.getReader()
+    const dec = new TextDecoder()
+    const { parseSSEChunk } = await import('./quality')
+
+    let buf = ''
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += dec.decode(value, { stream: true })
+          const parsed = parseSSEChunk('', buf)
+          buf = parsed.buffer
+          for (const ev of parsed.events) {
+            if (onEvent) onEvent(ev)
+          }
+        }
+        // 流结束：处理残留
+        if (buf.trim()) {
+          const parsed = parseSSEChunk('', buf + '\n\n')
+          for (const ev of parsed.events) {
+            if (onEvent) onEvent(ev)
+          }
+        }
+      } catch (e) {
+        if (!ctrl.signal.aborted && onDisconnect) onDisconnect()
+      } finally {
+        if (signal) signal.removeEventListener('abort', abortFromSignal)
+      }
+    }
+    pump() // 后台泵，不阻塞调用方
+    return { stop }
+  },
+
   // ===== 策略中心 =====
   getPolicy: () => api.get('/admin/policies'),
   updatePolicy: (p) => api.put('/admin/policies', p),
