@@ -148,7 +148,7 @@ func main() {
 	adminHandler := api.NewAdminHandler(db, redisClient, cfg, zapLogger.Named("admin"))
 
 	// 实时倍率：按需手动实测（复用 checker 探测逻辑，运行在 Gateway 内）
-	ratioProbe := checker.NewProbeChecker(db, zapLogger.Named("ratio-probe"), cfg.Security.EncryptionKey)
+	ratioProbe := checker.NewProbeChecker(db, zapLogger.Named("ratio-probe"), cfg.Security.EncryptionKey, redisClient)
 	ratioProbe.SetProbeModel(cfg.Checker.ProbeModel)
 	ratioHandler := api.NewRatioHandler(db, redisClient, cfg, ratioProbe, zapLogger.Named("ratio"))
 
@@ -228,9 +228,11 @@ func main() {
 		adminGroup.GET("/settings", adminHandler.GetSettings)
 		adminGroup.PATCH("/settings", adminHandler.UpdateSettings)
 		adminGroup.GET("/decisions", adminHandler.GetDecisions)
+		adminGroup.DELETE("/decisions", adminHandler.DeleteDecisions)
 		adminGroup.GET("/circuit", adminHandler.GetCircuitStates)
 		adminGroup.POST("/circuit/:channel_id/reset", adminHandler.ResetCircuit)
 		adminGroup.GET("/stats", adminHandler.GetStats)
+		adminGroup.GET("/alerts", adminHandler.GetAlerts)
 		adminGroup.GET("/keys", adminHandler.ListKeys)
 		adminGroup.POST("/keys", adminHandler.CreateKey)
 		adminGroup.PATCH("/keys/:id", adminHandler.UpdateKey)

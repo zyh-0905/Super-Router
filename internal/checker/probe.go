@@ -23,12 +23,12 @@ type ProbeChecker struct {
 	cryptoKey  string          // 上游凭据解密密钥（P1-07）
 }
 
-func NewProbeChecker(db *store.DB, logger *zap.Logger, cryptoKey string) *ProbeChecker {
+func NewProbeChecker(db *store.DB, logger *zap.Logger, cryptoKey string, redis *store.RedisClient) *ProbeChecker {
 	return &ProbeChecker{
 		db:         db,
 		logger:     logger,
 		client:     &http.Client{Timeout: 30 * time.Second},
-		balance:    NewBalanceChecker(db, logger, cryptoKey),
+		balance:    NewBalanceChecker(db, logger, cryptoKey, redis),
 		probeModel: "gpt-4o",
 		cryptoKey:  cryptoKey,
 	}
@@ -234,8 +234,9 @@ func (p *ProbeChecker) Run(ctx context.Context, globalDailyBudget float64) error
 
 func (p *ProbeChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	rows, err := p.db.Pool.Query(ctx, `
-		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol, relay_type,
-		       daily_probe_budget, balance_api_url, balance_api_token, timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms
+		SELECT id, name, base_url, access_token, api_key, enabled, role, protocol, relay_type, test_model,
+		       daily_probe_budget, balance_api_url, balance_api_token, timeout_connect_ms, timeout_first_byte_ms, timeout_total_ms,
+		       balance_login_email, balance_login_password
 		FROM upstreams
 		WHERE enabled = true
 	`)
@@ -248,8 +249,9 @@ func (p *ProbeChecker) loadUpstreams(ctx context.Context) ([]Upstream, error) {
 	for rows.Next() {
 		var u Upstream
 		if err := rows.Scan(
-			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol, &u.RelayType,
+			&u.ID, &u.Name, &u.BaseURL, &u.AccessToken, &u.APIKey, &u.Enabled, &u.Role, &u.Protocol, &u.RelayType, &u.TestModel,
 			&u.DailyProbeBudget, &u.BalanceAPIURL, &u.BalanceAPIToken, &u.TimeoutConnectMS, &u.TimeoutFirstByteMS, &u.TimeoutTotalMS,
+			&u.BalanceLoginEmail, &u.BalanceLoginPassword,
 		); err != nil {
 			return nil, err
 		}
@@ -286,9 +288,23 @@ func (p *ProbeChecker) getUpstreamTodaySpent(ctx context.Context, upstreamID int
 }
 
 // ProbeChannel 对单个上游执行推理探针（分组调度器使用），返回结构化结果与错误。
-// 调度器依据返回的 res.Cost 结算预算（P1-06：预留估算 → 按实际成本结算）。
+// 模型选择：站点默认测试模型（test_model，测试台自动预填的那个）优先，
+// 未配置时回退全局 checker.probe_model。这样 sub2api 等不支持全局默认模型的
+// 站点也能被定时实测覆盖。调度器依据返回的 res.Cost 结算预算（P1-06）。
 func (p *ProbeChecker) ProbeChannel(ctx context.Context, upstream Upstream, epoch int64) (*ProbeResult, error) {
-	return p.probeOne(ctx, upstream, epoch, p.probeModel, 16, ProbeSourceScheduled)
+	model := p.probeModel
+	if upstream.TestModel != "" {
+		model = upstream.TestModel
+	}
+	return p.probeOne(ctx, upstream, epoch, model, 16, ProbeSourceScheduled)
+}
+
+// ScheduledProbeModel 返回某站点定时探针实际使用的模型（预算预估用，与 ProbeChannel 一致）
+func (p *ProbeChecker) ScheduledProbeModel(upstream Upstream) string {
+	if upstream.TestModel != "" {
+		return upstream.TestModel
+	}
+	return p.probeModel
 }
 
 // ProbeModel 按需探测指定模型（手动实测入口），返回结构化结果

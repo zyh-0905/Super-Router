@@ -28,13 +28,15 @@ type BalanceChecker struct {
 	logger    *zap.Logger
 	client    *http.Client
 	cryptoKey string
+	redis     *store.RedisClient // Sub2API 自动登录令牌缓存；nil 时每次检测重新登录
 }
 
-func NewBalanceChecker(db *store.DB, logger *zap.Logger, cryptoKey string) *BalanceChecker {
+func NewBalanceChecker(db *store.DB, logger *zap.Logger, cryptoKey string, redis *store.RedisClient) *BalanceChecker {
 	return &BalanceChecker{
 		db:        db,
 		logger:    logger,
 		cryptoKey: cryptoKey,
+		redis:     redis,
 		client:    &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -81,13 +83,10 @@ func (b *BalanceChecker) fetch(ctx context.Context, upstream Upstream) (*Balance
 
 	var attempts []string
 
-	// 站点余额凭证：独立令牌 > API Key > Access Token
-	cred := upstream.BalanceAPIToken
-	if cred == "" {
-		cred = upstream.APIKey
-	}
-	if cred == "" {
-		cred = upstream.AccessToken
+	// 站点余额凭证：独立令牌 > 自动登录会话（Sub2API）> API Key > Access Token
+	cred, auto, loginErr := b.balanceCredential(ctx, upstream)
+	if loginErr != nil {
+		attempts = append(attempts, loginErr.Error())
 	}
 
 	// 0a. 站点自定义余额接口（完整 URL 或相对 base_url 的路径）
@@ -96,7 +95,7 @@ func (b *BalanceChecker) fetch(ctx context.Context, upstream Upstream) (*Balance
 		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 			url = strings.TrimRight(upstream.BaseURL, "/") + "/" + strings.TrimLeft(url, "/")
 		}
-		bal, src, err := b.fetchGeneric(ctx, url, cred)
+		bal, src, err := b.fetchWithAutoRetry(ctx, url, cred, auto, upstream)
 		if err == nil {
 			return &BalanceResult{Balance: bal, Currency: "USD", Source: src}, nil
 		}
@@ -106,7 +105,7 @@ func (b *BalanceChecker) fetch(ctx context.Context, upstream Upstream) (*Balance
 	// 0b. 中转站类型默认余额接口（newapi → /api/user/self，sub2api → /api/v1/auth/me）
 	if ep := protocol.DefaultBalanceEndpoint(upstream.RelayType); ep != "" {
 		url := strings.TrimRight(upstream.BaseURL, "/") + "/" + strings.TrimLeft(ep, "/")
-		bal, src, err := b.fetchGeneric(ctx, url, cred)
+		bal, src, err := b.fetchWithAutoRetry(ctx, url, cred, auto, upstream)
 		if err == nil {
 			return &BalanceResult{Balance: bal, Currency: "USD", Source: src}, nil
 		}

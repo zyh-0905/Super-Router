@@ -83,8 +83,8 @@ func main() {
 	// 初始化 checker
 	aliveChecker := checker.NewAliveChecker(db, logger.Named("alive"), cfg.Security.EncryptionKey)
 	pricingChecker := checker.NewPricingChecker(db, logger.Named("pricing"), cfg.Security.EncryptionKey)
-	probeChecker := checker.NewProbeChecker(db, logger.Named("probe"), cfg.Security.EncryptionKey)
-	balanceChecker := checker.NewBalanceChecker(db, logger.Named("balance"), cfg.Security.EncryptionKey)
+	probeChecker := checker.NewProbeChecker(db, logger.Named("probe"), cfg.Security.EncryptionKey, redisClient)
+	balanceChecker := checker.NewBalanceChecker(db, logger.Named("balance"), cfg.Security.EncryptionKey, redisClient)
 	probeChecker.SetProbeModel(cfg.Checker.ProbeModel)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -380,8 +380,9 @@ func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, g
 		return
 	}
 
-	// 估算单次探测成本并做原子预留（Redis 可用时）
-	estCost, err := s.probe.EstimateProbeCost(ctx, s.cfg.Checker.ProbeModel, 16, 16)
+	// 估算单次探测成本并做原子预留（Redis 可用时；模型与 ProbeChannel 的选择一致）
+	probeModel := s.probe.ScheduledProbeModel(sch.Upstream)
+	estCost, err := s.probe.EstimateProbeCost(ctx, probeModel, 16, 16)
 	if err != nil {
 		s.logger.Warn("Estimate probe cost failed, probe skipped", zap.String("channel", sch.Name), zap.Error(err))
 		last["probe"] = now
