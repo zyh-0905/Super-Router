@@ -146,6 +146,7 @@ func main() {
 	// 初始化处理器
 	proxyHandler := api.NewProxyHandler(routerEngine, db, zapLogger.Named("proxy"), circuitManager, cfg.Security.EncryptionKey)
 	adminHandler := api.NewAdminHandler(db, redisClient, cfg, zapLogger.Named("admin"))
+	telegramHandler := api.NewTelegramHandler(db, cfg.Security.EncryptionKey, zapLogger.Named("telegram"))
 
 	// 实时倍率：按需手动实测（复用 checker 探测逻辑，运行在 Gateway 内）
 	ratioProbe := checker.NewProbeChecker(db, zapLogger.Named("ratio-probe"), cfg.Security.EncryptionKey, redisClient)
@@ -246,6 +247,13 @@ func main() {
 		adminGroup.PUT("/policies", adminHandler.UpdateSystemPolicy)
 		adminGroup.GET("/groups/:id/strategy", adminHandler.GetGroupStrategy)
 		adminGroup.PUT("/groups/:id/strategy", adminHandler.UpdateGroupStrategy)
+		adminGroup.GET("/telegram/config", telegramHandler.GetConfig)
+		adminGroup.PATCH("/telegram/config", telegramHandler.UpdateConfig)
+		adminGroup.GET("/telegram/subscribers", telegramHandler.ListSubscribers)
+		adminGroup.POST("/telegram/subscribers", telegramHandler.CreateSubscriber)
+		adminGroup.PATCH("/telegram/subscribers/:id", telegramHandler.UpdateSubscriber)
+		adminGroup.DELETE("/telegram/subscribers/:id", telegramHandler.DeleteSubscriber)
+		adminGroup.GET("/telegram/delivery-logs", telegramHandler.GetDeliveryLogs)
 	}
 
 	// 静态托管 Web 管理界面（同一端口，免 CORS）
