@@ -1,10 +1,10 @@
 <script setup>
 // 告警页：全部活跃告警（低余额 / 倍率超限 / 熔断开闸降级 / 站点禁用）
-// 数据来自 GET /admin/alerts（与右下角弹窗同一数据源，实时计算）。
+// 数据来自 GET /admin/alerts（与右下角弹窗同一数据源，Checker reconcile 的持久化事件）。
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '../api'
-import { store } from '../store'
+import { store, toast } from '../store'
 import GroupSwitcher from '../components/GroupSwitcher.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Icon from '../components/Icon.vue'
@@ -16,6 +16,10 @@ const alerts = ref([])
 const lastRefresh = ref('')
 let pollTimer = null
 
+// Telegram 状态摘要（非敏感；立即发送按钮）
+const tgStatus = ref(null)
+const tgSending = ref(false)
+
 // 告警类型 → 展示信息与处理页
 const TYPE_INFO = {
   bal_:     { label: '低余额',   icon: 'key',     color: 'red',    target: '/channels' },
@@ -23,11 +27,12 @@ const TYPE_INFO = {
   cb_:      { label: '熔断',     icon: 'zap_off', color: 'orange', target: '/circuit' },
   dis_:     { label: '站点禁用', icon: 'server',  color: 'orange', target: '/channels' },
   pricing_: { label: '价格同步', icon: 'refresh', color: 'orange', target: '/channels' },
+  qc_:      { label: '接口质量', icon: 'gauge',   color: 'orange', target: '/channels' },
 }
 
 function typeOf(a) {
   if (!a?.id) return null
-  const key = ['bal_', 'ratio_', 'cb_', 'dis_', 'pricing_'].find(p => a.id.startsWith(p))
+  const key = ['bal_', 'ratio_', 'cb_', 'dis_', 'pricing_', 'qc_'].find(p => a.id.startsWith(p))
   return TYPE_INFO[key] || { label: '其他', icon: 'alert', color: 'orange', target: '/' }
 }
 
@@ -46,6 +51,22 @@ async function load() {
   finally { loading.value = false }
 }
 
+async function loadTelegramStatus() {
+  try {
+    tgStatus.value = await api.getTelegramConfig()
+    store.telegram = { enabled: tgStatus.value.enabled, last_report_at: tgStatus.value.last_report_at }
+  } catch { /* 未启用或不支持时静默 */ }
+}
+
+async function sendNow() {
+  tgSending.value = true
+  try {
+    const r = await api.sendTelegramAlertSummary()
+    toast(r.message || '告警汇总已发送', 'success')
+  } catch { /* 已提示 */ }
+  finally { tgSending.value = false }
+}
+
 function goHandle(a) {
   router.push(typeOf(a).target)
 }
@@ -54,6 +75,7 @@ function onGroupChange() { load() }
 
 onMounted(() => {
   load()
+  loadTelegramStatus()
   pollTimer = setInterval(load, 30000)
 })
 onUnmounted(() => clearInterval(pollTimer))
@@ -71,6 +93,21 @@ onUnmounted(() => clearInterval(pollTimer))
         <GroupSwitcher @change="onGroupChange" />
         <button class="btn btn-ghost" @click="load" :disabled="loading">
           <Icon name="refresh" :size="15" />刷新
+        </button>
+      </div>
+    </div>
+
+    <!-- Telegram 状态摘要 -->
+    <div v-if="tgStatus" class="card card-pad mb-3" style="padding:12px 16px">
+      <div class="row gap-3" style="align-items:center;flex-wrap:wrap">
+        <span class="badge" :class="tgStatus.enabled ? 'badge-green' : 'badge-gray'">
+          Telegram：{{ tgStatus.enabled ? '已启用' : '未启用' }}
+        </span>
+        <span v-if="tgStatus.last_report_at" class="text-3" style="font-size:12px">最近汇总：{{ tgStatus.last_report_at }}</span>
+        <span v-if="tgStatus.last_error" class="text-red" style="font-size:12px" :title="tgStatus.last_error">⚠ {{ tgStatus.last_error.slice(0, 50) }}</span>
+        <button class="btn btn-ghost btn-sm" style="margin-left:auto" :disabled="tgSending || !tgStatus.bot_configured"
+          :title="tgStatus.bot_configured ? '向全部订阅者发送当前告警汇总' : '请先在设置页配置 Bot Token'" @click="sendNow">
+          <Icon name="send" :size="13" />{{ tgSending ? '发送中…' : '立即发送当前告警汇总' }}
         </button>
       </div>
     </div>

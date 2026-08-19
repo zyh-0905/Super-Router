@@ -249,10 +249,13 @@ func main() {
 		adminGroup.PUT("/groups/:id/strategy", adminHandler.UpdateGroupStrategy)
 		adminGroup.GET("/telegram/config", telegramHandler.GetConfig)
 		adminGroup.PATCH("/telegram/config", telegramHandler.UpdateConfig)
+		adminGroup.POST("/telegram/test", telegramHandler.TestConnection)
+		adminGroup.POST("/telegram/report", telegramHandler.SendReport)
 		adminGroup.GET("/telegram/subscribers", telegramHandler.ListSubscribers)
 		adminGroup.POST("/telegram/subscribers", telegramHandler.CreateSubscriber)
 		adminGroup.PATCH("/telegram/subscribers/:id", telegramHandler.UpdateSubscriber)
 		adminGroup.DELETE("/telegram/subscribers/:id", telegramHandler.DeleteSubscriber)
+		adminGroup.POST("/telegram/subscribers/:id/test", telegramHandler.SendSubscriberTest)
 		adminGroup.GET("/telegram/delivery-logs", telegramHandler.GetDeliveryLogs)
 	}
 

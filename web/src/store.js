@@ -37,6 +37,9 @@ export const store = reactive({
   // 全局分组筛选器（null = 全部），各页面共享
   currentGroup: null,
 
+  // Telegram 告警状态缓存（只保存非敏感状态：是否启用/最近汇总，绝不保存 Bot Token）
+  telegram: null,
+
   // Toast 队列
   toasts: [],
 })

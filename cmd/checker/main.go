@@ -115,6 +115,7 @@ func main() {
 			telegram.RegisterAlertQueries(db)
 			tgWorker := telegram.NewWorker(tgStore, telegram.NewClient(token),
 				telegram.NewCommandService(telegram.NewSQLQueryService(db)), logger.Named("telegram"))
+			tgWorker.SetReportBuilder(telegram.NewReportBuilder(db))
 			tgWorker.SetLock(pgAdvisoryLock(db))
 			go tgWorker.Run(ctx)
 			logger.Info("Telegram worker started (long polling + hourly reports)")

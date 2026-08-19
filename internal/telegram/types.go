@@ -21,6 +21,7 @@ type Config struct {
 	Timezone              string
 	IncludeRecovered      bool
 	IncludeOngoing        bool
+	WebBaseURL            string
 	LastUpdateID          int64
 	LastReportAt          *time.Time
 }

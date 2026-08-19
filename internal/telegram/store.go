@@ -31,10 +31,12 @@ func (s *SQLConfigStore) LoadConfig(ctx context.Context) (Config, error) {
 	var lastReportAt *time.Time
 	err := s.Pool.QueryRow(ctx, `
 		SELECT enabled, report_enabled, report_interval_minutes, report_minute,
-		       timezone, include_recovered, include_ongoing, last_update_id, last_report_at
+		       timezone, include_recovered, include_ongoing, web_base_url,
+		       last_update_id, last_report_at
 		FROM telegram_config WHERE id = 1
 	`).Scan(&c.Enabled, &c.ReportEnabled, &c.ReportIntervalMinutes, &c.ReportMinute,
-		&c.Timezone, &c.IncludeRecovered, &c.IncludeOngoing, &c.LastUpdateID, &lastReportAt)
+		&c.Timezone, &c.IncludeRecovered, &c.IncludeOngoing, &c.WebBaseURL,
+		&c.LastUpdateID, &lastReportAt)
 	if err != nil {
 		return c, fmt.Errorf("load telegram config: %w", err)
 	}

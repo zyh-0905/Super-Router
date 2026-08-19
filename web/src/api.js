@@ -142,6 +142,18 @@ export const api = {
   // ===== 运行配置 =====
   config: () => api.get('/admin/config'),
 
+  // ===== Telegram 告警 =====
+  getTelegramConfig: () => api.get('/admin/telegram/config'),
+  updateTelegramConfig: (p) => api.patch('/admin/telegram/config', p),
+  testTelegramConnection: (p) => api.post('/admin/telegram/test', p || {}),
+  sendTelegramAlertSummary: () => api.post('/admin/telegram/report', {}),
+  listTelegramSubscribers: () => api.get('/admin/telegram/subscribers'),
+  createTelegramSubscriber: (p) => api.post('/admin/telegram/subscribers', p),
+  updateTelegramSubscriber: (id, p) => api.patch(`/admin/telegram/subscribers/${id}`, p),
+  deleteTelegramSubscriber: (id) => api.del(`/admin/telegram/subscribers/${id}`),
+  sendTelegramSubscriberTest: (id) => api.post(`/admin/telegram/subscribers/${id}/test`, {}),
+  getTelegramDeliveryLogs: () => api.get('/admin/telegram/delivery-logs'),
+
   // ===== 策略中心 =====
   getPolicy: () => api.get('/admin/policies'),
   updatePolicy: (p) => api.put('/admin/policies', p),

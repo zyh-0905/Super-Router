@@ -249,6 +249,141 @@ async function loadConfig() {
   finally { configLoading.value = false }
 }
 
+// ===== Telegram 告警 =====
+const tgConfig = ref(null)         // 服务端脱敏配置（无完整 Token）
+const tgTokenDraft = ref('')       // 密码输入框草稿（仅 PATCH 时发送，不存 store）
+const tgSaving = ref(false)
+const tgTesting = ref(false)
+const tgSubscribers = ref([])
+const tgSubsLoading = ref(false)
+const showSubModal = ref(false)
+const editingSub = ref(null)       // null = 新建
+const subForm = ref({ chat_id: '', display_name: '', enabled: true, alert_enabled: true, query_enabled: true, group_ids: [] })
+const savingSub = ref(false)
+const confirmDeleteSub = ref(null)
+const tgDeliveryLogs = ref([])
+
+async function loadTelegram() {
+  try {
+    tgConfig.value = await api.getTelegramConfig()
+    store.telegram = { enabled: tgConfig.value.enabled, last_report_at: tgConfig.value.last_report_at }
+  } catch { /* 已提示 */ }
+  try {
+    tgSubscribers.value = (await api.listTelegramSubscribers()).subscribers || []
+  } catch { /* 已提示 */ }
+  try {
+    tgDeliveryLogs.value = (await api.getTelegramDeliveryLogs()).logs || []
+  } catch { /* 已提示 */ }
+}
+
+async function saveTelegram() {
+  tgSaving.value = true
+  try {
+    const payload = {
+      enabled: tgConfig.value.enabled,
+      report_enabled: tgConfig.value.report_enabled,
+      report_interval_minutes: tgConfig.value.report_interval_minutes,
+      report_minute: tgConfig.value.report_minute,
+      timezone: tgConfig.value.timezone,
+      include_recovered: tgConfig.value.include_recovered,
+      include_ongoing: tgConfig.value.include_ongoing,
+      web_base_url: (tgConfig.value.web_base_url || '').trim(),
+    }
+    if (tgTokenDraft.value) payload.bot_token = tgTokenDraft.value
+    await api.updateTelegramConfig(payload)
+    tgTokenDraft.value = '' // 保存成功后清空草稿，表单不保留完整 Token
+    toast('Telegram 配置已保存', 'success')
+    await loadTelegram() // 重新 GET，确保前端状态不含完整 Token
+  } catch { /* 已提示 */ }
+  finally { tgSaving.value = false }
+}
+
+async function testTelegram() {
+  tgTesting.value = true
+  try {
+    // 保存草稿 Token（若已填写）后调用 getMe 验证；验证结果即时反馈
+    const payload = {}
+    if (tgTokenDraft.value) payload.bot_token = tgTokenDraft.value
+    await api.updateTelegramConfig(payload)
+    try {
+      const r = await api.testTelegramConnection(tgTokenDraft.value ? { bot_token: tgTokenDraft.value } : {})
+      toast(r.message || 'Bot Token 有效', 'success')
+      tgTokenDraft.value = ''
+    } catch {
+      // getMe 失败：detail 已在 api 层提示
+    }
+    await loadTelegram()
+  } catch { /* 已提示 */ }
+  finally { tgTesting.value = false }
+}
+
+function openSubModal(s) {
+  editingSub.value = s || null
+  subForm.value = s
+    ? {
+        chat_id: String(s.chat_id),
+        display_name: s.display_name || '',
+        enabled: s.enabled,
+        alert_enabled: s.alert_enabled,
+        query_enabled: s.query_enabled,
+        group_ids: [...(s.group_ids || [])],
+      }
+    : { chat_id: '', display_name: '', enabled: true, alert_enabled: true, query_enabled: true, group_ids: [] }
+  showSubModal.value = true
+}
+
+async function saveSubscriber() {
+  const chatID = Number(subForm.value.chat_id)
+  if (!Number.isInteger(chatID) || chatID <= 0) { toast('Chat ID 必须为正整数', 'error'); return }
+  savingSub.value = true
+  try {
+    const payload = {
+      chat_id: chatID,
+      display_name: subForm.value.display_name,
+      enabled: subForm.value.enabled,
+      alert_enabled: subForm.value.alert_enabled,
+      query_enabled: subForm.value.query_enabled,
+      group_ids: subForm.value.group_ids,
+    }
+    if (editingSub.value) {
+      await api.updateTelegramSubscriber(editingSub.value.id, payload)
+      toast('订阅者已更新', 'success')
+    } else {
+      await api.createTelegramSubscriber(payload)
+      toast('订阅者已添加', 'success')
+    }
+    showSubModal.value = false
+    await loadTelegram()
+  } catch { /* 已提示 */ }
+  finally { savingSub.value = false }
+}
+
+function askDeleteSub(s) { confirmDeleteSub.value = s }
+
+async function doDeleteSub() {
+  const s = confirmDeleteSub.value
+  confirmDeleteSub.value = null
+  try {
+    await api.deleteTelegramSubscriber(s.id)
+    toast('订阅者已删除', 'success')
+    await loadTelegram()
+  } catch { /* 已提示 */ }
+}
+
+async function toggleSubEnabled(s) {
+  try {
+    await api.updateTelegramSubscriber(s.id, { enabled: !s.enabled })
+    s.enabled = !s.enabled
+    toast(s.enabled ? '订阅者已启用' : '订阅者已停用', 'success')
+  } catch { /* 已提示 */ }
+}
+
+// 分组 ID → 名称
+function groupName(gid) {
+  const g = groups.value.find(x => x.id === gid)
+  return g ? g.name : '#' + gid
+}
+
 const cfgRows = computed(() => {
   const c = config.value || {}
   return [
@@ -264,7 +399,7 @@ const cfgRows = computed(() => {
   ]
 })
 
-onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSettings(); loadModelPrices() })
+onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSettings(); loadModelPrices(); loadTelegram() })
 </script>
 
 <template>
@@ -421,6 +556,115 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
           <div class="field-hint">余额检测由 checker 进程每 10 分钟自动执行一次（分组可在「站点 → 管理分组」中覆盖间隔）。</div>
         </div>
       </div>
+
+      <!-- Telegram 告警 -->
+      <div class="card card-pad" style="grid-column:1/-1">
+        <div class="row">
+          <div class="set-title">Telegram 告警</div>
+          <span class="spacer" />
+          <span v-if="tgConfig" class="badge" :class="tgConfig.enabled ? 'badge-green' : 'badge-gray'">
+            {{ tgConfig.enabled ? '已启用' : '未启用' }}
+          </span>
+        </div>
+        <p class="set-desc">将告警汇总推送到 Telegram。默认关闭；启用后 checker 进程按小时整点发送汇总并响应查询命令。</p>
+        <div v-if="!tgConfig" class="skeleton" style="height:120px" />
+        <template v-else>
+          <div class="form-grid-2">
+            <div class="field">
+              <label class="field-label">启用开关</label>
+              <div class="row gap-2" style="align-items:center">
+                <input type="checkbox" v-model="tgConfig.enabled" class="switch">
+                <span class="text-3" style="font-size:12.5px">{{ tgConfig.enabled ? '开启 Telegram 集成' : '关闭（默认）' }}</span>
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label">Bot Token</label>
+              <input v-model="tgTokenDraft" type="password" class="input mono"
+                :placeholder="tgConfig.bot_configured ? '已配置（尾号 ' + tgConfig.bot_token_suffix + '），留空保持不变' : '如 123456:ABC-DEF…'">
+              <div class="field-hint">仅通过加密通道保存，页面不回显完整 Token。</div>
+            </div>
+            <div class="field">
+              <label class="field-label">时区</label>
+              <input v-model="tgConfig.timezone" class="input" placeholder="Asia/Shanghai">
+            </div>
+            <div class="field">
+              <label class="field-label">汇总频率（分钟）</label>
+              <input v-model.number="tgConfig.report_interval_minutes" type="number" min="1" max="60" class="input" style="width:120px">
+            </div>
+            <div class="field">
+              <label class="field-label">发送分钟（0-59）</label>
+              <input v-model.number="tgConfig.report_minute" type="number" min="0" max="59" class="input" style="width:120px">
+              <div class="field-hint">默认 0 = 每小时整点。</div>
+            </div>
+            <div class="field">
+              <label class="field-label">控制台链接（可选）</label>
+              <input v-model="tgConfig.web_base_url" class="input" placeholder="https://router.example.com">
+            </div>
+          </div>
+          <div class="row gap-3" style="flex-wrap:wrap;align-items:center">
+            <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
+              <input type="checkbox" v-model="tgConfig.include_recovered" class="switch"> 包含已恢复告警
+            </label>
+            <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
+              <input type="checkbox" v-model="tgConfig.include_ongoing" class="switch"> 包含持续中告警
+            </label>
+            <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
+              <input type="checkbox" v-model="tgConfig.report_enabled" class="switch"> 每小时整点汇总
+            </label>
+          </div>
+          <div class="row gap-2 mt-2">
+            <button class="btn btn-primary" @click="saveTelegram" :disabled="tgSaving">
+              <Icon name="check" :size="13" />{{ tgSaving ? '保存中…' : '保存配置' }}
+            </button>
+            <button class="btn btn-ghost" @click="testTelegram" :disabled="tgTesting">
+              <Icon name="plug" :size="13" />{{ tgTesting ? '保存中…' : '保存并验证' }}
+            </button>
+            <span v-if="tgConfig.last_poll_at" class="text-3" style="font-size:12px">最近轮询 {{ fmtDate(tgConfig.last_poll_at) }}</span>
+            <span v-if="tgConfig.last_report_at" class="text-3" style="font-size:12px">最近汇总 {{ fmtDate(tgConfig.last_report_at) }}</span>
+            <span v-if="tgConfig.last_error" class="text-red" style="font-size:12px" :title="tgConfig.last_error">⚠ 最近错误：{{ tgConfig.last_error.slice(0, 60) }}</span>
+          </div>
+        </template>
+      </div>
+
+      <!-- Telegram 订阅者 -->
+      <div class="card card-pad" style="grid-column:1/-1">
+        <div class="row">
+          <div class="set-title">Telegram 订阅者</div>
+          <span class="spacer" />
+          <button class="btn btn-primary btn-sm" @click="openSubModal()"><Icon name="plus" :size="13" />添加订阅者</button>
+        </div>
+        <p class="set-desc">只有录入的 Chat ID 可以接收告警汇总并执行查询命令。不开放 /start 自助绑定，请在后台手动维护。</p>
+        <div v-if="tgSubsLoading" class="skeleton" style="height:80px" />
+        <EmptyState v-else-if="!tgSubscribers.length" icon="bell" title="暂无订阅者" desc="添加 Chat ID 后，每小时告警汇总将推送给对应账号" style="padding:26px 0" />
+        <div v-else class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">名称</th><th scope="col">Chat ID</th><th scope="col">告警推送</th><th scope="col">查询权限</th><th scope="col">分组范围</th><th scope="col">最近发送</th><th scope="col" style="width:130px"><span class="sr-only">操作</span></th></tr></thead>
+            <tbody>
+              <tr v-for="s in tgSubscribers" :key="s.id">
+                <td data-label="名称">{{ s.display_name || '—' }}</td>
+                <td class="mono" data-label="Chat ID">{{ s.chat_id }}</td>
+                <td data-label="告警推送"><span class="badge" :class="s.alert_enabled ? 'badge-green' : 'badge-gray'">{{ s.alert_enabled ? '开启' : '关闭' }}</span></td>
+                <td data-label="查询权限"><span class="badge" :class="s.query_enabled ? 'badge-teal' : 'badge-gray'">{{ s.query_enabled ? '允许' : '禁止' }}</span></td>
+                <td data-label="分组范围">
+                  <span v-if="!s.group_ids.length" class="badge badge-gray" style="font-size:10px">全部分组</span>
+                  <span v-else class="row gap-1" style="flex-wrap:wrap">
+                    <span v-for="gid in s.group_ids" :key="gid" class="badge badge-teal" style="font-size:10px">{{ groupName(gid) }}</span>
+                  </span>
+                </td>
+                <td class="mono text-3" data-label="最近发送">{{ s.last_sent_at ? fmtDate(s.last_sent_at) : '—' }}</td>
+                <td class="row gap-1" style="justify-content:flex-end">
+                  <button class="btn btn-ghost btn-sm" @click="toggleSubEnabled(s)">{{ s.enabled ? '停用' : '启用' }}</button>
+                  <button class="btn btn-ghost btn-sm" @click="openSubModal(s)"><Icon name="pencil" :size="12" /></button>
+                  <button class="btn btn-ghost btn-sm" :aria-label="'删除 ' + s.chat_id" @click="askDeleteSub(s)"><Icon name="trash" :size="12" /></button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-if="tgDeliveryLogs.length" class="text-3 mt-2" style="font-size:11.5px">
+          最近投递：{{ tgDeliveryLogs.slice(0, 3).map(l => (l.success ? '✓' : '✗') + ' ' + l.message_kind + ' ' + fmtDate(l.sent_at)).join(' · ') }}
+        </div>
+      </div>
     </div>
 
     <!-- 创建 Key 弹窗 -->
@@ -507,6 +751,58 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
       danger
       @confirm="doRemovePrice"
       @cancel="confirmDeletePrice = null"
+    />
+
+    <!-- 订阅者编辑弹窗 -->
+    <BaseModal v-if="showSubModal" :title="editingSub ? '编辑订阅者' : '添加订阅者'" width="440px" @close="showSubModal = false">
+      <div class="field">
+        <label class="field-label">Chat ID *</label>
+        <input v-model="subForm.chat_id" class="input mono" placeholder="如 123456789" :disabled="!!editingSub">
+        <div class="field-hint">发消息给 Bot（如 /start）后，在 Telegram 中无法直接查看 ID；可先用其他 Bot 工具获取。</div>
+      </div>
+      <div class="field">
+        <label class="field-label">显示名称</label>
+        <input v-model="subForm.display_name" class="input" placeholder="如 运维-张三">
+      </div>
+      <div class="row gap-3" style="flex-wrap:wrap">
+        <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
+          <input type="checkbox" v-model="subForm.enabled" class="switch"> 启用
+        </label>
+        <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
+          <input type="checkbox" v-model="subForm.alert_enabled" class="switch"> 告警推送
+        </label>
+        <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
+          <input type="checkbox" v-model="subForm.query_enabled" class="switch"> 查询权限
+        </label>
+      </div>
+      <div class="field">
+        <label class="field-label">分组范围（不选 = 全部分组）</label>
+        <div class="row gap-2" style="flex-wrap:wrap">
+          <button v-for="g in groups" :key="g.id" type="button"
+            class="badge" :class="subForm.group_ids.includes(g.id) ? 'badge-teal' : 'badge-gray'"
+            style="cursor:pointer;border:none;font-family:inherit"
+            @click="subForm.group_ids.includes(g.id) ? subForm.group_ids.splice(subForm.group_ids.indexOf(g.id), 1) : subForm.group_ids.push(g.id)">
+            {{ g.name }}
+          </button>
+          <span v-if="!groups.length" class="text-3" style="font-size:12px">暂无分组</span>
+        </div>
+        <div class="field-hint mt-2">绑定后，告警与查询仅返回所选分组内的站点信息。</div>
+      </div>
+      <template #footer>
+        <button class="btn btn-ghost" @click="showSubModal = false">取消</button>
+        <button class="btn btn-primary" @click="saveSubscriber" :disabled="savingSub">{{ savingSub ? '保存中…' : '保存' }}</button>
+      </template>
+    </BaseModal>
+
+    <!-- 删除订阅者确认 -->
+    <ConfirmDialog
+      v-if="confirmDeleteSub"
+      title="删除订阅者"
+      :message="`确认删除 Chat ID ${confirmDeleteSub.chat_id}（${confirmDeleteSub.display_name || '未命名'}）？此操作不可恢复。`"
+      confirm-text="删除"
+      danger
+      @confirm="doDeleteSub"
+      @cancel="confirmDeleteSub = null"
     />
 
     <!-- 官方模型价格弹窗 -->

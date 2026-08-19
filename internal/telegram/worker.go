@@ -51,6 +51,9 @@ type Worker struct {
 	client BotClient
 	cmds   *CommandService
 
+	// builder 小时汇总报告构建器（nil 时报告退化为告警查询 stub）
+	builder *ReportBuilder
+
 	// lock 选主函数；nil 时默认直接成功（单实例部署）
 	lock LockFn
 
@@ -67,6 +70,9 @@ func NewWorker(store ConfigStore, client BotClient, cmds *CommandService, logger
 	}
 	return &Worker{store: store, client: client, cmds: cmds, logger: logger}
 }
+
+// SetReportBuilder 注入报告构建器（Checker 装配时注入，共享 DB）。
+func (w *Worker) SetReportBuilder(b *ReportBuilder) { w.builder = b }
 
 // SetLock 注入 advisory lock 实现（cmd/checker 装配时注入）。
 func (w *Worker) SetLock(fn LockFn) { w.lock = fn }
@@ -251,16 +257,19 @@ func (w *Worker) sendReportWindow(ctx context.Context, start, end time.Time) {
 	}
 }
 
-// buildReport 组装报告内容（无告警服务时仅返回系统概况心跳）。
+// buildReport 组装报告内容（ReportBuilder 组装系统概况 + 告警变化）。
 func (w *Worker) buildReport(ctx context.Context, start, end time.Time) string {
-	// 简化：Worker 层提供系统概况 + 告警变化由告警查询回调填充
-	if alertsQuery == nil {
+	if w.builder == nil {
 		return "🛰 <b>Smart Router 告警汇总</b>\n━━━━━━━━━━━━━━━━\n时间：" +
 			start.Format("2006-01-02 15:04") + "\n告警服务暂不可用。\n"
 	}
-	// 使用全局 changes（组过滤为空 = 全部；后续可细化为按订阅者分组）
-	msg, err := alertsQuery(ctx, nil, false)
+	cfg, err := w.store.LoadConfig(ctx)
 	if err != nil {
+		cfg = Config{}
+	}
+	msg, err := w.builder.Build(ctx, start, int(end.Sub(start)/time.Hour), cfg, nil)
+	if err != nil {
+		w.logger.Warn("Report build failed", zap.Error(err))
 		return "🛰 <b>Smart Router 告警汇总</b>\n时间：" + start.Format("2006-01-02 15:04") + "\n告警查询失败。\n"
 	}
 	return msg

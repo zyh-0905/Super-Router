@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 
 	"smart-router/internal/crypto"
 	"smart-router/internal/store"
+	"smart-router/internal/telegram"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -488,4 +490,140 @@ func (h *TelegramHandler) validateGroupIDs(c *gin.Context, groupIDs []int) error
 		}
 	}
 	return nil
+}
+
+// loadRawConfig 读取配置行原始值（含密文 Token），供 test/report 端点使用。
+func (h *TelegramHandler) loadRawConfig(c *gin.Context) (enabled bool, botToken, webBaseURL string, err error) {
+	err = h.DB.Pool.QueryRow(c.Request.Context(), `
+		SELECT enabled, bot_token, web_base_url FROM telegram_config WHERE id = 1
+	`).Scan(&enabled, &botToken, &webBaseURL)
+	return
+}
+
+// TestConnection POST /admin/telegram/test - 校验 Bot Token（getMe）。
+func (h *TelegramHandler) TestConnection(c *gin.Context) {
+	var req struct {
+		BotToken *string `json:"bot_token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	token := ""
+	if req.BotToken != nil && *req.BotToken != "" {
+		token = *req.BotToken
+	} else {
+		_, stored, _, err := h.loadRawConfig(c)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "failed to load telegram config"})
+			return
+		}
+		plain, derr := crypto.Decrypt(stored, h.CryptoKey)
+		if derr != nil {
+			c.JSON(500, gin.H{"error": "failed to decrypt bot token"})
+			return
+		}
+		token = plain
+	}
+	if token == "" {
+		c.JSON(400, gin.H{"error": "bot token not configured"})
+		return
+	}
+	client := telegram.NewClient(token)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	if err := client.GetMe(ctx); err != nil {
+		c.JSON(502, gin.H{"error": "getMe failed", "detail": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "message": "Bot Token 有效"})
+}
+
+// SendReport POST /admin/telegram/report - 立即向全部订阅者发送当前告警汇总。
+// 只触发一次发送，不改变正常调度。
+func (h *TelegramHandler) SendReport(c *gin.Context) {
+	_, stored, _, err := h.loadRawConfig(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to load telegram config"})
+		return
+	}
+	plain, derr := crypto.Decrypt(stored, h.CryptoKey)
+	if derr != nil || plain == "" {
+		c.JSON(400, gin.H{"error": "bot token not configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	builder := telegram.NewReportBuilder(h.DB)
+	cfg := telegram.Config{IncludeRecovered: true, IncludeOngoing: true}
+	_ = h.DB.Pool.QueryRow(ctx, `
+		SELECT include_recovered, include_ongoing, web_base_url FROM telegram_config WHERE id = 1
+	`).Scan(&cfg.IncludeRecovered, &cfg.IncludeOngoing, &cfg.WebBaseURL)
+	now := time.Now()
+	msg, err := builder.Build(ctx, now, 1, cfg, nil)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to build report"})
+		return
+	}
+
+	subs, err := telegram.NewSQLConfigStore(h.DB).LoadSubscribers(ctx)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to load subscribers"})
+		return
+	}
+	client := telegram.NewClient(plain)
+	sent, failed := 0, 0
+	for _, s := range subs {
+		if !s.Enabled || !s.AlertEnabled {
+			continue
+		}
+		for _, part := range telegram.SplitMessage(msg, telegram.MaxTelegramMessageLen) {
+			if _, err := client.SendMessage(ctx, s.ChatID, part); err != nil {
+				failed++
+				break
+			}
+			sent++
+		}
+	}
+	c.JSON(200, gin.H{
+		"message": fmt.Sprintf("已发送 %d 条消息，失败 %d", sent, failed),
+		"sent":    sent,
+		"failed":  failed,
+	})
+}
+
+// SendSubscriberTest POST /admin/telegram/subscribers/:id/test - 向单个订阅者发送测试消息。
+func (h *TelegramHandler) SendSubscriberTest(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		c.JSON(400, gin.H{"error": "invalid subscriber id"})
+		return
+	}
+	_, stored, _, err := h.loadRawConfig(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to load telegram config"})
+		return
+	}
+	plain, derr := crypto.Decrypt(stored, h.CryptoKey)
+	if derr != nil || plain == "" {
+		c.JSON(400, gin.H{"error": "bot token not configured"})
+		return
+	}
+	var chatID int64
+	if err := h.DB.Pool.QueryRow(c.Request.Context(), `
+		SELECT chat_id FROM telegram_subscribers WHERE id = $1
+	`, id).Scan(&chatID); err != nil {
+		c.JSON(404, gin.H{"error": "subscriber not found"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	client := telegram.NewClient(plain)
+	if _, err := client.SendMessage(ctx, chatID, "✅ Smart Router 测试消息：Telegram 通知链路正常。"); err != nil {
+		c.JSON(502, gin.H{"error": "sendMessage failed", "detail": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"ok": true, "message": "测试消息已发送"})
 }
