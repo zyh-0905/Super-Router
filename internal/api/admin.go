@@ -76,7 +76,10 @@ type channelUpdateRequest struct {
 	RatioLimit       *float64          `json:"ratio_limit"`
 	BalanceAPIURL    *string           `json:"balance_api_url"`
 	BalanceAPIToken  *string           `json:"balance_api_token"`
-	GroupIDs         *[]int            `json:"group_ids"`
+	// Sub2API 余额自动登录（019）：邮箱明文入库，密码加密入库（P1-07）
+	BalanceLoginEmail    *string `json:"balance_login_email"`
+	BalanceLoginPassword *string `json:"balance_login_password"`
+	GroupIDs             *[]int  `json:"group_ids"`
 	// ExpectedUpdatedAt 乐观锁（P1-08）：非空时与库中 updated_at 比较，不一致返回 409。
 	ExpectedUpdatedAt *string `json:"expected_updated_at"`
 }
@@ -127,7 +130,10 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 		RatioLimit       float64           `json:"ratio_limit"`
 		BalanceAPIURL    string            `json:"balance_api_url"`
 		BalanceAPIToken  string            `json:"balance_api_token"`
-		GroupIDs         []int             `json:"group_ids"`
+		// Sub2API 余额自动登录（019）：邮箱明文入库，密码加密入库（P1-07）
+		BalanceLoginEmail    string `json:"balance_login_email"`
+		BalanceLoginPassword string `json:"balance_login_password"`
+		GroupIDs             []int  `json:"group_ids"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -191,6 +197,11 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "failed to encrypt balance token"})
 		return
 	}
+	encBalanceLoginPassword, err := h.encryptCred(req.BalanceLoginPassword)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to encrypt balance login password"})
+		return
+	}
 
 	ctx := c.Request.Context()
 	modelMappingJSON, _ := json.Marshal(req.ModelMapping)
@@ -222,10 +233,10 @@ func (h *AdminHandler) CreateChannel(c *gin.Context) {
 
 	var id int
 	err = tx.QueryRow(ctx, `
-		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, protocol, relay_type, test_model, user_priority, weight, model_mapping, capabilities, daily_probe_budget, ratio_limit, balance_api_url, balance_api_token)
-		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		INSERT INTO upstreams (name, base_url, access_token, api_key, enabled, role, protocol, relay_type, test_model, user_priority, weight, model_mapping, capabilities, daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, balance_login_email, balance_login_password)
+		VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING id
-	`, req.Name, req.BaseURL, encAccessToken, encAPIKey, req.Role, req.Protocol, req.RelayType, req.TestModel, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, encBalanceToken).Scan(&id)
+	`, req.Name, req.BaseURL, encAccessToken, encAPIKey, req.Role, req.Protocol, req.RelayType, req.TestModel, req.UserPriority, req.Weight, modelMappingJSON, capabilitiesJSON, req.DailyProbeBudget, req.RatioLimit, req.BalanceAPIURL, encBalanceToken, req.BalanceLoginEmail, encBalanceLoginPassword).Scan(&id)
 
 	if err != nil {
 		h.logger.Error("Failed to create channel", zap.Error(err))
@@ -335,7 +346,7 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT id, name, base_url, enabled, role, protocol, relay_type, test_model, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
-		       daily_probe_budget, ratio_limit, balance_api_url, created_at, updated_at
+		       daily_probe_budget, ratio_limit, balance_api_url, balance_login_email, created_at, updated_at
 		FROM upstreams
 		ORDER BY id
 	`)
@@ -354,11 +365,11 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 		var enabled bool
 		var dailyProbeBudget, ratioLimit float64
 		var modelMappingJSON, capabilitiesJSON string
-		var balanceAPIURL string
+		var balanceAPIURL, balanceLoginEmail string
 		var createdAt, updatedAt time.Time
 
 		if err := rows.Scan(&id, &name, &baseURL, &enabled, &role, &proto, &relayType, &testModel, &userPriority, &weight,
-			&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &createdAt, &updatedAt); err != nil {
+			&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceLoginEmail, &createdAt, &updatedAt); err != nil {
 			h.logger.Warn("Failed to scan channel row", zap.Error(err))
 			continue
 		}
@@ -374,24 +385,26 @@ func (h *AdminHandler) ListChannels(c *gin.Context) {
 		}
 
 		channels = append(channels, map[string]interface{}{
-			"id":                 id,
-			"name":               name,
-			"base_url":           baseURL,
-			"enabled":            enabled,
-			"role":               role,
-			"protocol":           proto,
-			"relay_type":         relayType,
-			"test_model":         testModel,
-			"user_priority":      userPriority,
-			"weight":             weight,
-			"model_mapping":      modelMapping,
-			"capabilities":       capabilities,
-			"daily_probe_budget": dailyProbeBudget,
-			"ratio_limit":        ratioLimit,
-			"balance_api_url":    balanceAPIURL,
-			"groups":             groups,
-			"created_at":         createdAt.Format(time.RFC3339),
-			"updated_at":         updatedAt.Format(time.RFC3339),
+			"id":                       id,
+			"name":                     name,
+			"base_url":                 baseURL,
+			"enabled":                  enabled,
+			"role":                     role,
+			"protocol":                 proto,
+			"relay_type":               relayType,
+			"test_model":               testModel,
+			"user_priority":            userPriority,
+			"weight":                   weight,
+			"model_mapping":            modelMapping,
+			"capabilities":             capabilities,
+			"daily_probe_budget":       dailyProbeBudget,
+			"ratio_limit":              ratioLimit,
+			"balance_api_url":          balanceAPIURL,
+			"balance_login_email":      balanceLoginEmail,
+			"balance_login_configured": balanceLoginEmail != "",
+			"groups":                   groups,
+			"created_at":               createdAt.Format(time.RFC3339),
+			"updated_at":               updatedAt.Format(time.RFC3339),
 		})
 	}
 
@@ -414,16 +427,19 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		dailyProbeBudget, ratioLimit          float64
 		modelMappingJSON, capabilitiesJSON    string
 		balanceAPIURL, balanceAPIToken        string
+		balanceLoginEmail, balanceLoginPwd    string
 		createdAt, updatedAt                  time.Time
 	)
 
 	err := h.db.Pool.QueryRow(ctx, `
 		SELECT id, name, base_url, enabled, role, protocol, relay_type, test_model, user_priority, weight,
 		       COALESCE(model_mapping::text, '{}'), COALESCE(capabilities::text, '[]'),
-		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token, created_at, updated_at
+		       daily_probe_budget, ratio_limit, balance_api_url, balance_api_token,
+		       balance_login_email, balance_login_password, created_at, updated_at
 		FROM upstreams WHERE id = $1
 	`, id).Scan(&channelID, &name, &baseURL, &enabled, &role, &proto, &relayType, &testModel, &userPriority, &weight,
-		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken, &createdAt, &updatedAt)
+		&modelMappingJSON, &capabilitiesJSON, &dailyProbeBudget, &ratioLimit, &balanceAPIURL, &balanceAPIToken,
+		&balanceLoginEmail, &balanceLoginPwd, &createdAt, &updatedAt)
 
 	if err != nil {
 		c.JSON(404, gin.H{"error": "channel not found"})
@@ -446,6 +462,9 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		}
 	}
 
+	// 余额自动登录脱敏：邮箱可回显（用于编辑表单），密码只返回是否配置（P1-07）
+	balanceLoginConfigured := balanceLoginEmail != "" && balanceLoginPwd != ""
+
 	c.JSON(200, gin.H{
 		"id":                           channelID,
 		"name":                         name,
@@ -464,6 +483,8 @@ func (h *AdminHandler) GetChannel(c *gin.Context) {
 		"balance_api_url":              balanceAPIURL,
 		"balance_api_token_configured": balanceTokenConfigured,
 		"balance_api_token_suffix":     balanceTokenSuffix,
+		"balance_login_email":          balanceLoginEmail,
+		"balance_login_configured":     balanceLoginConfigured,
 		"created_at":                   createdAt.Format(time.RFC3339),
 		"updated_at":                   updatedAt.Format(time.RFC3339),
 	})
@@ -592,6 +613,19 @@ func (h *AdminHandler) UpdateChannel(c *gin.Context) {
 			return
 		}
 		updates = append(updates, "balance_api_token = $"+strconv.Itoa(len(args)+1))
+		args = append(args, enc)
+	}
+	if req.BalanceLoginEmail != nil {
+		updates = append(updates, "balance_login_email = $"+strconv.Itoa(len(args)+1))
+		args = append(args, *req.BalanceLoginEmail)
+	}
+	if req.BalanceLoginPassword != nil {
+		enc, err := h.encryptCred(*req.BalanceLoginPassword)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "failed to encrypt balance login password"})
+			return
+		}
+		updates = append(updates, "balance_login_password = $"+strconv.Itoa(len(args)+1))
 		args = append(args, enc)
 	}
 
@@ -1671,11 +1705,12 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 		stats["trend"] = []map[string]interface{}{}
 	}
 
-	// 模型分布
+	// 模型分布（排除 is_probe 探测行，如价格同步的 __pricing__，避免污染模型 top10）
 	rows, err = h.db.Pool.Query(ctx, `
 		SELECT model, COUNT(*)
 		FROM request_history
 		WHERE created_at >= NOW() - INTERVAL '24 hours'
+		  AND is_probe = false
 		  AND ($1::int IS NULL OR group_id = $1)
 		GROUP BY model ORDER BY COUNT(*) DESC LIMIT 10
 	`, gid)
@@ -1834,7 +1869,6 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 		}
 		rows.Close()
 	}
-	threshold := h.lowBalanceThreshold(ctx)
 	for _, ch := range channelStats {
 		id := ch["id"].(int)
 		if b, ok := balMap[id]; ok {
@@ -1853,119 +1887,8 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 	ratioSummary := h.buildRatioSummary(ctx, gid)
 	stats["ratio_summary"] = ratioSummary
 
-	// 告警：熔断开启 + 已禁用站点
-	alerts := []map[string]interface{}{}
-
-	// 低余额告警
-	for _, ch := range channelStats {
-		b, ok := ch["balance"].(float64)
-		if !ok {
-			continue
-		}
-		name := ch["name"].(string)
-		if b <= threshold {
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("bal_%d", ch["id"].(int)),
-				"name":    fmt.Sprintf("余额不足: %s 剩余 $%.2f（阈值 $%.2f）", name, b, threshold),
-				"channel": name,
-				"sev":     "critical",
-				"ago":     formatAgo(time.Now()),
-			})
-		}
-	}
-
-	// 倍率超限告警
-	for _, ch := range ratioSummary {
-		limit, _ := ch["ratio_limit"].(float64)
-		if limit <= 0 {
-			continue
-		}
-		ratios, _ := ch["ratios"].([]map[string]interface{})
-		for _, mr := range ratios {
-			ratio, _ := mr["real_ratio"].(float64)
-			if ratio <= limit {
-				continue
-			}
-			model, _ := mr["model"].(string)
-			name, _ := ch["name"].(string)
-			cid, _ := ch["id"].(int)
-			ago := "—"
-			if s, ok := mr["checked_at"].(string); ok {
-				if t, err := time.Parse(time.RFC3339, s); err == nil {
-					ago = formatAgo(t)
-				}
-			}
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("ratio_%d_%s", cid, model),
-				"name":    fmt.Sprintf("倍率超标: %s %s 实测 %.4fx 超过上限 %.4fx", name, model, ratio, limit),
-				"channel": name,
-				"model":   model,
-				"sev":     "critical",
-				"ago":     ago,
-			})
-		}
-	}
-
-	rows, err = h.db.Pool.Query(ctx, `
-		SELECT cs.channel_id, u.name, cs.model, cs.state, cs.updated_at
-		FROM circuit_states cs
-		JOIN upstreams u ON u.id = cs.channel_id
-		WHERE cs.state IN ('open', 'degraded')
-		  AND ($1::int IS NULL OR EXISTS (
-			SELECT 1 FROM channel_group_members cgm
-			WHERE cgm.channel_id = cs.channel_id AND cgm.group_id = $1
-		  ))
-		ORDER BY cs.updated_at DESC LIMIT 20
-	`, gid)
-	if err == nil {
-		for rows.Next() {
-			var cid int
-			var name, model, state string
-			var updatedAt time.Time
-			if err := rows.Scan(&cid, &name, &model, &state, &updatedAt); err != nil {
-				continue
-			}
-			sev := "warning"
-			if state == "open" {
-				sev = "critical"
-			}
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("cb_%d_%s", cid, model),
-				"name":    fmt.Sprintf("熔断%s: %s (%s)", map[string]string{"open": "已开启", "degraded": "降级"}[state], name, model),
-				"channel": name,
-				"model":   model,
-				"sev":     sev,
-				"ago":     formatAgo(updatedAt),
-			})
-		}
-		rows.Close()
-	}
-	rows, err = h.db.Pool.Query(ctx, `
-		SELECT id, name FROM upstreams WHERE enabled = false
-		  AND ($1::int IS NULL OR EXISTS (
-			SELECT 1 FROM channel_group_members cgm
-			WHERE cgm.channel_id = upstreams.id AND cgm.group_id = $1
-		  ))
-		ORDER BY id
-	`, gid)
-	if err == nil {
-		for rows.Next() {
-			var id int
-			var name string
-			if err := rows.Scan(&id, &name); err != nil {
-				continue
-			}
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("dis_%d", id),
-				"name":    fmt.Sprintf("站点已禁用: %s", name),
-				"channel": name,
-				"sev":     "warning",
-				"ago":     "—",
-			})
-		}
-		rows.Close()
-	}
-	stats["alerts"] = alerts
+	// 告警：低余额 / 倍率超限 / 熔断开闸降级 / 站点禁用（与告警页共用构建逻辑）
+	stats["alerts"] = h.buildAlerts(ctx, gid, channelStats, ratioSummary)
 
 	// 分组列表（供前端切换器）+ 当前筛选分组名
 	groupRows, err := h.db.Pool.Query(ctx, `
@@ -2009,6 +1932,263 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 	stats["generated_at"] = time.Now().Format(time.RFC3339)
 
 	c.JSON(200, stats)
+}
+
+// buildAlerts 构建全部活跃告警：低余额 / 倍率超限 / 熔断开闸降级 / 站点禁用。
+// channelStats 需含 id/name/balance 字段（balance 为 nil 或 float64），
+// ratioSummary 为 buildRatioSummary 的输出。与 GetStats / GetAlerts 共用。
+func (h *AdminHandler) buildAlerts(ctx context.Context, gid *int, channelStats []map[string]interface{}, ratioSummary []map[string]interface{}) []map[string]interface{} {
+	alerts := []map[string]interface{}{}
+	threshold := h.lowBalanceThreshold(ctx)
+
+	// 1. 低余额告警
+	for _, ch := range channelStats {
+		b, ok := ch["balance"].(float64)
+		if !ok {
+			continue
+		}
+		name, _ := ch["name"].(string)
+		if b <= threshold {
+			alerts = append(alerts, map[string]interface{}{
+				"id":      fmt.Sprintf("bal_%d", ch["id"].(int)),
+				"name":    fmt.Sprintf("余额不足: %s 剩余 $%.2f（阈值 $%.2f）", name, b, threshold),
+				"channel": name,
+				"sev":     "critical",
+				"ago":     formatAgo(time.Now()),
+			})
+		}
+	}
+
+	// 2. 倍率超限告警
+	for _, ch := range ratioSummary {
+		limit, _ := ch["ratio_limit"].(float64)
+		if limit <= 0 {
+			continue
+		}
+		ratios, _ := ch["ratios"].([]map[string]interface{})
+		for _, mr := range ratios {
+			ratio, _ := mr["real_ratio"].(float64)
+			if ratio <= limit {
+				continue
+			}
+			model, _ := mr["model"].(string)
+			name, _ := ch["name"].(string)
+			cid, _ := ch["id"].(int)
+			ago := "—"
+			if s, ok := mr["checked_at"].(string); ok {
+				if t, err := time.Parse(time.RFC3339, s); err == nil {
+					ago = formatAgo(t)
+				}
+			}
+			alerts = append(alerts, map[string]interface{}{
+				"id":      fmt.Sprintf("ratio_%d_%s", cid, model),
+				"name":    fmt.Sprintf("倍率超标: %s %s 实测 %.4fx 超过上限 %.4fx", name, model, ratio, limit),
+				"channel": name,
+				"model":   model,
+				"sev":     "critical",
+				"ago":     ago,
+			})
+		}
+	}
+
+	// 3. 熔断开闸/降级告警
+	rows, err := h.db.Pool.Query(ctx, `
+		SELECT cs.channel_id, u.name, cs.model, cs.state, cs.updated_at
+		FROM circuit_states cs
+		JOIN upstreams u ON u.id = cs.channel_id
+		WHERE cs.state IN ('open', 'degraded')
+		  AND ($1::int IS NULL OR EXISTS (
+			SELECT 1 FROM channel_group_members cgm
+			WHERE cgm.channel_id = cs.channel_id AND cgm.group_id = $1
+		  ))
+		ORDER BY cs.updated_at DESC LIMIT 20
+	`, gid)
+	if err == nil {
+		for rows.Next() {
+			var cid int
+			var name, model, state string
+			var updatedAt time.Time
+			if err := rows.Scan(&cid, &name, &model, &state, &updatedAt); err != nil {
+				continue
+			}
+			sev := "warning"
+			if state == "open" {
+				sev = "critical"
+			}
+			alerts = append(alerts, map[string]interface{}{
+				"id":      fmt.Sprintf("cb_%d_%s", cid, model),
+				"name":    fmt.Sprintf("熔断%s: %s (%s)", map[string]string{"open": "已开启", "degraded": "降级"}[state], name, model),
+				"channel": name,
+				"model":   model,
+				"sev":     sev,
+				"ago":     formatAgo(updatedAt),
+			})
+		}
+		rows.Close()
+	}
+
+	// 4. 站点禁用告警
+	rows, err = h.db.Pool.Query(ctx, `
+		SELECT id, name FROM upstreams WHERE enabled = false
+		  AND ($1::int IS NULL OR EXISTS (
+			SELECT 1 FROM channel_group_members cgm
+			WHERE cgm.channel_id = upstreams.id AND cgm.group_id = $1
+		  ))
+		ORDER BY id
+	`, gid)
+	if err == nil {
+		for rows.Next() {
+			var id int
+			var name string
+			if err := rows.Scan(&id, &name); err != nil {
+				continue
+			}
+			alerts = append(alerts, map[string]interface{}{
+				"id":      fmt.Sprintf("dis_%d", id),
+				"name":    fmt.Sprintf("站点已禁用: %s", name),
+				"channel": name,
+				"sev":     "warning",
+				"ago":     "—",
+			})
+		}
+		rows.Close()
+	}
+
+	// 5. 价格同步失败告警（最近 30 分钟内倍率查询失败的站点）
+	rows, err = h.db.Pool.Query(ctx, `
+		SELECT rh.channel_id, u.name, MAX(rh.created_at)
+		FROM request_history rh
+		JOIN upstreams u ON u.id = rh.channel_id
+		WHERE rh.is_probe = true AND rh.capability = 'pricing'
+		  AND rh.success = false
+		  AND rh.created_at >= NOW() - INTERVAL '30 minutes'
+		  AND ($1::int IS NULL OR EXISTS (
+			SELECT 1 FROM channel_group_members cgm
+			WHERE cgm.channel_id = rh.channel_id AND cgm.group_id = $1
+		  ))
+		GROUP BY rh.channel_id, u.name
+		ORDER BY MAX(rh.created_at) DESC
+	`, gid)
+	if err == nil {
+		for rows.Next() {
+			var cid int
+			var name string
+			var lastFail time.Time
+			if err := rows.Scan(&cid, &name, &lastFail); err != nil {
+				continue
+			}
+			alerts = append(alerts, map[string]interface{}{
+				"id":      fmt.Sprintf("pricing_%d", cid),
+				"name":    fmt.Sprintf("价格同步失败: %s（最近一轮倍率查询失败）", name),
+				"channel": name,
+				"sev":     "warning",
+				"ago":     formatAgo(lastFail),
+			})
+		}
+		rows.Close()
+	}
+	return alerts
+}
+
+// GetAlerts GET /admin/alerts - 全部活跃告警（告警页专用，支持 ?group_id= 分组筛选）
+func (h *AdminHandler) GetAlerts(c *gin.Context) {
+	ctx := c.Request.Context()
+	gid := parseGroupIDParam(c)
+
+	// 站点基础信息 + 最新成功余额（低余额判定所需的最小集合）
+	channelStats := []map[string]interface{}{}
+	rows, err := h.db.Pool.Query(ctx, `
+		SELECT u.id, u.name
+		FROM upstreams u
+		WHERE $1::int IS NULL OR EXISTS (
+			SELECT 1 FROM channel_group_members cgm
+			WHERE cgm.channel_id = u.id AND cgm.group_id = $1
+		)
+		ORDER BY u.id
+	`, gid)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "failed to query channels"})
+		return
+	}
+	balMap := map[int]map[string]interface{}{}
+	brows, berr := h.db.Pool.Query(ctx, `
+		SELECT DISTINCT ON (channel_id) channel_id, balance, currency, source, error, checked_at
+		FROM balance_checks
+		WHERE source != ''
+		ORDER BY channel_id, checked_at DESC
+	`)
+	if berr == nil {
+		for brows.Next() {
+			var cid int
+			var balance float64
+			var currency, source, errMsg string
+			var checkedAt time.Time
+			if brows.Scan(&cid, &balance, &currency, &source, &errMsg, &checkedAt) != nil {
+				continue
+			}
+			balMap[cid] = map[string]interface{}{
+				"balance": balance, "currency": currency, "source": source,
+				"error": errMsg, "checked_at": checkedAt.Format(time.RFC3339),
+			}
+		}
+		brows.Close()
+	}
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			continue
+		}
+		ch := map[string]interface{}{"id": id, "name": name, "balance": nil}
+		if b, ok := balMap[id]; ok {
+			ch["balance"] = b["balance"]
+			ch["balance_currency"] = b["currency"]
+			ch["balance_checked_at"] = b["checked_at"]
+		}
+		channelStats = append(channelStats, ch)
+	}
+	rows.Close()
+
+	alerts := h.buildAlerts(ctx, gid, channelStats, h.buildRatioSummary(ctx, gid))
+	c.JSON(200, gin.H{
+		"alerts":       alerts,
+		"total":        len(alerts),
+		"group_id":     gid,
+		"generated_at": time.Now().Format(time.RFC3339),
+	})
+}
+
+// DeleteDecisions DELETE /admin/decisions - 批量删除决策日志（多选/全选）
+func (h *AdminHandler) DeleteDecisions(c *gin.Context) {
+	var req struct {
+		RequestIDs []string `json:"request_ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	if len(req.RequestIDs) == 0 {
+		c.JSON(400, gin.H{"error": "request_ids is required"})
+		return
+	}
+	if len(req.RequestIDs) > 500 {
+		c.JSON(400, gin.H{"error": "too many request_ids (max 500)"})
+		return
+	}
+
+	tag, err := h.db.Pool.Exec(c.Request.Context(), `
+		DELETE FROM decision_logs WHERE request_id = ANY($1)
+	`, req.RequestIDs)
+	if err != nil {
+		h.logger.Error("Failed to delete decisions", zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to delete decisions"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"deleted":         tag.RowsAffected(),
+		"total_requested": len(req.RequestIDs),
+	})
 }
 
 // worse 判断熔断状态严重程度 a > b
