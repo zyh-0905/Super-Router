@@ -40,6 +40,8 @@ func TestUpFromEmptyDatabase(t *testing.T) {
 		"public.telegram_config",
 		"public.telegram_subscribers",
 		"public.telegram_delivery_logs",
+		"public.quality_check_runs",
+		"public.quality_check_results",
 	} {
 		var exists bool
 		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
@@ -50,13 +52,17 @@ func TestUpFromEmptyDatabase(t *testing.T) {
 		}
 	}
 
-	// 020 索引验收
+	// 020/021 索引验收
 	for _, idx := range []string{
 		"idx_alert_events_active_key",
 		"idx_alert_events_channel_time",
 		"idx_alert_events_status_time",
 		"idx_telegram_subscribers_enabled",
 		"idx_telegram_delivery_logs_subscriber_time",
+		"idx_quality_check_runs_channel_time",
+		"idx_quality_check_runs_queue",
+		"idx_quality_check_runs_active_channel",
+		"idx_quality_check_results_run_time",
 	} {
 		var exists bool
 		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)`, idx).Scan(&exists); err != nil {
