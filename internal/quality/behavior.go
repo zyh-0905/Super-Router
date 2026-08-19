@@ -16,6 +16,10 @@ func JudgeUsage(ev *ChatEvidence) StageResult {
 		res.Details["reason"] = "no_chat_evidence"
 		return res
 	}
+	// 复用证据时同步 HTTP/耗时字段（阶段结果记录完整指标）
+	res.HTTPStatus = intPtr(ev.HTTPStatus)
+	res.TTFBMS = intPtr(ev.TTFBMS)
+	res.LatencyMS = intPtr(ev.TotalMS)
 	u := ev.Usage
 	res.Details["usage_present"] = u.Present
 	if u.Present {
@@ -121,8 +125,9 @@ func JudgeProtocol(ev *ChatEvidence) StageResult {
 	case ev.HTTPStatus >= 400:
 		res.Status = StatusFailed
 		res.Error = classifyHTTPStatus(ev.HTTPStatus)
-	case ev.Text == "":
-		res.Status = StatusAttention
+	case strings.TrimSpace(ev.Text) == "":
+		// HTTP 200 但响应结构异常（choices 缺失/内容为空）→ 协议结构检查失败
+		res.Status = StatusFailed
 		res.Error = "empty_content"
 		res.Details["code"] = "empty_content"
 	default:
