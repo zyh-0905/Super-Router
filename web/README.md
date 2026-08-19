@@ -37,7 +37,7 @@ open http://localhost:5173/
 | 路由 | 页面 | 说明 |
 |---|---|---|
 | `#/` | 总览 | 24h 请求/成功率/延迟（同比）、趋势图、模型分布、告警、**决策雷达**（最近一次决策六维对比 + 近 10 次最优站点，可点击切换）、**分组切换器**、站点综合信息抽屉 |
-| `#/channels` | 站点 | 站点列表（**分组筛选**、**余额徽章**、OpenAI/Anthropic 协议徽章、中转站类型徽章、角色中文徽章）、详情（信息/健康/统计/余额/**倍率**）、新增/编辑（**接口协议**、**中转站类型**、**默认测试模型**、**余额自动登录邮箱密码**、多选分组、乐观锁、**测试连接**）、**分组管理**、**倍率检测分组**、获取上游模型 |
+| `#/channels` | 站点 | 站点列表（**分组筛选**、**余额徽章**、OpenAI/Anthropic 协议徽章、中转站类型徽章、角色中文徽章）、详情（信息/健康/统计/余额/**倍率**/**质量检测**）、新增/编辑（**接口协议**、**中转站类型**、**默认测试模型**、**余额自动登录邮箱密码**、多选分组、乐观锁、**测试连接**）、**分组管理**、**倍率检测分组**、获取上游模型 |
 | `#/playground` | 测试台 | 真实流式请求、**站点选择自动预填该站点默认测试模型**、**分组选择**（限定路由范围且站点列表联动过滤）、路由决策信息、**请求中等待动画**（进行中状态条 + 三点弹跳 + 实时计时） |
 | `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉（候选**六维评分雷达图** + 真实指标/人话排名/排除原因/故障切换明细）、**编辑模式多选/全选删除与导出** |
 | `#/strategy` | 策略中心 | 路由策略按「系统默认」与**每个分组**分别配置；5 种策略可视化卡片（因素权重条）、「加权均衡」四维权重滑块、分组一键恢复跟随系统默认 |
@@ -115,6 +115,7 @@ web/
 | API Keys | `GET/POST /admin/keys` · `PATCH/DELETE /admin/keys/:id`（支持 group_ids 绑定） |
 | 运行配置 | `GET /admin/config` |
 | **Telegram 告警** | `GET/PATCH /admin/telegram/config`（Token 脱敏/加密保存） · `POST /admin/telegram/test`（getMe 验证） · `POST /admin/telegram/report`（立即发送汇总） · `GET/POST /admin/telegram/subscribers` · `PATCH/DELETE /admin/telegram/subscribers/:id` · `POST .../subscribers/:id/test` · `GET /admin/telegram/delivery-logs` |
+| **接口质量检测** | `POST /admin/channels/:id/quality-checks`（创建，同站点活跃任务 409） · `GET /admin/channels/:id/quality-checks`（历史） · `GET /admin/quality-checks/:run_id`（详情） · `GET /admin/quality-checks/:run_id/events`（带认证 SSE 进度） · `POST /admin/quality-checks/:run_id/cancel` |
 | 测试请求 | `POST /v1/chat/completions`（body `group` 字段或 `X-Group` 头） |
 
 ## 中转站分组
@@ -149,6 +150,16 @@ web/
 - **订阅者管理**：Chat ID 只能由管理员在后台手动录入（不开放 /start 自助绑定）；可分别控制告警推送与查询权限，并可限定分组范围（空 = 全部）
 - **查询命令**：`/alerts` `/alert <key>` `/status` `/relay [id]` `/balance [id]` `/health [id]` `/ratio [id]`——全部只读数据库，不触发上游调用；未授权 Chat ID 统一拒绝
 - **发送状态**：设置页显示最近轮询/汇总/错误；「告警」页显示 Telegram 状态并可立即发送当前汇总（只触发一次，不改变调度）
+- **`/quality <id>`**：查询最近一次接口质量检测摘要（各阶段状态/耗时），只读历史，不启动新检测
+
+## 接口质量检测
+
+- **一键检测**：站点详情「质量检测」页签；复用已保存凭据，任务由 checker 异步执行（全局最多 3 并发，同站点同时最多 1 个）
+- **模型解析**：默认站点 test_model → 全局 probe_model（需在映射中）→ 按名称排序的首个映射；可临时选择已映射模型，只影响当前任务
+- **检测深度**：basic（连接性/协议/流式）与 full（+Usage/模型行为）；full 最多发起两次小型聊天请求（非流式+流式），**可能产生少量上游费用**；界面明确提示
+- **结果语义**：good / attention / failed / unknown 是启发式质量信号，**不是绝对模型真实性证明**；行为不一致只产生"需要关注"，不判"假模型"
+- **实时进度**：带认证 fetch SSE（原生 EventSource 无法携带 Bearer）+ 阶段呼吸动画；SSE 断开自动退化 1s 轮询；刷新页面恢复进行中任务；`prefers-reduced-motion` 禁用循环动画
+- **历史与告警**：最近 5 次检测历史；关键阶段硬失败产生 `quality_check_failed` 告警（后续通过自动恢复）
 
 ## 常见问题
 
