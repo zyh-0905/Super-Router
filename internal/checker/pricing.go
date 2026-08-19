@@ -156,10 +156,18 @@ func (p *PricingChecker) syncOne(ctx context.Context, upstream Upstream, epoch i
 
 	// 批量写入数据库
 	insertCount := 0
+	skipped := 0
 	for _, item := range pricingResp.Data {
 		// 计算最终倍率（group_ratio 通常是全局倍率）
 		promptRatio := item.ModelRatio * item.GroupRatio
 		completionRatio := item.CompletionRatio * item.GroupRatio
+
+		// 丢弃无效条目：部分中转站的 /api/pricing 会返回空模型名或零倍率。
+		// 零倍率入库后会被换算成 $0 单价，使该渠道在 price_first 下显得免费而永远排第一。
+		if item.Model == "" || promptRatio <= 0 || completionRatio <= 0 {
+			skipped++
+			continue
+		}
 
 		_, err := p.db.Pool.Exec(ctx, `
 			INSERT INTO declared_prices (upstream_id, epoch, model, prompt_ratio, completion_ratio, checked_at)
@@ -174,6 +182,14 @@ func (p *PricingChecker) syncOne(ctx context.Context, upstream Upstream, epoch i
 			continue
 		}
 		insertCount++
+	}
+
+	if skipped > 0 {
+		p.logger.Warn("Skipped invalid pricing entries (empty model or non-positive ratio)",
+			zap.String("name", upstream.Name),
+			zap.Int("skipped", skipped),
+			zap.Int("total", len(pricingResp.Data)),
+		)
 	}
 
 	p.logger.Debug("Pricing synced",

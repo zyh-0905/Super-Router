@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"smart-router/internal/crypto"
 	"smart-router/internal/metrics"
@@ -817,6 +819,15 @@ func (h *ProxyHandler) resolveGroupID(ctx context.Context, spec string) (int, er
 
 // 辅助函数
 
+// 输入 token 估算的经验系数（无分词器，仅用于成本估算与价格上限过滤，
+// 不用于计费；真实用量以上游返回的 usage 为准）。
+const (
+	tokensPerASCIIChar    = 0.25 // 英文约 4 字符/token
+	tokensPerNonASCIIChar = 0.6  // 中日韩等约 1.7 字符/token
+	messageOverheadTokens = 4    // 每条消息的 role/分隔符开销
+	mediaPartTokens       = 800  // 单个图片/音频块的粗略等效 token
+)
+
 func extractCapabilities(req *ChatCompletionRequest) []string {
 	var caps []string
 	if len(req.Tools) > 0 {
@@ -826,8 +837,69 @@ func extractCapabilities(req *ChatCompletionRequest) []string {
 }
 
 func estimateInputTokens(req *ChatCompletionRequest) int {
-	// 简化：每个消息约 100 tokens
-	return len(req.Messages) * 100
+	total := 0.0
+	for _, m := range req.Messages {
+		total += messageOverheadTokens
+		total += estimateContentTokens(m.Content)
+	}
+	// 工具定义也计入输入上下文，schema 较大时占比可观
+	for _, t := range req.Tools {
+		if b, err := json.Marshal(t); err == nil {
+			total += estimateTextTokens(string(b))
+		}
+	}
+	if total < 1 {
+		return 1
+	}
+	return int(math.Ceil(total))
+}
+
+// estimateContentTokens 估算单条消息 content 的 token 数。
+// content 为原始 JSON：可能是字符串，也可能是多模态内容块数组。
+func estimateContentTokens(raw json.RawMessage) float64 {
+	if len(raw) == 0 {
+		return 0
+	}
+
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return estimateTextTokens(s)
+	}
+
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) == nil {
+		total := 0.0
+		for _, p := range parts {
+			switch p.Type {
+			case "text":
+				total += estimateTextTokens(p.Text)
+			case "image_url", "input_audio":
+				total += mediaPartTokens
+			}
+		}
+		return total
+	}
+
+	// 无法识别的结构：按原始 JSON 字节兜底，好过记为 0
+	return estimateTextTokens(string(raw))
+}
+
+// estimateTextTokens 按字符类别估算 token 数。
+// 无分词器，用经验比例区分 ASCII 与非 ASCII：英文约 4 字符/token，
+// 中日韩等非 ASCII 字符信息密度高，约 1.7 字符/token。
+func estimateTextTokens(s string) float64 {
+	total := 0.0
+	for _, r := range s {
+		if r < utf8.RuneSelf {
+			total += tokensPerASCIIChar
+		} else {
+			total += tokensPerNonASCIIChar
+		}
+	}
+	return total
 }
 
 func generateRequestID() string {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -241,3 +242,58 @@ func TestRequestFidelityPreservesUnknownFields(t *testing.T) {
 		t.Fatal("max_completion_tokens must survive marshal roundtrip")
 	}
 }
+
+// 输入 token 估算：此前固定为 len(messages)*100，与内容长度无关，
+// 使成本估算与 max_price_cap 过滤形同虚设。
+func TestEstimateInputTokensScalesWithContent(t *testing.T) {
+	parse := func(body string) *ChatCompletionRequest {
+		t.Helper()
+		var req ChatCompletionRequest
+		if err := json.Unmarshal([]byte(body), &req); err != nil {
+			t.Fatal(err)
+		}
+		return &req
+	}
+
+	short := parse(`{"messages":[{"role":"user","content":"hi"}]}`)
+	long := parse(`{"messages":[{"role":"user","content":"` + strings.Repeat("word ", 400) + `"}]}`)
+
+	if estimateInputTokens(long) <= estimateInputTokens(short) {
+		t.Fatalf("long prompt must estimate higher: short=%d long=%d",
+			estimateInputTokens(short), estimateInputTokens(long))
+	}
+
+	// 2000 个 ASCII 字符 ≈ 500 token，允许量级范围内的偏差
+	if got := estimateInputTokens(long); got < 300 || got > 900 {
+		t.Fatalf("2000 ASCII chars estimated %d tokens, want roughly 500", got)
+	}
+
+	// 非 ASCII 密度更高：同字符数的中文应比英文估得多
+	cn := parse(`{"messages":[{"role":"user","content":"` + strings.Repeat("中", 100) + `"}]}`)
+	en := parse(`{"messages":[{"role":"user","content":"` + strings.Repeat("a", 100) + `"}]}`)
+	if estimateInputTokens(cn) <= estimateInputTokens(en) {
+		t.Fatalf("CJK must estimate higher than ASCII: cn=%d en=%d",
+			estimateInputTokens(cn), estimateInputTokens(en))
+	}
+
+	// 空消息也至少记 1 token，避免成本恒为 0
+	if got := estimateInputTokens(parse(`{"messages":[]}`)); got < 1 {
+		t.Fatalf("empty request estimated %d, want >= 1", got)
+	}
+}
+
+// 多模态内容块必须计入估算（文本块按文本、图片块按等效常量）
+func TestEstimateInputTokensMultimodal(t *testing.T) {
+	var req ChatCompletionRequest
+	if err := json.Unmarshal([]byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"describe"},
+		{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
+	]}]}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	// 图片块应显著抬高估算，不能像纯文本一样只有几个 token
+	if got := estimateInputTokens(&req); got < mediaPartTokens {
+		t.Fatalf("multimodal estimate = %d, want >= %d", got, mediaPartTokens)
+	}
+}
+

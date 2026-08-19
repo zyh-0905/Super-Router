@@ -109,6 +109,16 @@ type PriceProfile struct {
 const snapshotCacheKey = "router:snapshot"
 const snapshotCacheTTL = 10 * time.Second
 
+// declaredRatioBasePerM 声明倍率（declared_prices.prompt_ratio / completion_ratio）
+// 换算成 $/1M tokens 时使用的基准单价。
+//
+// 注意：这是一个未经上游核实的假设值。上游 /api/pricing 返回的是无量纲倍率，
+// 具体基准取决于中转站实现（one-api 系通常以某个固定单价为倍率 1）。
+// 声明价格只在「没有实测倍率」时作为兜底参与成本估算，实测倍率（basis=official）
+// 优先级更高且是相对官网价的真实测量值，因此该常量的误差不影响主路径。
+// 若要精确化，应实测校准后再调整，不要凭猜测改动。
+const declaredRatioBasePerM = 10.0
+
 // InvalidateSnapshotCache 清除快照缓存。
 // 手动实测倍率/站点配置变更后调用，使下一请求立即基于新数据路由。
 func InvalidateSnapshotCache(ctx context.Context, redis *store.RedisClient) {
@@ -189,40 +199,21 @@ func buildSnapshot(ctx context.Context, db *store.DB) (*HealthSnapshot, error) {
 		return nil, fmt.Errorf("load channels: %w", err)
 	}
 
-	// 填充每个渠道的健康数据
+	byID := make(map[int]*ChannelHealth, len(channels))
 	for _, ch := range channels {
 		snapshot.Channels[ch.ID] = ch
-
-		// 加载存活状态
-		if err := loadAliveStatus(ctx, db, ch, epoch); err != nil {
-			// 非致命错误，记录日志但继续
-			ch.IsAlive = false
-		}
-
-		// 加载声明价格
-		if err := loadDeclaredPrices(ctx, db, ch, epoch); err != nil {
-			ch.DeclaredPrice = make(map[string]*PriceProfile)
-		}
-
-		// 加载实测倍率和 TTFT
-		if err := loadProbeResults(ctx, db, ch, epoch); err != nil {
-			ch.RealRatio = make(map[string]float64)
-			ch.TTFTP50 = make(map[string]int)
-			ch.TTFTP95 = make(map[string]int)
-		}
-
-		// 加载请求历史（滑动窗口：最近 1 小时或最近 1000 次）
-		if err := loadRequestHistory(ctx, db, ch); err != nil {
-			ch.RecentAttempts = 0
-			ch.RecentSuccesses = 0
-			ch.ReliabilityScore = 0.5 // 默认值
-		}
-
-		// 加载熔断状态
-		if err := loadCircuitState(ctx, db, ch); err != nil {
-			ch.CircuitState = "closed"
-		}
+		byID[ch.ID] = ch
 	}
+
+	// 健康数据按表批量加载（每张表一次查询，与渠道数无关）：
+	// 逐渠道查询会让快照重建的往返次数随渠道数线性增长（N+1），
+	// 缓存到期的瞬间所有并发请求都会撞上重建，放大为 DB 压力尖峰。
+	// 单表失败不致命：该表对应字段退化为默认值，路由继续。
+	loadAliveStatusAll(ctx, db, byID, epoch)
+	loadDeclaredPricesAll(ctx, db, byID, epoch)
+	loadProbeResultsAll(ctx, db, byID, epoch)
+	loadRequestHistoryAll(ctx, db, byID)
+	loadCircuitStatesAll(ctx, db, byID)
 
 	return snapshot, nil
 }
@@ -252,6 +243,9 @@ func loadChannels(ctx context.Context, db *store.DB) ([]*ChannelHealth, error) {
 			TTFTP95:                  make(map[string]int),
 			GroupIDs:                 []int{},
 			CircuitStates:            make(map[string]string),
+			// 无请求历史时的默认可靠性 = 贝叶斯先验 5/10；批量加载只覆盖有历史的渠道
+			ReliabilityScore: 0.5,
+			CircuitState:     "closed",
 		}
 
 		var modelMappingJSON, capabilitiesJSON []byte
@@ -297,84 +291,131 @@ func loadChannels(ctx context.Context, db *store.DB) ([]*ChannelHealth, error) {
 	return channels, nil
 }
 
-func loadAliveStatus(ctx context.Context, db *store.DB, ch *ChannelHealth, epoch int64) error {
-	// 读取最近的存活记录（最近 3 个 epoch）
-	err := db.Pool.QueryRow(ctx, `
-		SELECT is_alive
-		FROM health_checks
-		WHERE upstream_id = $1 AND epoch <= $2
-		ORDER BY epoch DESC
-		LIMIT 1
-	`, ch.ID, epoch).Scan(&ch.IsAlive)
-
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func loadDeclaredPrices(ctx context.Context, db *store.DB, ch *ChannelHealth, epoch int64) error {
+func loadAliveStatusAll(ctx context.Context, db *store.DB, byID map[int]*ChannelHealth, epoch int64) {
 	rows, err := db.Pool.Query(ctx, `
-		SELECT DISTINCT ON (model) model, prompt_ratio, completion_ratio
-		FROM declared_prices
-		WHERE upstream_id = $1 AND epoch <= $2
-		ORDER BY model, epoch DESC
-	`, ch.ID, epoch)
+		SELECT DISTINCT ON (upstream_id) upstream_id, is_alive
+		FROM health_checks
+		WHERE epoch <= $1
+		ORDER BY upstream_id, epoch DESC
+	`, epoch)
 	if err != nil {
-		return err
+		return
 	}
 	defer rows.Close()
 
 	for rows.Next() {
+		var id int
+		var alive bool
+		if err := rows.Scan(&id, &alive); err != nil {
+			continue
+		}
+		if ch := byID[id]; ch != nil {
+			ch.IsAlive = alive
+		}
+	}
+}
+
+func loadDeclaredPricesAll(ctx context.Context, db *store.DB, byID map[int]*ChannelHealth, epoch int64) {
+	// 只取有效行：上游 /api/pricing 可能返回空模型名或零倍率，
+	// 零价格会让 estimateCost 算出 0 成本，使该渠道在 price_first 下永远排第一。
+	rows, err := db.Pool.Query(ctx, `
+		SELECT DISTINCT ON (upstream_id, model) upstream_id, model, prompt_ratio, completion_ratio
+		FROM declared_prices
+		WHERE epoch <= $1 AND model <> '' AND prompt_ratio > 0 AND completion_ratio > 0
+		ORDER BY upstream_id, model, epoch DESC
+	`, epoch)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int
 		var model string
 		var promptRatio, completionRatio float64
-		if err := rows.Scan(&model, &promptRatio, &completionRatio); err != nil {
+		if err := rows.Scan(&id, &model, &promptRatio, &completionRatio); err != nil {
 			continue
 		}
-
+		ch := byID[id]
+		if ch == nil {
+			continue
+		}
 		ch.DeclaredPrice[model] = &PriceProfile{
-			InputPrice:  promptRatio * 10.0, // 转换为 $/1M tokens（假设基准 $10/1M）
-			OutputPrice: completionRatio * 10.0,
+			InputPrice:  promptRatio * declaredRatioBasePerM,
+			OutputPrice: completionRatio * declaredRatioBasePerM,
 		}
 	}
-
-	return rows.Err()
 }
 
-func loadProbeResults(ctx context.Context, db *store.DB, ch *ChannelHealth, epoch int64) error {
-	// 按 checked_at 取每个模型的最新一次成功探测：
-	// 手动实测（source=manual）与定时探针写入同一 epoch，按时间取最新才正确
+// ttftSampleWindow 计算 TTFT 分位数时每个 (渠道, 模型) 采用的最近样本数。
+const ttftSampleWindow = 20
+
+func loadProbeResultsAll(ctx context.Context, db *store.DB, byID map[int]*ChannelHealth, epoch int64) {
+	// 1. 每个 (渠道, 模型) 最新一次成功探测的倍率与官网价快照。
+	//    手动实测（source=manual）与定时探针写入同一 epoch，按时间取最新才正确。
 	rows, err := db.Pool.Query(ctx, `
-		SELECT DISTINCT ON (model) model, real_ratio, ttft_ms, basis,
+		SELECT DISTINCT ON (upstream_id, model)
+		       upstream_id, model, real_ratio, basis,
 		       COALESCE(official_input_per_m, 0), COALESCE(official_output_per_m, 0)
 		FROM probe_results
-		WHERE upstream_id = $1 AND epoch <= $2 AND success = true
-		ORDER BY model, checked_at DESC
-	`, ch.ID, epoch)
-	if err != nil {
-		return err
+		WHERE epoch <= $1 AND success = true
+		ORDER BY upstream_id, model, checked_at DESC
+	`, epoch)
+	if err == nil {
+		for rows.Next() {
+			var id int
+			var model, basis string
+			var realRatio, officialInPerM, officialOutPerM float64
+			if err := rows.Scan(&id, &model, &realRatio, &basis, &officialInPerM, &officialOutPerM); err != nil {
+				continue
+			}
+			ch := byID[id]
+			if ch == nil {
+				continue
+			}
+			ch.RealRatio[model] = realRatio
+			ch.RealRatioBasis[model] = basis
+			ch.RealRatioOfficialInPerM[model] = officialInPerM
+			ch.RealRatioOfficialOutPerM[model] = officialOutPerM
+		}
+		rows.Close()
 	}
-	defer rows.Close()
 
-	for rows.Next() {
+	// 2. TTFT 分位数：对最近 ttftSampleWindow 个样本求真实 P50/P95。
+	//    单次探测的 TTFT 抖动很大（实测同一渠道同一模型可在 2.2s~15.4s 之间），
+	//    用最新一次充当 P50 会让 latency_first 的排序随机化。
+	pRows, err := db.Pool.Query(ctx, `
+		WITH ranked AS (
+			SELECT upstream_id, model, ttft_ms,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY upstream_id, model ORDER BY checked_at DESC
+			       ) AS rn
+			FROM probe_results
+			WHERE epoch <= $1 AND success = true AND ttft_ms > 0
+		)
+		SELECT upstream_id, model,
+		       percentile_cont(0.5)  WITHIN GROUP (ORDER BY ttft_ms)::int,
+		       percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms)::int
+		FROM ranked
+		WHERE rn <= $2
+		GROUP BY upstream_id, model
+	`, epoch, ttftSampleWindow)
+	if err != nil {
+		return
+	}
+	defer pRows.Close()
+
+	for pRows.Next() {
+		var id, p50, p95 int
 		var model string
-		var realRatio float64
-		var ttftMS int
-		var basis string
-		var officialInPerM, officialOutPerM float64
-		if err := rows.Scan(&model, &realRatio, &ttftMS, &basis, &officialInPerM, &officialOutPerM); err != nil {
+		if err := pRows.Scan(&id, &model, &p50, &p95); err != nil {
 			continue
 		}
-
-		ch.RealRatio[model] = realRatio
-		ch.RealRatioBasis[model] = basis
-		ch.RealRatioOfficialInPerM[model] = officialInPerM
-		ch.RealRatioOfficialOutPerM[model] = officialOutPerM
-		ch.TTFTP50[model] = ttftMS                     // 简化：单个值作为 P50
-		ch.TTFTP95[model] = int(float64(ttftMS) * 1.2) // 简化：P95 约为 P50 的 1.2 倍
+		if ch := byID[id]; ch != nil {
+			ch.TTFTP50[model] = p50
+			ch.TTFTP95[model] = p95
+		}
 	}
-
-	return rows.Err()
 }
 
 // loadModelPrices 加载官方模型价格库（快照全局共享，失败返回空表）
@@ -399,91 +440,121 @@ func loadModelPrices(ctx context.Context, db *store.DB) map[string]*ModelPrice {
 	return prices
 }
 
-func loadRequestHistory(ctx context.Context, db *store.DB, ch *ChannelHealth) error {
-	// 最近 1 小时或最近 1000 次
-	err := db.Pool.QueryRow(ctx, `
-		SELECT
-			COUNT(*) as attempts,
-			SUM(CASE WHEN success THEN 1 ELSE 0 END) as successes
-		FROM (
-			SELECT success
-			FROM request_history
-			WHERE channel_id = $1 AND created_at >= NOW() - INTERVAL '1 hour'
-			ORDER BY created_at DESC
-			LIMIT 1000
-		) recent
-	`, ch.ID).Scan(&ch.RecentAttempts, &ch.RecentSuccesses)
-
-	if err != nil {
-		return err
-	}
-
-	// 贝叶斯平滑：prior_success=5, prior_attempts=10
-	ch.ReliabilityScore = float64(ch.RecentSuccesses+5) / float64(ch.RecentAttempts+10)
-
-	return nil
-}
-
-// loadCircuitState 读取渠道的熔断状态（P1-04：按分组桶聚合）。
-// 每个分组桶（含全局桶 "0"）取该组所有模型行中的最严重状态
-// （open > degraded > half_open > closed），冷却到期折算为 half_open。
-// 同时保留渠道级最严重状态（CircuitState）供仪表盘/指标使用。
-func loadCircuitState(ctx context.Context, db *store.DB, ch *ChannelHealth) error {
+// loadRequestHistoryAll 滑动窗口成功率（最近 1 小时，每渠道最多 1000 次）。
+// 无历史的渠道保持 loadChannels 设置的默认值（贝叶斯先验 0.5）。
+func loadRequestHistoryAll(ctx context.Context, db *store.DB, byID map[int]*ChannelHealth) {
 	rows, err := db.Pool.Query(ctx, `
-		SELECT COALESCE(group_id, 0) AS group_id, state, cooling_until
-		FROM circuit_states
-		WHERE channel_id = $1 AND capability = ''
-	`, ch.ID)
+		SELECT channel_id,
+		       COUNT(*),
+		       COALESCE(SUM(CASE WHEN success THEN 1 ELSE 0 END), 0)
+		FROM (
+			SELECT channel_id, success,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY channel_id ORDER BY created_at DESC
+			       ) AS rn
+			FROM request_history
+			WHERE created_at >= NOW() - INTERVAL '1 hour'
+		) recent
+		WHERE rn <= 1000
+		GROUP BY channel_id
+	`)
 	if err != nil {
-		return err
+		return
 	}
 	defer rows.Close()
 
-	// groupBucket: key → {worstState, maxCooling(open 行中最大值)}
+	for rows.Next() {
+		var id, attempts, successes int
+		if err := rows.Scan(&id, &attempts, &successes); err != nil {
+			continue
+		}
+		ch := byID[id]
+		if ch == nil {
+			continue
+		}
+		ch.RecentAttempts = attempts
+		ch.RecentSuccesses = successes
+		// 贝叶斯平滑：prior_success=5, prior_attempts=10
+		ch.ReliabilityScore = float64(successes+5) / float64(attempts+10)
+	}
+}
+
+// loadCircuitStatesAll 读取全部渠道的熔断状态（P1-04：按分组桶聚合）。
+// 每个分组桶（含全局桶 "0"）取该组所有模型行中的最严重状态
+// （open > degraded > half_open > closed），冷却到期折算为 half_open。
+// 同时保留渠道级最严重状态（CircuitState）供仪表盘/指标使用。
+func loadCircuitStatesAll(ctx context.Context, db *store.DB, byID map[int]*ChannelHealth) {
+	rows, err := db.Pool.Query(ctx, `
+		SELECT channel_id, COALESCE(group_id, 0) AS group_id, state,
+		       COALESCE(cooling_until, '1970-01-01'::timestamp) AS cooling_until
+		FROM circuit_states
+		WHERE capability = ''
+	`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	// 每渠道每分组桶：{最严重状态, open 行中最大的冷却截止}
 	type bucketAgg struct {
 		worstState string
 		maxCooling time.Time
 	}
-	groups := map[string]*bucketAgg{}
-
-	stateRank := map[string]int{"closed": 0, "half_open": 1, "degraded": 2, "open": 3}
-	consider := func(key, state string, cooling time.Time) {
-		b := groups[key]
-		if b == nil {
-			b = &bucketAgg{}
-			groups[key] = b
-		}
-		if stateRank[state] > stateRank[b.worstState] {
-			b.worstState = state
-		}
-		if state == "open" && (b.maxCooling.IsZero() || cooling.After(b.maxCooling)) {
-			b.maxCooling = cooling
-		}
-	}
+	agg := map[int]map[string]*bucketAgg{}
 
 	for rows.Next() {
-		var groupID int
+		var channelID, groupID int
 		var state string
 		var coolingUntil time.Time
-		if err := rows.Scan(&groupID, &state, &coolingUntil); err != nil {
+		if err := rows.Scan(&channelID, &groupID, &state, &coolingUntil); err != nil {
 			continue
 		}
-		consider(fmt.Sprintf("%d", groupID), state, coolingUntil)
-	}
-
-	ch.CircuitStates = make(map[string]string, len(groups))
-	overall := "closed"
-	for key, b := range groups {
-		eff := EffectiveCircuitState(b.worstState, b.maxCooling, time.Now())
-		ch.CircuitStates[key] = eff
-		if stateRank[eff] > stateRank[overall] {
-			overall = eff
+		if byID[channelID] == nil {
+			continue
+		}
+		buckets := agg[channelID]
+		if buckets == nil {
+			buckets = map[string]*bucketAgg{}
+			agg[channelID] = buckets
+		}
+		key := fmt.Sprintf("%d", groupID)
+		b := buckets[key]
+		if b == nil {
+			// 初值必须是 closed 而不是零值 ""：closed 的严重度为 0，
+			// 用 rank 比较无法把 "" 抬升为 "closed"，会让整个桶留下空状态。
+			b = &bucketAgg{worstState: "closed"}
+			buckets[key] = b
+		}
+		if circuitStateRank[state] > circuitStateRank[b.worstState] {
+			b.worstState = state
+		}
+		if state == "open" && (b.maxCooling.IsZero() || coolingUntil.After(b.maxCooling)) {
+			b.maxCooling = coolingUntil
 		}
 	}
-	ch.CircuitState = overall
 
-	return rows.Err()
+	now := time.Now()
+	for channelID, buckets := range agg {
+		ch := byID[channelID]
+		if ch == nil {
+			continue
+		}
+		ch.CircuitStates = make(map[string]string, len(buckets))
+		overall := "closed"
+		for key, b := range buckets {
+			eff := EffectiveCircuitState(b.worstState, b.maxCooling, now)
+			ch.CircuitStates[key] = eff
+			if circuitStateRank[eff] > circuitStateRank[overall] {
+				overall = eff
+			}
+		}
+		ch.CircuitState = overall
+	}
 }
+
+// circuitStateRank 熔断状态严重度排序（聚合分组桶时取最严重）。
+var circuitStateRank = map[string]int{"closed": 0, "half_open": 1, "degraded": 2, "open": 3}
+
 
 // EffectiveCircuitState 时间驱动的状态换算：open 且冷却到期 → half_open。
 // 冷却截止取所有 open 行中的最大值（只有全部开闸行都冷却完成才允许探测）。

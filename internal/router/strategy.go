@@ -356,11 +356,14 @@ func estimateCost(ch *ChannelHealth, req *FilterRequest, policy *Policy, prices 
 		basePrice := 10.0 / 1_000_000
 		inputPrice = ratio * basePrice
 		outputPrice = ratio * basePrice
-	} else if price, ok := ch.DeclaredPrice[req.Model]; ok {
+	} else if price, ok := ch.DeclaredPrice[req.Model]; ok && price.InputPrice > 0 && price.OutputPrice > 0 {
 		inputPrice = price.InputPrice / 1_000_000
 		outputPrice = price.OutputPrice / 1_000_000
 	} else {
-		// 无价格信息，使用保守估计
+		// 无价格信息，使用保守估计。
+		// 注意此处必须是保守（偏高）值而非 0：把未知价格当作免费会让该渠道
+		// 在 price_first / balanced 下永远排第一。归档快照可能含 0 价格的历史行，
+		// 上面的 >0 判定确保它们走这条兜底分支。
 		inputPrice = 10.0 / 1_000_000
 		outputPrice = 30.0 / 1_000_000
 	}

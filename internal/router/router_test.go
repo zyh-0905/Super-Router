@@ -553,3 +553,27 @@ func TestEstimateCostBaselineFallback(t *testing.T) {
 		t.Fatalf("cost = %v, want 0.02", cost)
 	}
 }
+
+// 零值声明价格（上游 /api/pricing 返回空倍率，或重放归档中的历史行）
+// 不能被当成"免费"，否则该渠道在 price_first 下会永远排第一。
+func TestEstimateCostIgnoresZeroDeclaredPrice(t *testing.T) {
+	zero := &ChannelHealth{
+		DeclaredPrice: map[string]*PriceProfile{"m": {InputPrice: 0, OutputPrice: 0}},
+	}
+	req := &FilterRequest{Model: "m", EstimatedInput: 1000, MaxOutput: 1000}
+	policy := &Policy{Config: map[string]interface{}{}}
+
+	got := estimateCost(zero, req, policy, nil)
+	// 应落到保守兜底：1000×10/1M + 1000×30/1M = 0.04
+	if math.Abs(got-0.04) > 1e-9 {
+		t.Fatalf("zero declared price cost = %v, want conservative 0.04", got)
+	}
+
+	// 且不得低于一个有真实声明价格的渠道
+	priced := &ChannelHealth{
+		DeclaredPrice: map[string]*PriceProfile{"m": {InputPrice: 1.0, OutputPrice: 2.0}},
+	}
+	if got <= estimateCost(priced, req, policy, nil) {
+		t.Fatal("channel with no usable price must not look cheaper than a priced one")
+	}
+}
