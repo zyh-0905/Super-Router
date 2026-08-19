@@ -126,10 +126,30 @@ docker compose -p smart-router logs -f gateway checker
 # 查看 Checker 最近余额结果
 docker exec smart-router-db psql -U gateway -d smart_router -c "SELECT channel_id, balance, currency, source, error, checked_at FROM balance_checks ORDER BY checked_at DESC LIMIT 20;"
 
+# 查看持久化告警事件（checker reconcile 每 30s 刷新）
+docker exec smart-router-db psql -U gateway -d smart_router -c "SELECT alert_key, severity, status, occurrence_count, last_seen_at, recovered_at FROM alert_events ORDER BY id DESC LIMIT 20;"
+
+# 查看 Telegram 配置状态（Bot Token 只显示密文前缀，不含明文）
+docker exec smart-router-db psql -U gateway -d smart_router -c "SELECT enabled, report_enabled, timezone, last_poll_at, last_report_at, COALESCE(last_error,'') FROM telegram_config WHERE id=1;"
+
 # 停止服务（保留数据卷）
 docker compose -p smart-router down
 # 不要随意使用 down -v，它会删除 PostgreSQL/Redis 数据卷
 ```
+
+## 📨 Telegram 告警速查
+
+| 项 | 值 |
+|-----|-----|
+| 默认状态 | **关闭**（`telegram_config.enabled=false`），开启后由 checker 长轮询 + 每小时整点汇总 |
+| 配置入口 | Web「设置 → Telegram 告警」（Bot Token 加密保存，页面只显示尾号）；订阅者只能后台手动录入 |
+| 查询命令 | `/start` `/help` `/alerts [critical]` `/alert <alert_key>` `/status` `/relay [id]` `/balance [id]` `/health [id]` `/ratio [id]` |
+| 未授权 Chat ID | 统一回复「⛔ 当前 Chat ID 未授权，请联系管理员。」 |
+| 发送间隔 | 默认 60 分钟整点（`report_interval_minutes` / `report_minute` / `timezone` 可配置） |
+| 幂等保证 | 投递日志按「订阅者×窗口」记录成功，崩溃后新 owner 只补发未成功的订阅者 |
+| 手动发送 | Web「告警」页「立即发送当前告警汇总」（只触发一次，不改变调度） |
+| 分组过滤 | 订阅者 `group_ids=[]` 可查全部；非空时告警与查询只返回绑定分组内的站点 |
+| 安全 | 查询只读数据库不触发上游；Base URL 只显示域名；凭据不入消息/日志 |
 
 ## 📚 文档
 

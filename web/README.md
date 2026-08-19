@@ -42,8 +42,8 @@ open http://localhost:5173/
 | `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉（候选**六维评分雷达图** + 真实指标/人话排名/排除原因/故障切换明细）、**编辑模式多选/全选删除与导出** |
 | `#/strategy` | 策略中心 | 路由策略按「系统默认」与**每个分组**分别配置；5 种策略可视化卡片（因素权重条）、「加权均衡」四维权重滑块、分组一键恢复跟随系统默认 |
 | `#/circuit` | 熔断 | 四态熔断器（分组隔离）、**分组切换器**、重置 |
-| `#/alerts` | 告警 | **全部活跃告警统一视图**（低余额/倍率超标/熔断开闸降级/站点禁用/价格同步失败），摘要卡 + 按严重度排序列表、**分组切换器**、30s 自动刷新、按类型跳转处理页 |
-| `#/settings` | 设置 | 连接配置、API Keys（**分组绑定**）、**每站点默认测试模型**（表格逐站点设置）、**官方模型价格库**、**低余额告警阈值** |
+| `#/alerts` | 告警 | **全部活跃告警统一视图**（低余额/倍率超标/熔断开闸降级/站点禁用/价格同步失败/接口质量），摘要卡 + 按严重度排序列表、**分组切换器**、**Telegram 状态摘要与立即发送**、30s 自动刷新、按类型跳转处理页 |
+| `#/settings` | 设置 | 连接配置、API Keys（**分组绑定**）、**每站点默认测试模型**（表格逐站点设置）、**官方模型价格库**、**低余额告警阈值**、**Telegram 告警**（Bot 配置 + 订阅者管理） |
 
 ## 项目结构
 
@@ -114,6 +114,7 @@ web/
 | 熔断 | `GET /admin/circuit[?group_id=]` · `POST /admin/circuit/:id/reset` |
 | API Keys | `GET/POST /admin/keys` · `PATCH/DELETE /admin/keys/:id`（支持 group_ids 绑定） |
 | 运行配置 | `GET /admin/config` |
+| **Telegram 告警** | `GET/PATCH /admin/telegram/config`（Token 脱敏/加密保存） · `POST /admin/telegram/test`（getMe 验证） · `POST /admin/telegram/report`（立即发送汇总） · `GET/POST /admin/telegram/subscribers` · `PATCH/DELETE /admin/telegram/subscribers/:id` · `POST .../subscribers/:id/test` · `GET /admin/telegram/delivery-logs` |
 | 测试请求 | `POST /v1/chat/completions`（body `group` 字段或 `X-Group` 头） |
 
 ## 中转站分组
@@ -140,6 +141,14 @@ web/
 - **展示**：站点卡片余额徽章（≤$1 红色 / >$1 绿色）、站点详情「余额」页签（当前余额 + 历史折线 + 明细）
 - **低余额告警**：余额 ≤ 阈值（设置页可配置，默认 $1）进入总览告警与侧边栏红点
 - 相关接口：`GET /admin/channels/:id/balance` · `GET/PATCH /admin/settings`
+
+## Telegram 告警
+
+- **默认关闭**：升级后不主动访问 Telegram；在「设置 → Telegram 告警」保存 Bot Token 并开启后，checker 进程开始长轮询并按小时整点发送告警汇总
+- **安全边界**：Bot Token 通过应用层加密（enc:v1: 信封）入库，页面只回显「已配置 + 尾号」；Token 不进入前端 store / localStorage / 日志 / Telegram 消息
+- **订阅者管理**：Chat ID 只能由管理员在后台手动录入（不开放 /start 自助绑定）；可分别控制告警推送与查询权限，并可限定分组范围（空 = 全部）
+- **查询命令**：`/alerts` `/alert <key>` `/status` `/relay [id]` `/balance [id]` `/health [id]` `/ratio [id]`——全部只读数据库，不触发上游调用；未授权 Chat ID 统一拒绝
+- **发送状态**：设置页显示最近轮询/汇总/错误；「告警」页显示 Telegram 状态并可立即发送当前汇总（只触发一次，不改变调度）
 
 ## 常见问题
 
