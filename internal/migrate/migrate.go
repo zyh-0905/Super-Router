@@ -43,6 +43,7 @@ var canary = map[string]string{
 	"016_replay_context":        "SELECT to_regclass('public.snapshot_archive') IS NOT NULL",
 	"017_policies_unique":       "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indrelid='routing_policies'::regclass AND indnullsnotdistinct)",
 	"018_group_strategy_config": "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='channel_groups' AND column_name='strategy_config')",
+	"020_alert_telegram":         "SELECT to_regclass('public.alert_events') IS NOT NULL AND to_regclass('public.telegram_config') IS NOT NULL",
 }
 
 // Up 执行所有未应用的 up 迁移（幂等、带锁、逐版本事务）。
