@@ -59,6 +59,13 @@ func unmarshalJSON(s string, v interface{}) error {
 	return json.Unmarshal([]byte(s), v)
 }
 
+// SetAlertSink 注入质量失败告警实现（Checker 装配时替换默认 Noop）。
+func (e *Executor) SetAlertSink(sink AlertSink) {
+	if sink != nil {
+		e.AlertSink = sink
+	}
+}
+
 // LoadChannel 从 upstreams 读取单站点配置并解密凭据。
 // 解密失败不写入 details，只返回通用 credential_decrypt_failed。
 func (e *Executor) LoadChannel(ctx context.Context, channelID int) (*Channel, error) {

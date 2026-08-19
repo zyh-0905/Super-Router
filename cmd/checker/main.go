@@ -128,6 +128,7 @@ func main() {
 	qualityRepo := quality.NewPostgresRepository(db)
 	qualityExecutor := quality.NewExecutor(db, qualityRepo,
 		quality.NewRedisPublisher(redisClient), cfg.Security.EncryptionKey, cfg.Checker.ProbeModel, logger.Named("quality"))
+	qualityExecutor.SetAlertSink(alert.NewQualityAlertSink(alert.NewSQLStore(db)))
 	go quality.NewWorker(qualityRepo, qualityExecutor, checkerWorkerID(), logger.Named("quality-worker")).Run(ctx)
 	logger.Info("Quality worker started (max 3 concurrent)")
 
