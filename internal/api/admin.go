@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"smart-router/internal/alert"
 	"smart-router/internal/config"
 	"smart-router/internal/crypto"
 	"smart-router/internal/protocol"
@@ -31,6 +32,10 @@ type AdminHandler struct {
 	redis  *store.RedisClient
 	cfg    *config.Config
 	logger *zap.Logger
+
+	// alerts 共享告警服务：读取 Checker reconcile 的持久化 active 事件。
+	// Checker 暂停时返回最近一次持久化状态。
+	alerts *alert.Service
 }
 
 // safenetOptions 按配置构造 SSRF 校验选项（P2-04：仅开发配置可显式放宽）。
@@ -101,6 +106,7 @@ func NewAdminHandler(db *store.DB, redis *store.RedisClient, cfg *config.Config,
 		redis:  redis,
 		cfg:    cfg,
 		logger: logger,
+		alerts: alert.NewService(db),
 	}
 }
 
@@ -830,19 +836,6 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{"message": "settings updated successfully"})
-}
-
-// lowBalanceThreshold 读取低余额告警阈值（默认 $1）
-func (h *AdminHandler) lowBalanceThreshold(ctx context.Context) float64 {
-	var v string
-	if err := h.db.Pool.QueryRow(ctx, `
-		SELECT value FROM system_settings WHERE key = 'low_balance_threshold'
-	`).Scan(&v); err == nil {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	return 1.0
 }
 
 // ==================== 上游模型列表 ====================
@@ -1887,8 +1880,13 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 	ratioSummary := h.buildRatioSummary(ctx, gid)
 	stats["ratio_summary"] = ratioSummary
 
-	// 告警：低余额 / 倍率超限 / 熔断开闸降级 / 站点禁用（与告警页共用构建逻辑）
-	stats["alerts"] = h.buildAlerts(ctx, gid, channelStats, ratioSummary)
+	// 告警：读取 Checker reconcile 的持久化 active 事件（共享数据口径）
+	activeAlerts, alertErr := h.alerts.Active(ctx, gid)
+	if alertErr != nil {
+		h.logger.Warn("Failed to load persisted alerts", zap.Error(alertErr))
+		activeAlerts = nil
+	}
+	stats["alerts"] = alert.ToWebAlerts(activeAlerts, time.Now())
 
 	// 分组列表（供前端切换器）+ 当前筛选分组名
 	groupRows, err := h.db.Pool.Query(ctx, `
@@ -1934,228 +1932,48 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 	c.JSON(200, stats)
 }
 
-// buildAlerts 构建全部活跃告警：低余额 / 倍率超限 / 熔断开闸降级 / 站点禁用。
-// channelStats 需含 id/name/balance 字段（balance 为 nil 或 float64），
-// ratioSummary 为 buildRatioSummary 的输出。与 GetStats / GetAlerts 共用。
-func (h *AdminHandler) buildAlerts(ctx context.Context, gid *int, channelStats []map[string]interface{}, ratioSummary []map[string]interface{}) []map[string]interface{} {
-	alerts := []map[string]interface{}{}
-	threshold := h.lowBalanceThreshold(ctx)
-
-	// 1. 低余额告警
-	for _, ch := range channelStats {
-		b, ok := ch["balance"].(float64)
-		if !ok {
-			continue
-		}
-		name, _ := ch["name"].(string)
-		if b <= threshold {
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("bal_%d", ch["id"].(int)),
-				"name":    fmt.Sprintf("余额不足: %s 剩余 $%.2f（阈值 $%.2f）", name, b, threshold),
-				"channel": name,
-				"sev":     "critical",
-				"ago":     formatAgo(time.Now()),
-			})
-		}
-	}
-
-	// 2. 倍率超限告警
-	for _, ch := range ratioSummary {
-		limit, _ := ch["ratio_limit"].(float64)
-		if limit <= 0 {
-			continue
-		}
-		ratios, _ := ch["ratios"].([]map[string]interface{})
-		for _, mr := range ratios {
-			ratio, _ := mr["real_ratio"].(float64)
-			if ratio <= limit {
-				continue
-			}
-			model, _ := mr["model"].(string)
-			name, _ := ch["name"].(string)
-			cid, _ := ch["id"].(int)
-			ago := "—"
-			if s, ok := mr["checked_at"].(string); ok {
-				if t, err := time.Parse(time.RFC3339, s); err == nil {
-					ago = formatAgo(t)
-				}
-			}
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("ratio_%d_%s", cid, model),
-				"name":    fmt.Sprintf("倍率超标: %s %s 实测 %.4fx 超过上限 %.4fx", name, model, ratio, limit),
-				"channel": name,
-				"model":   model,
-				"sev":     "critical",
-				"ago":     ago,
-			})
-		}
-	}
-
-	// 3. 熔断开闸/降级告警
-	rows, err := h.db.Pool.Query(ctx, `
-		SELECT cs.channel_id, u.name, cs.model, cs.state, cs.updated_at
-		FROM circuit_states cs
-		JOIN upstreams u ON u.id = cs.channel_id
-		WHERE cs.state IN ('open', 'degraded')
-		  AND ($1::int IS NULL OR EXISTS (
-			SELECT 1 FROM channel_group_members cgm
-			WHERE cgm.channel_id = cs.channel_id AND cgm.group_id = $1
-		  ))
-		ORDER BY cs.updated_at DESC LIMIT 20
-	`, gid)
-	if err == nil {
-		for rows.Next() {
-			var cid int
-			var name, model, state string
-			var updatedAt time.Time
-			if err := rows.Scan(&cid, &name, &model, &state, &updatedAt); err != nil {
-				continue
-			}
-			sev := "warning"
-			if state == "open" {
-				sev = "critical"
-			}
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("cb_%d_%s", cid, model),
-				"name":    fmt.Sprintf("熔断%s: %s (%s)", map[string]string{"open": "已开启", "degraded": "降级"}[state], name, model),
-				"channel": name,
-				"model":   model,
-				"sev":     sev,
-				"ago":     formatAgo(updatedAt),
-			})
-		}
-		rows.Close()
-	}
-
-	// 4. 站点禁用告警
-	rows, err = h.db.Pool.Query(ctx, `
-		SELECT id, name FROM upstreams WHERE enabled = false
-		  AND ($1::int IS NULL OR EXISTS (
-			SELECT 1 FROM channel_group_members cgm
-			WHERE cgm.channel_id = upstreams.id AND cgm.group_id = $1
-		  ))
-		ORDER BY id
-	`, gid)
-	if err == nil {
-		for rows.Next() {
-			var id int
-			var name string
-			if err := rows.Scan(&id, &name); err != nil {
-				continue
-			}
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("dis_%d", id),
-				"name":    fmt.Sprintf("站点已禁用: %s", name),
-				"channel": name,
-				"sev":     "warning",
-				"ago":     "—",
-			})
-		}
-		rows.Close()
-	}
-
-	// 5. 价格同步失败告警（最近 30 分钟内倍率查询失败的站点）
-	rows, err = h.db.Pool.Query(ctx, `
-		SELECT rh.channel_id, u.name, MAX(rh.created_at)
-		FROM request_history rh
-		JOIN upstreams u ON u.id = rh.channel_id
-		WHERE rh.is_probe = true AND rh.capability = 'pricing'
-		  AND rh.success = false
-		  AND rh.created_at >= NOW() - INTERVAL '30 minutes'
-		  AND ($1::int IS NULL OR EXISTS (
-			SELECT 1 FROM channel_group_members cgm
-			WHERE cgm.channel_id = rh.channel_id AND cgm.group_id = $1
-		  ))
-		GROUP BY rh.channel_id, u.name
-		ORDER BY MAX(rh.created_at) DESC
-	`, gid)
-	if err == nil {
-		for rows.Next() {
-			var cid int
-			var name string
-			var lastFail time.Time
-			if err := rows.Scan(&cid, &name, &lastFail); err != nil {
-				continue
-			}
-			alerts = append(alerts, map[string]interface{}{
-				"id":      fmt.Sprintf("pricing_%d", cid),
-				"name":    fmt.Sprintf("价格同步失败: %s（最近一轮倍率查询失败）", name),
-				"channel": name,
-				"sev":     "warning",
-				"ago":     formatAgo(lastFail),
-			})
-		}
-		rows.Close()
-	}
-	return alerts
-}
-
 // GetAlerts GET /admin/alerts - 全部活跃告警（告警页专用，支持 ?group_id= 分组筛选）
+// 数据源已切换为 Checker reconcile 的持久化 alert_events（共享数据口径），
+// 响应 JSON 结构保持旧版前端兼容（id/name/channel/model/sev/ago），
+// 并附加 alert_key/alert_type/title/impact/recommendation/admin_path/
+// first_seen_at/last_seen_at/occurrence_count 等新字段。
 func (h *AdminHandler) GetAlerts(c *gin.Context) {
 	ctx := c.Request.Context()
 	gid := parseGroupIDParam(c)
 
-	// 站点基础信息 + 最新成功余额（低余额判定所需的最小集合）
-	channelStats := []map[string]interface{}{}
-	rows, err := h.db.Pool.Query(ctx, `
-		SELECT u.id, u.name
-		FROM upstreams u
-		WHERE $1::int IS NULL OR EXISTS (
-			SELECT 1 FROM channel_group_members cgm
-			WHERE cgm.channel_id = u.id AND cgm.group_id = $1
-		)
-		ORDER BY u.id
-	`, gid)
+	active, err := h.alerts.Active(ctx, gid)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to query channels"})
+		h.logger.Error("Failed to query persisted alerts", zap.Error(err))
+		c.JSON(500, gin.H{"error": "failed to query alerts"})
 		return
 	}
-	balMap := map[int]map[string]interface{}{}
-	brows, berr := h.db.Pool.Query(ctx, `
-		SELECT DISTINCT ON (channel_id) channel_id, balance, currency, source, error, checked_at
-		FROM balance_checks
-		WHERE source != ''
-		ORDER BY channel_id, checked_at DESC
-	`)
-	if berr == nil {
-		for brows.Next() {
-			var cid int
-			var balance float64
-			var currency, source, errMsg string
-			var checkedAt time.Time
-			if brows.Scan(&cid, &balance, &currency, &source, &errMsg, &checkedAt) != nil {
-				continue
-			}
-			balMap[cid] = map[string]interface{}{
-				"balance": balance, "currency": currency, "source": source,
-				"error": errMsg, "checked_at": checkedAt.Format(time.RFC3339),
-			}
-		}
-		brows.Close()
-	}
-	for rows.Next() {
-		var id int
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
+	now := time.Now()
+	alerts := alert.ToWebAlerts(active, now)
+
+	// data_freshness：持久化状态的最新更新时间（Checker 暂停时前端可感知数据时效）
+	dataFreshness := ""
+	for _, a := range active {
+		if a.LastSeenAt.IsZero() {
 			continue
 		}
-		ch := map[string]interface{}{"id": id, "name": name, "balance": nil}
-		if b, ok := balMap[id]; ok {
-			ch["balance"] = b["balance"]
-			ch["balance_currency"] = b["currency"]
-			ch["balance_checked_at"] = b["checked_at"]
+		if dataFreshness == "" || a.LastSeenAt.After(mustParseTime(dataFreshness)) {
+			dataFreshness = a.LastSeenAt.Format(time.RFC3339)
 		}
-		channelStats = append(channelStats, ch)
 	}
-	rows.Close()
 
-	alerts := h.buildAlerts(ctx, gid, channelStats, h.buildRatioSummary(ctx, gid))
 	c.JSON(200, gin.H{
-		"alerts":       alerts,
-		"total":        len(alerts),
-		"group_id":     gid,
-		"generated_at": time.Now().Format(time.RFC3339),
+		"alerts":         alerts,
+		"total":          len(alerts),
+		"group_id":       gid,
+		"generated_at":   now.Format(time.RFC3339),
+		"data_freshness": dataFreshness,
 	})
+}
+
+// mustParseTime 解析 RFC3339 字符串（失败返回零值）。
+func mustParseTime(s string) time.Time {
+	t, _ := time.Parse(time.RFC3339, s)
+	return t
 }
 
 // DeleteDecisions DELETE /admin/decisions - 批量删除决策日志（多选/全选）
@@ -2330,20 +2148,6 @@ func (h *AdminHandler) buildRatioSummary(ctx context.Context, gid *int) []map[st
 		})
 	}
 	return summary
-}
-
-func formatAgo(t time.Time) string {
-	d := time.Since(t)
-	switch {
-	case d < time.Minute:
-		return "刚刚"
-	case d < time.Hour:
-		return fmt.Sprintf("%d分钟前", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%d小时前", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%d天前", int(d.Hours()/24))
-	}
 }
 
 // ==================== API Keys ====================
