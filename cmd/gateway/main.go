@@ -19,6 +19,7 @@ import (
 	"smart-router/internal/logger"
 	"smart-router/internal/metrics"
 	"smart-router/internal/migrate"
+	"smart-router/internal/quality"
 	"smart-router/internal/router"
 	"smart-router/internal/store"
 
@@ -147,6 +148,10 @@ func main() {
 	proxyHandler := api.NewProxyHandler(routerEngine, db, zapLogger.Named("proxy"), circuitManager, cfg.Security.EncryptionKey)
 	adminHandler := api.NewAdminHandler(db, redisClient, cfg, zapLogger.Named("admin"))
 	telegramHandler := api.NewTelegramHandler(db, cfg.Security.EncryptionKey, zapLogger.Named("telegram"))
+	qualityHandler := api.NewQualityHandler(
+		quality.NewPostgresRepository(db),
+		quality.NewRedisPublisher(redisClient),
+		db, zapLogger.Named("quality"))
 
 	// 实时倍率：按需手动实测（复用 checker 探测逻辑，运行在 Gateway 内）
 	ratioProbe := checker.NewProbeChecker(db, zapLogger.Named("ratio-probe"), cfg.Security.EncryptionKey, redisClient)
@@ -257,6 +262,11 @@ func main() {
 		adminGroup.DELETE("/telegram/subscribers/:id", telegramHandler.DeleteSubscriber)
 		adminGroup.POST("/telegram/subscribers/:id/test", telegramHandler.SendSubscriberTest)
 		adminGroup.GET("/telegram/delivery-logs", telegramHandler.GetDeliveryLogs)
+		adminGroup.POST("/channels/:id/quality-checks", qualityHandler.CreateQualityCheck)
+		adminGroup.GET("/channels/:id/quality-checks", qualityHandler.ListQualityChecks)
+		adminGroup.GET("/quality-checks/:run_id", qualityHandler.GetQualityCheck)
+		adminGroup.GET("/quality-checks/:run_id/events", qualityHandler.EventsQualityCheck)
+		adminGroup.POST("/quality-checks/:run_id/cancel", qualityHandler.CancelQualityCheck)
 	}
 
 	// 静态托管 Web 管理界面（同一端口，免 CORS）
