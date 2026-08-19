@@ -6,7 +6,7 @@ import { api } from '../api'
 import Icon from './Icon.vue'
 import SelectBox from './SelectBox.vue'
 
-const props = defineProps({
+defineProps({
   compact: { type: Boolean, default: false },
 })
 const emit = defineEmits(['change'])
@@ -66,17 +66,5 @@ onMounted(ensureGroups)
 
 <style scoped>
 .group-switch { display: flex; align-items: center; gap: 10px; }
-.seg {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 5px 13px; border-radius: var(--radius-full);
-  border: 1px solid var(--border-strong); background: var(--surface-solid);
-  color: var(--text-2); font-size: 12.5px; font-weight: 500; font-family: inherit;
-  cursor: pointer; transition: all var(--dur) var(--ease);
-}
-.seg:hover { color: var(--text-1); }
-.seg.on { background: var(--blue); border-color: var(--blue); color: #fff; }
-.seg-count {
-  background: rgba(255,255,255,0.22); border-radius: var(--radius-full);
-  padding: 0 6px; font-size: 10.5px; font-weight: 600;
-}
+/* seg/seg-count 样式已移至 base.css 全局 */
 </style>

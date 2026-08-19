@@ -5,6 +5,7 @@ import { store, toast } from '../store'
 import StatCard from '../components/StatCard.vue'
 import EmptyState from '../components/EmptyState.vue'
 import GroupSwitcher from '../components/GroupSwitcher.vue'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import Icon from '../components/Icon.vue'
 import { fmtDate } from '../utils'
 
@@ -25,8 +26,6 @@ function badge(state) {
 
 const stateFlow = ['closed', 'open', 'half_open', 'degraded']
 
-function curIdx(s) { return Math.max(0, stateFlow.indexOf(s.state)) }
-
 async function load() {
   loading.value = true
   try {
@@ -38,8 +37,16 @@ async function load() {
 
 function onGroupChange() { load() }
 
-async function reset(s) {
-  if (!confirm(`确认重置「${s.channel_name}」(${s.model}) 的熔断状态？`)) return
+// 确认对话框
+const confirmReset = ref(null) // { channel_name, model, channel_id }
+
+function askReset(s) {
+  confirmReset.value = s
+}
+
+async function doReset() {
+  const s = confirmReset.value
+  confirmReset.value = null
   try {
     await api.resetCircuit(s.channel_id)
     toast('熔断器已重置', 'success')
@@ -86,27 +93,38 @@ onMounted(load)
     <!-- 熔断列表 -->
     <div class="card table-wrap">
       <table>
-        <thead><tr><th>渠道</th><th>模型</th><th>状态</th><th>失败 / 成功</th><th>冷却截止</th><th>更新时间</th><th /></tr></thead>
+        <thead><tr><th scope="col">渠道</th><th scope="col">模型</th><th scope="col">状态</th><th scope="col">失败 / 成功</th><th scope="col">冷却截止</th><th scope="col">更新时间</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
         <tbody>
           <tr v-if="loading"><td colspan="7"><div class="skeleton" style="height:22px;margin:10px 0" /></td></tr>
           <tr v-if="!loading && states.length === 0">
             <td colspan="7"><EmptyState icon="bolt" title="暂无熔断记录" desc="请求量达到阈值后，熔断器会自动创建状态记录" style="padding:40px 0" /></td>
           </tr>
           <tr v-for="s in states" :key="s.channel_id + '_' + s.model">
-            <td style="font-weight:600">{{ s.channel_name }}</td>
-            <td><span class="badge badge-blue">{{ s.model }}</span></td>
-            <td>
+            <td style="font-weight:600" data-label="渠道">{{ s.channel_name }}</td>
+            <td data-label="模型"><span class="badge badge-blue">{{ s.model }}</span></td>
+            <td data-label="状态">
               <span class="badge" :class="badge(s.state).cls">{{ badge(s.state).label }}</span>
             </td>
-            <td class="mono"><span class="text-red">{{ s.failure_count }}</span> / <span class="text-green">{{ s.success_count }}</span></td>
-            <td class="mono text-3">{{ s.cooling_until ? fmtDate(s.cooling_until) : '—' }}</td>
-            <td class="mono text-3">{{ fmtDate(s.updated_at) }}</td>
+            <td class="mono" data-label="失败/成功"><span class="text-red">{{ s.failure_count }}</span> / <span class="text-green">{{ s.success_count }}</span></td>
+            <td class="mono text-3" data-label="冷却截止">{{ s.cooling_until ? fmtDate(s.cooling_until) : '—' }}</td>
+            <td class="mono text-3" data-label="更新时间">{{ fmtDate(s.updated_at) }}</td>
             <td style="width:90px">
-              <button class="btn btn-ghost btn-sm" :disabled="s.state === 'closed'" @click="reset(s)">重置</button>
+              <button class="btn btn-ghost btn-sm" :disabled="s.state === 'closed'" @click="askReset(s)">重置</button>
             </td>
           </tr>
         </tbody>
       </table>
     </div>
+
+    <!-- 重置确认 -->
+    <ConfirmDialog
+      v-if="confirmReset"
+      title="重置熔断器"
+      :message="`确认重置「${confirmReset.channel_name}」(${confirmReset.model}) 的熔断状态？`"
+      confirm-text="重置"
+      danger
+      @confirm="doReset"
+      @cancel="confirmReset = null"
+    />
   </div>
 </template>

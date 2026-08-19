@@ -17,10 +17,10 @@ const themeLabel = { auto: '自动', light: '浅色', dark: '深色' }
 </script>
 
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" role="navigation" aria-label="主导航">
     <!-- Logo -->
     <div class="sb-brand">
-      <div class="sb-logo">
+      <div class="sb-logo" aria-hidden="true">
         <svg width="22" height="22" viewBox="0 0 64 64" fill="none">
           <rect width="64" height="64" rx="16" fill="#0a84ff" />
           <path d="M20 34l8-14 8 20 8-28 8 22" stroke="white" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
@@ -38,9 +38,9 @@ const themeLabel = { auto: '自动', light: '浅色', dark: '深色' }
         v-for="item in nav" :key="item.to"
         :to="item.to" class="sb-item" active-class="active"
       >
-        <Icon :name="item.name" :size="17" />
+        <Icon :name="item.name" :size="17" aria-hidden="true" />
         <span>{{ item.label }}</span>
-        <span v-if="item.name === 'bolt' && store.alerts.length" class="sb-badge">{{ store.alerts.length }}</span>
+        <span v-if="item.name === 'bolt' && store.alerts.length" class="sb-badge" :aria-label="store.alerts.length + ' 条告警'">{{ store.alerts.length }}</span>
       </router-link>
     </nav>
 
@@ -48,14 +48,19 @@ const themeLabel = { auto: '自动', light: '浅色', dark: '深色' }
 
     <!-- 主题切换 -->
     <div class="sb-bottom">
-      <button class="sb-item as-btn" @click="cycleTheme" :title="'主题：' + themeLabel[store.theme] + '（点击切换）'">
-        <Icon :name="resolvedTheme === 'dark' ? 'moon' : store.theme === 'auto' ? 'auto' : 'sun'" :size="17" />
+      <button
+        class="sb-item as-btn"
+        @click="cycleTheme"
+        :title="'主题：' + themeLabel[store.theme] + '（点击切换）'"
+        :aria-label="'切换主题，当前：' + themeLabel[store.theme]"
+      >
+        <Icon :name="resolvedTheme === 'dark' ? 'moon' : store.theme === 'auto' ? 'auto' : 'sun'" :size="17" aria-hidden="true" />
         <span>外观 · {{ themeLabel[store.theme] }}</span>
       </button>
 
       <!-- 连接状态 -->
-      <div class="sb-conn" :class="{ off: !store.connected }">
-        <span class="dot" :class="store.connected ? 'dot-green dot-pulse' : 'dot-red dot-pulse'" />
+      <div class="sb-conn" :class="{ off: !store.connected }" role="status" :aria-label="store.connected ? '已连接到后端' : '后端离线'">
+        <span class="dot" :class="store.connected ? 'dot-green dot-pulse' : 'dot-red dot-pulse'" aria-hidden="true" />
         <span class="sb-conn-text">{{ store.connected ? '已连接' : '后端离线' }}</span>
         <span class="sb-conn-epoch mono" v-if="store.epoch != null">Epoch {{ store.epoch }}</span>
       </div>
@@ -93,6 +98,7 @@ const themeLabel = { auto: '自动', light: '浅色', dark: '深色' }
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
   cursor: pointer; border: none; background: transparent; font-family: inherit;
   width: 100%; text-align: left;
+  position: relative;
 }
 .sb-item:hover { background: var(--surface-hover); color: var(--text-1); }
 .sb-item.active { background: var(--blue-soft); color: var(--blue); font-weight: 600; }
@@ -127,7 +133,12 @@ const themeLabel = { auto: '自动', light: '浅色', dark: '深色' }
   .sb-brand > div:last-child { display: none; }
   .sb-item { justify-content: center; padding: 10px; }
   .sb-item span, .sb-conn-text, .sb-conn-epoch { display: none; }
-  .sb-badge { position: absolute; }
+  .sb-badge {
+    position: absolute;
+    top: 2px; right: 2px;
+    min-width: 15px; height: 15px;
+    font-size: 9px; padding: 0 4px;
+  }
   .sb-conn { justify-content: center; border: none; background: transparent; padding: 8px 0; }
 }
 </style>

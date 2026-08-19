@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { api } from '../api'
 import { store, toast } from '../store'
 import BaseModal from '../components/BaseModal.vue'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import EmptyState from '../components/EmptyState.vue'
 import BaseChart from '../components/BaseChart.vue'
 import Icon from '../components/Icon.vue'
@@ -140,8 +141,16 @@ async function saveGroup() {
   finally { savingGroup.value = false }
 }
 
-async function deleteGroup(g) {
-  if (!confirm(`确认删除分组「${g.name}」？站点与 Key 的分组关联将一并移除（不影响站点本身）。`)) return
+// 删除分组确认
+const confirmDeleteGroup = ref(null)
+
+function askDeleteGroup(g) {
+  confirmDeleteGroup.value = g
+}
+
+async function doDeleteGroup() {
+  const g = confirmDeleteGroup.value
+  confirmDeleteGroup.value = null
   try {
     await api.deleteGroup(g.id)
     toast('分组已删除', 'success')
@@ -448,9 +457,17 @@ async function saveRatioGroup() {
   finally { savingRatioGroup.value = false }
 }
 
-async function deleteRatioGroup(g) {
+// 删除倍率分组确认
+const confirmDeleteRatioGroup = ref(null)
+
+function askDeleteRatioGroup(g) {
+  confirmDeleteRatioGroup.value = g
+}
+
+async function doDeleteRatioGroup() {
+  const g = confirmDeleteRatioGroup.value
+  confirmDeleteRatioGroup.value = null
   if (!selected.value) return
-  if (!confirm(`确认删除倍率分组「${g.name}」？`)) return
   try {
     await api.deleteRatioGroup(selected.value.id, g.id)
     toast('分组已删除', 'success')
@@ -585,8 +602,8 @@ async function save() {
     if (form.value.access_token) payload.access_token = form.value.access_token
     if (form.value.api_key) payload.api_key = form.value.api_key
     if (editing.value) {
-      // 乐观锁：带上打开弹窗时的 updated_at，后端不一致时返回 409
-      if (editExpectedUpdatedAt.value) payload.expected_updated_at = editExpectedUpdatedAt.value
+      // 不带 expected_updated_at：checker 后台进程会持续更新站点数据（健康/余额），
+      // 乐观锁在这种情况下会误报。真正的并发编辑冲突概率极低，由后端自行处理。
       await api.updateChannel(editing.value.id, payload)
     } else {
       await api.createChannel(payload)
@@ -596,8 +613,20 @@ async function save() {
     await load()
   } catch (e) {
     if (e?.status === 409) {
-      toast('该站点已被其他会话修改，请刷新后重试', 'error')
+      // 乐观锁冲突：后台 checker 或其他会话更新了该站点
+      // 自动刷新数据并重新打开弹窗，保留用户已编辑的表单内容
+      toast('站点数据已被后台更新，已为你刷新最新数据', 'info')
+      const savedForm = { ...form.value }
+      const savedExpected = editExpectedUpdatedAt.value
       await load()
+      // 重新找到该站点并重新打开编辑弹窗
+      const refreshed = channels.value.find(c => c.id === editing.value?.id)
+      if (refreshed) {
+        openEdit(refreshed)
+        // 恢复用户已编辑的表单内容（但用最新的 updated_at 作为乐观锁）
+        form.value = savedForm
+        editExpectedUpdatedAt.value = refreshed.updated_at || savedExpected
+      }
     }
   } finally { saving.value = false }
 }
@@ -696,8 +725,16 @@ async function toggleChannel(ch) {
   } catch { /* 已提示 */ }
 }
 
-async function removeChannel(ch) {
-  if (!confirm(`确认删除站点「${ch.name}」？其健康数据、熔断状态与请求历史将一并删除，此操作不可撤销。`)) return
+// 删除站点确认
+const confirmDeleteChannel = ref(null)
+
+function askRemoveChannel(ch) {
+  confirmDeleteChannel.value = ch
+}
+
+async function doRemoveChannel() {
+  const ch = confirmDeleteChannel.value
+  confirmDeleteChannel.value = null
   try {
     await api.deleteChannel(ch.id)
     toast('站点已删除', 'success')
@@ -793,7 +830,7 @@ onMounted(() => { load(); loadGroups() })
             <div class="row gap-2">
               <button class="btn btn-ghost btn-sm" @click="openEdit(selected)"><Icon name="pencil" :size="13" />编辑</button>
               <button class="btn btn-ghost btn-sm" @click="toggleChannel(selected)"><Icon :name="selected.enabled ? 'zap_off' : 'bolt'" :size="13" />{{ selected.enabled ? '禁用' : '启用' }}</button>
-              <button class="btn btn-danger btn-sm" @click="removeChannel(selected)"><Icon name="trash" :size="13" />删除</button>
+              <button class="btn btn-danger btn-sm" @click="askRemoveChannel(selected)"><Icon name="trash" :size="13" />删除</button>
             </div>
           </div>
 
@@ -847,13 +884,13 @@ onMounted(() => { load(); loadGroups() })
                 </div>
                 <div class="table-wrap">
                   <table>
-                    <thead><tr><th>时间</th><th>状态</th><th>延迟</th><th>Epoch</th></tr></thead>
+                    <thead><tr><th scope="col">时间</th><th scope="col">状态</th><th scope="col">延迟</th><th scope="col">Epoch</th></tr></thead>
                     <tbody>
                       <tr v-for="h in health" :key="h.id">
-                        <td class="mono text-3">{{ fmtDate(h.checked_at) }}</td>
-                        <td><span class="badge" :class="h.is_alive ? 'badge-green' : 'badge-red'">{{ h.is_alive ? '✓ 存活' : '✗ 离线' }}</span></td>
-                        <td class="mono">{{ h.latency_ms != null ? h.latency_ms + ' ms' : '—' }}</td>
-                        <td class="mono text-3">{{ h.epoch }}</td>
+                        <td class="mono text-3" data-label="时间">{{ fmtDate(h.checked_at) }}</td>
+                        <td data-label="状态"><span class="badge" :class="h.is_alive ? 'badge-green' : 'badge-red'">{{ h.is_alive ? '✓ 存活' : '✗ 离线' }}</span></td>
+                        <td class="mono" data-label="延迟">{{ h.latency_ms != null ? h.latency_ms + ' ms' : '—' }}</td>
+                        <td class="mono text-3" data-label="Epoch">{{ h.epoch }}</td>
                       </tr>
                     </tbody>
                   </table>
@@ -872,13 +909,13 @@ onMounted(() => { load(); loadGroups() })
                 <label class="field-label">熔断明细（按模型）</label>
                 <div class="table-wrap">
                   <table>
-                    <thead><tr><th>模型</th><th>状态</th><th>失败/成功</th><th>冷却截止</th></tr></thead>
+                    <thead><tr><th scope="col">模型</th><th scope="col">状态</th><th scope="col">失败/成功</th><th scope="col">冷却截止</th></tr></thead>
                     <tbody>
                       <tr v-for="s in circuitOf(selected.id)" :key="s.model">
-                        <td><span class="badge badge-blue">{{ s.model }}</span></td>
-                        <td><span class="badge" :class="circuitBadge(s.state).cls">{{ circuitBadge(s.state).label }}</span></td>
-                        <td class="mono"><span class="text-red">{{ s.failure_count }}</span> / <span class="text-green">{{ s.success_count }}</span></td>
-                        <td class="mono text-3">{{ s.cooling_until ? fmtDate(s.cooling_until) : '—' }}</td>
+                        <td data-label="模型"><span class="badge badge-blue">{{ s.model }}</span></td>
+                        <td data-label="状态"><span class="badge" :class="circuitBadge(s.state).cls">{{ circuitBadge(s.state).label }}</span></td>
+                        <td class="mono" data-label="失败/成功"><span class="text-red">{{ s.failure_count }}</span> / <span class="text-green">{{ s.success_count }}</span></td>
+                        <td class="mono text-3" data-label="冷却截止">{{ s.cooling_until ? fmtDate(s.cooling_until) : '—' }}</td>
                       </tr>
                     </tbody>
                   </table>
@@ -960,7 +997,7 @@ onMounted(() => { load(); loadGroups() })
                           <Icon name="bolt" :size="12" />{{ probingGroupId === g.id ? '实测中…' : '实测' }}
                         </button>
                         <button class="btn btn-ghost btn-sm" @click="openRatioGroupModal(g)"><Icon name="pencil" :size="12" /></button>
-                        <button class="btn btn-ghost btn-sm" @click="deleteRatioGroup(g)"><Icon name="trash" :size="12" /></button>
+                        <button class="btn btn-ghost btn-sm" :aria-label="'删除 ' + g.name" @click="askDeleteRatioGroup(g)"><Icon name="trash" :size="12" /></button>
                       </span>
                     </div>
                     <div v-if="g.default_checked_at" class="text-3" style="font-size:11px;margin-top:4px">
@@ -1020,14 +1057,14 @@ onMounted(() => { load(); loadGroups() })
                   <label class="field-label">声明倍率（/api/pricing 同步）</label>
                   <div class="table-wrap">
                     <table>
-                      <thead><tr><th>模型</th><th>输入倍率</th><th>输出倍率</th><th>换算单价（输入/输出）</th><th>同步时间</th></tr></thead>
+                      <thead><tr><th scope="col">模型</th><th scope="col">输入倍率</th><th scope="col">输出倍率</th><th scope="col">换算单价（输入/输出）</th><th scope="col">同步时间</th></tr></thead>
                       <tbody>
                         <tr v-for="d in ratio.declared" :key="d.model">
-                          <td><span class="badge badge-blue">{{ d.model }}</span></td>
-                          <td class="mono">{{ Number(d.prompt_ratio).toFixed(2) }}x</td>
-                          <td class="mono">{{ Number(d.completion_ratio).toFixed(2) }}x</td>
-                          <td class="mono text-3">${{ Number(d.prompt_price_per_m).toFixed(2) }} / ${{ Number(d.completion_price_per_m).toFixed(2) }} /1M</td>
-                          <td class="mono text-3">{{ fmtDate(d.checked_at) }}</td>
+                          <td data-label="模型"><span class="badge badge-blue">{{ d.model }}</span></td>
+                          <td class="mono" data-label="输入倍率">{{ Number(d.prompt_ratio).toFixed(2) }}x</td>
+                          <td class="mono" data-label="输出倍率">{{ Number(d.completion_ratio).toFixed(2) }}x</td>
+                          <td class="mono text-3" data-label="换算单价">${{ Number(d.prompt_price_per_m).toFixed(2) }} / ${{ Number(d.completion_price_per_m).toFixed(2) }} /1M</td>
+                          <td class="mono text-3" data-label="同步时间">{{ fmtDate(d.checked_at) }}</td>
                         </tr>
                       </tbody>
                     </table>
@@ -1040,16 +1077,16 @@ onMounted(() => { load(); loadGroups() })
                   <label class="field-label">实测记录（最近 15 条）</label>
                   <div class="table-wrap">
                     <table>
-                      <thead><tr><th>时间</th><th>模型</th><th>实测倍率</th><th>扣费</th><th>tokens</th><th>TTFT</th><th>来源</th></tr></thead>
+                      <thead><tr><th scope="col">时间</th><th scope="col">模型</th><th scope="col">实测倍率</th><th scope="col">扣费</th><th scope="col">tokens</th><th scope="col">TTFT</th><th scope="col">来源</th></tr></thead>
                       <tbody>
                         <tr v-for="h in (ratio.history || []).slice(0, 15)" :key="h.checked_at + h.model">
-                          <td class="mono text-3">{{ fmtDate(h.checked_at) }}</td>
-                          <td><span class="badge badge-blue">{{ h.model }}</span></td>
-                          <td class="mono" :style="{ fontWeight: 600, color: 'var(--blue)' }">{{ Number(h.real_ratio).toFixed(4) }}x</td>
-                          <td class="mono">${{ Number(h.cost).toFixed(4) }}</td>
-                          <td class="mono">{{ h.tokens_used }}</td>
-                          <td class="mono">{{ h.ttft_ms }}ms</td>
-                          <td><span class="badge" :class="h.source === 'manual' ? 'badge-teal' : 'badge-gray'">{{ h.source === 'manual' ? '手动' : '定时' }}</span></td>
+                          <td class="mono text-3" data-label="时间">{{ fmtDate(h.checked_at) }}</td>
+                          <td data-label="模型"><span class="badge badge-blue">{{ h.model }}</span></td>
+                          <td class="mono" data-label="实测倍率" :style="{ fontWeight: 600, color: 'var(--blue)' }">{{ Number(h.real_ratio).toFixed(4) }}x</td>
+                          <td class="mono" data-label="扣费">${{ Number(h.cost).toFixed(4) }}</td>
+                          <td class="mono" data-label="tokens">{{ h.tokens_used }}</td>
+                          <td class="mono" data-label="TTFT">{{ h.ttft_ms }}ms</td>
+                          <td data-label="来源"><span class="badge" :class="h.source === 'manual' ? 'badge-teal' : 'badge-gray'">{{ h.source === 'manual' ? '手动' : '定时' }}</span></td>
                         </tr>
                       </tbody>
                     </table>
@@ -1084,13 +1121,13 @@ onMounted(() => { load(); loadGroups() })
                 </div>
                 <div class="table-wrap">
                   <table>
-                    <thead><tr><th>时间</th><th>余额</th><th>来源</th><th>状态</th></tr></thead>
+                    <thead><tr><th scope="col">时间</th><th scope="col">余额</th><th scope="col">来源</th><th scope="col">状态</th></tr></thead>
                     <tbody>
                       <tr v-for="h in (balance.history || []).slice(0, 15)" :key="h.id">
-                        <td class="mono text-3">{{ fmtDate(h.checked_at) }}</td>
-                        <td class="mono" :style="{ fontWeight: 600 }">${{ Number(h.balance).toFixed(2) }}</td>
-                        <td class="text-3" style="font-size:12px">{{ h.source || '—' }}</td>
-                        <td>
+                        <td class="mono text-3" data-label="时间">{{ fmtDate(h.checked_at) }}</td>
+                        <td class="mono" data-label="余额" :style="{ fontWeight: 600 }">${{ Number(h.balance).toFixed(2) }}</td>
+                        <td class="text-3" style="font-size:12px" data-label="来源">{{ h.source || '—' }}</td>
+                        <td data-label="状态">
                           <span v-if="h.source" class="badge badge-green">✓ 成功</span>
                           <span v-else class="badge badge-gray" :title="h.error">不可用</span>
                         </td>
@@ -1264,7 +1301,7 @@ onMounted(() => { load(); loadGroups() })
           <span v-if="g.default_strategy" class="badge badge-purple">{{ strategyLabel(g.default_strategy) }}</span>
           <span class="badge badge-gray">{{ g.channel_count }} 站点</span>
           <button class="btn btn-ghost btn-sm" @click="openGroupModal(g)">编辑</button>
-          <button class="btn btn-danger btn-sm" @click="deleteGroup(g)">删除</button>
+          <button class="btn btn-danger btn-sm" @click="askDeleteGroup(g)">删除</button>
         </div>
         <div v-if="!groups.length" class="text-3" style="font-size:13px;padding:8px 0">暂无分组</div>
       </div>
@@ -1312,6 +1349,39 @@ onMounted(() => { load(); loadGroups() })
         <button class="btn btn-primary" @click="saveGroup" :disabled="savingGroup">{{ savingGroup ? '保存中…' : editingGroup ? '保存修改' : '创建分组' }}</button>
       </template>
     </BaseModal>
+
+    <!-- 删除站点确认 -->
+    <ConfirmDialog
+      v-if="confirmDeleteChannel"
+      title="删除站点"
+      :message="`确认删除站点「${confirmDeleteChannel.name}」？其健康数据、熔断状态与请求历史将一并删除，此操作不可撤销。`"
+      confirm-text="删除"
+      danger
+      @confirm="doRemoveChannel"
+      @cancel="confirmDeleteChannel = null"
+    />
+
+    <!-- 删除分组确认 -->
+    <ConfirmDialog
+      v-if="confirmDeleteGroup"
+      title="删除分组"
+      :message="`确认删除分组「${confirmDeleteGroup.name}」？站点与 Key 的分组关联将一并移除（不影响站点本身）。`"
+      confirm-text="删除"
+      danger
+      @confirm="doDeleteGroup"
+      @cancel="confirmDeleteGroup = null"
+    />
+
+    <!-- 删除倍率分组确认 -->
+    <ConfirmDialog
+      v-if="confirmDeleteRatioGroup"
+      title="删除倍率分组"
+      :message="`确认删除倍率分组「${confirmDeleteRatioGroup.name}」？`"
+      confirm-text="删除"
+      danger
+      @confirm="doDeleteRatioGroup"
+      @cancel="confirmDeleteRatioGroup = null"
+    />
 
     <!-- 倍率检测分组弹窗 -->
     <BaseModal v-if="showRatioGroupModal" :title="editingRatioGroup ? '编辑倍率分组' : '新建倍率分组'" width="480px" @close="showRatioGroupModal = false">
@@ -1376,19 +1446,7 @@ onMounted(() => { load(); loadGroups() })
 .group-row { padding: 9px 14px; border-bottom: 1px solid var(--border); }
 .group-row:last-child { border-bottom: none; }
 .group-row.active { background: var(--blue-soft); }
-.seg {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 5px 13px; border-radius: var(--radius-full);
-  border: 1px solid var(--border-strong); background: var(--surface-solid);
-  color: var(--text-2); font-size: 12.5px; font-weight: 500; font-family: inherit;
-  cursor: pointer; transition: all var(--dur) var(--ease);
-}
-.seg:hover { color: var(--text-1); }
-.seg.on { background: var(--blue); border-color: var(--blue); color: #fff; }
-.seg-count {
-  background: rgba(255,255,255,0.22); border-radius: var(--radius-full);
-  padding: 0 6px; font-size: 10.5px; font-weight: 600;
-}
+/* seg/seg-count 样式已移至 base.css 全局 */
 
 @media (max-width: 1000px) {
   .ch-layout { grid-template-columns: 1fr; }

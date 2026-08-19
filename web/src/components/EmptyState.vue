@@ -2,14 +2,14 @@
 defineProps({
   icon: { type: String, default: 'layers' },
   title: { type: String, default: '暂无数据' },
-  desc: String,
+  desc: { type: String, default: '' },
 })
 import Icon from './Icon.vue'
 </script>
 
 <template>
-  <div class="empty">
-    <div class="empty-icon"><Icon :name="icon" :size="30" /></div>
+  <div class="empty" role="status">
+    <div class="empty-icon"><Icon :name="icon" :size="30" aria-hidden="true" /></div>
     <div class="empty-title">{{ title }}</div>
     <div v-if="desc" class="empty-desc">{{ desc }}</div>
     <div class="mt-2"><slot /></div>

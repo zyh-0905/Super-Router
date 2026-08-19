@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { computed } from 'vue'
 import AppSidebar from './components/AppSidebar.vue'
@@ -11,6 +11,21 @@ import { store, feedAlerts } from './store'
 
 const route = useRoute()
 const title = computed(() => route.meta.title || 'Smart Router')
+
+// 更新 document.title
+watch(title, (t) => {
+  document.title = t === 'Smart Router' ? t : `${t} · Smart Router`
+}, { immediate: true })
+
+// 页面切换加载指示
+const pageLoading = ref(false)
+watch(() => route.path, () => {
+  pageLoading.value = true
+  // 页面切换动画结束后隐藏
+  requestAnimationFrame(() => {
+    setTimeout(() => { pageLoading.value = false }, 300)
+  })
+})
 
 let pingTimer = null
 let alertTimer = null
@@ -41,14 +56,17 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <!-- 页面切换加载进度条 -->
+  <div v-if="pageLoading" class="page-loading-bar" aria-hidden="true" />
+
   <div class="app-shell">
     <AppSidebar />
 
     <div class="app-main">
       <!-- 离线横幅 -->
       <Transition name="banner">
-        <div v-if="!store.connected" class="offline-bar">
-          <Icon name="alert" :size="15" />
+        <div v-if="!store.connected" class="offline-bar" role="alert">
+          <Icon name="alert" :size="15" aria-hidden="true" />
           <span>无法连接后端服务{{ store.baseURL ? '（' + store.baseURL + '）' : '' }}，请确认 Gateway 已启动。</span>
           <div class="spacer" />
           <router-link to="/settings" class="btn btn-ghost btn-sm">连接设置</router-link>
@@ -56,7 +74,7 @@ onUnmounted(() => {
         </div>
       </Transition>
 
-      <main class="app-content">
+      <main class="app-content" id="main-content">
         <router-view v-slot="{ Component }">
           <Transition name="page" mode="out-in">
             <component :is="Component" :key="route.path" />

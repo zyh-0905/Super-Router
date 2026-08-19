@@ -1,11 +1,12 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { api } from '../api'
-import { store, toast, saveConnection, setTheme } from '../store'
+import { store, toast, saveConnection } from '../store'
 import BaseModal from '../components/BaseModal.vue'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Icon from '../components/Icon.vue'
-import { fmtDate, maskKey } from '../utils'
+import { fmtDate } from '../utils'
 
 // 开发环境标识（模板中 import.meta 表达式不可用，统一在此取值）
 const isDev = import.meta.env.DEV
@@ -94,8 +95,16 @@ async function toggleKey(k) {
   } catch { /* 已提示 */ }
 }
 
-async function revokeKey(k) {
-  if (!confirm(`确认撤销 ${k.prefix}•••• ？此操作不可恢复。`)) return
+// 撤销 Key 确认
+const confirmRevokeKey = ref(null)
+
+function askRevokeKey(k) {
+  confirmRevokeKey.value = k
+}
+
+async function doRevokeKey() {
+  const k = confirmRevokeKey.value
+  confirmRevokeKey.value = null
   try {
     await api.deleteKey(k.id)
     keys.value = keys.value.filter(x => x.id !== k.id)
@@ -193,8 +202,16 @@ async function savePrice() {
   finally { savingPrice.value = false }
 }
 
-async function removePrice(p) {
-  if (!confirm(`确认删除「${p.model}」的官方价格？`)) return
+// 删除价格确认
+const confirmDeletePrice = ref(null)
+
+function askRemovePrice(p) {
+  confirmDeletePrice.value = p
+}
+
+async function doRemovePrice() {
+  const p = confirmDeletePrice.value
+  confirmDeletePrice.value = null
   try {
     await api.deleteModelPrice(p.model)
     toast('已删除', 'success')
@@ -313,7 +330,7 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
           </div>
           <button v-if="k.role === 'caller'" class="btn btn-ghost btn-sm" @click="openBindGroups(k)"><Icon name="layers" :size="13" />分组</button>
           <button class="btn btn-ghost btn-sm" @click="toggleKey(k)">{{ k.enabled ? '禁用' : '启用' }}</button>
-          <button class="btn btn-danger btn-sm" @click="revokeKey(k)">撤销</button>
+          <button class="btn btn-danger btn-sm" @click="askRevokeKey(k)">撤销</button>
         </div>
       </div>
 
@@ -341,18 +358,18 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
         <EmptyState v-else-if="modelPrices.length === 0" icon="gauge" title="价格库为空" desc="添加模型官方价格后，实测倍率将按官网价精确换算" style="padding:26px 0" />
         <div v-else class="table-wrap">
           <table>
-            <thead><tr><th>模型</th><th>输入价 $/1M</th><th>输出价 $/1M</th><th>缓存读 $/1M</th><th>缓存写 $/1M</th><th>备注</th><th style="width:110px"></th></tr></thead>
+            <thead><tr><th scope="col">模型</th><th scope="col">输入价 $/1M</th><th scope="col">输出价 $/1M</th><th scope="col">缓存读 $/1M</th><th scope="col">缓存写 $/1M</th><th scope="col">备注</th><th scope="col" style="width:110px"><span class="sr-only">操作</span></th></tr></thead>
             <tbody>
               <tr v-for="p in modelPrices" :key="p.model">
-                <td><span class="badge badge-blue mono">{{ p.model }}</span></td>
-                <td class="mono">${{ Number(p.input_price_per_m).toFixed(4) }}</td>
-                <td class="mono">${{ Number(p.output_price_per_m).toFixed(4) }}</td>
-                <td class="mono text-3">{{ p.cached_read_per_m != null ? '$' + Number(p.cached_read_per_m).toFixed(4) : '—' }}</td>
-                <td class="mono text-3">{{ p.cached_write_per_m != null ? '$' + Number(p.cached_write_per_m).toFixed(4) : '—' }}</td>
-                <td class="text-3" style="font-size:12px" :title="p.note">{{ p.note || '—' }}</td>
+                <td data-label="模型"><span class="badge badge-blue mono">{{ p.model }}</span></td>
+                <td class="mono" data-label="输入价">${{ Number(p.input_price_per_m).toFixed(4) }}</td>
+                <td class="mono" data-label="输出价">${{ Number(p.output_price_per_m).toFixed(4) }}</td>
+                <td class="mono text-3" data-label="缓存读">{{ p.cached_read_per_m != null ? '$' + Number(p.cached_read_per_m).toFixed(4) : '—' }}</td>
+                <td class="mono text-3" data-label="缓存写">{{ p.cached_write_per_m != null ? '$' + Number(p.cached_write_per_m).toFixed(4) : '—' }}</td>
+                <td class="text-3" style="font-size:12px" :title="p.note" data-label="备注">{{ p.note || '—' }}</td>
                 <td class="row gap-1" style="justify-content:flex-end">
                   <button class="btn btn-ghost btn-sm" @click="openPriceModal(p)"><Icon name="pencil" :size="12" /></button>
-                  <button class="btn btn-ghost btn-sm" @click="removePrice(p)"><Icon name="trash" :size="12" /></button>
+                  <button class="btn btn-ghost btn-sm" :aria-label="'删除 ' + p.model" @click="askRemovePrice(p)"><Icon name="trash" :size="12" /></button>
                 </td>
               </tr>
             </tbody>
@@ -367,12 +384,12 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th style="width:180px">站点</th><th>默认测试模型</th><th style="width:90px"></th></tr>
+              <tr><th scope="col" style="width:180px">站点</th><th scope="col">默认测试模型</th><th scope="col" style="width:90px"><span class="sr-only">操作</span></th></tr>
             </thead>
             <tbody>
               <tr v-for="ch in channels" :key="ch.id">
-                <td><span class="badge badge-teal">{{ ch.name }}</span></td>
-                <td>
+                <td data-label="站点"><span class="badge badge-teal">{{ ch.name }}</span></td>
+                <td data-label="默认测试模型">
                   <input v-model="testModelDrafts[ch.id]" class="input mono" :list="'tm-' + ch.id"
                     :placeholder="(ch.model_mapping && Object.keys(ch.model_mapping)[0]) || '如 gpt-4o'">
                   <datalist :id="'tm-' + ch.id">
@@ -469,6 +486,28 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
         <button class="btn btn-primary" @click="saveBinding" :disabled="savingBinding">{{ savingBinding ? '保存中…' : '保存' }}</button>
       </template>
     </BaseModal>
+
+    <!-- 撤销 Key 确认 -->
+    <ConfirmDialog
+      v-if="confirmRevokeKey"
+      title="撤销 API Key"
+      :message="`确认撤销 ${confirmRevokeKey.prefix}•••• ？此操作不可恢复。`"
+      confirm-text="撤销"
+      danger
+      @confirm="doRevokeKey"
+      @cancel="confirmRevokeKey = null"
+    />
+
+    <!-- 删除价格确认 -->
+    <ConfirmDialog
+      v-if="confirmDeletePrice"
+      title="删除官方价格"
+      :message="`确认删除「${confirmDeletePrice.model}」的官方价格？`"
+      confirm-text="删除"
+      danger
+      @confirm="doRemovePrice"
+      @cancel="confirmDeletePrice = null"
+    />
 
     <!-- 官方模型价格弹窗 -->
     <BaseModal v-if="showPriceModal" :title="editingPrice ? '编辑官方价格' : '添加官方价格'" width="440px" @close="showPriceModal = false">

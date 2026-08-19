@@ -97,18 +97,40 @@ const shapeStyle = i => {
 }
 
 const tipDetail = computed(() => shapes.value[tip.value.idx] || null)
+
+// 键盘导航：左右方向键在图例项间切换
+function onLegendKeydown(e) {
+  if (!shapes.value.length) return
+  const current = hovered.value ?? -1
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+    e.preventDefault()
+    const next = (current + 1) % shapes.value.length
+    hovered.value = next
+    emit('hover', next)
+  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+    e.preventDefault()
+    const prev = current <= 0 ? shapes.value.length - 1 : current - 1
+    hovered.value = prev
+    emit('hover', prev)
+  }
+}
 </script>
 
 <template>
   <div class="radar-wrap">
     <!-- 图例 -->
-    <div class="radar-legend">
+    <div class="radar-legend" role="listbox" :aria-activedescendant="hovered != null ? 'radar-legend-' + hovered : undefined" @keydown="onLegendKeydown">
       <button
         v-for="(s, i) in shapes" :key="s.channel_id" type="button"
+        :id="'radar-legend-' + i"
         class="legend-item" :class="{ on: hovered === i }"
+        role="option"
+        :aria-selected="hovered === i"
+        :tabindex="i === 0 || hovered === i ? 0 : -1"
         @mouseenter="hovered = i; emit('hover', i)" @mouseleave="onLeave"
+        @focus="hovered = i; emit('hover', i)"
       >
-        <span class="lg-dot" :style="{ background: s.color, boxShadow: i === 0 ? '0 0 8px ' + s.color : 'none' }" />
+        <span class="lg-dot" :style="{ background: s.color, boxShadow: i === 0 ? '0 0 8px ' + s.color : 'none' }" aria-hidden="true" />
         <span class="lg-name">{{ s.channel || ('#' + s.channel_id) }}</span>
         <span v-if="i === 0" class="lg-sel">已选</span>
       </button>

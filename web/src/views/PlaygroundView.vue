@@ -33,7 +33,6 @@ async function loadChannels() {
 }
 onMounted(() => { loadGroups(); loadChannels() })
 
-const knownModels = ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku']
 
 const selectedChannel = computed(() => channels.value.find(c => c.id === selChannelId.value) || null)
 
@@ -84,7 +83,7 @@ const loading = ref(false)
 const streamText = ref('')
 const result = ref(null) // { status, meta, body, displayText, raw, ttftMs, totalMs }
 const tab = ref('response')
-const autoScroll = ref(true)
+const autoScroll = ref(true) // TODO: 实现自动滚动到底部
 
 const statusCls = computed(() => {
   if (!result.value) return ''
@@ -321,14 +320,7 @@ function reset() {
 .msg-box { border: 1px solid var(--border); border-radius: var(--radius-md); overflow: hidden; margin-bottom: 10px; background: var(--surface-solid); }
 .msg-head { padding: 6px 10px; background: var(--surface); border-bottom: 1px solid var(--border); }
 
-.seg {
-  padding: 5px 14px; border-radius: var(--radius-full);
-  border: 1px solid var(--border-strong); background: var(--surface-solid);
-  color: var(--text-2); font-size: 12.5px; font-weight: 500; font-family: inherit;
-  cursor: pointer; transition: all var(--dur) var(--ease);
-}
-.seg:hover { color: var(--text-1); }
-.seg.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+/* seg 样式已移至 base.css 全局 */
 
 .resp-status { padding: 10px 14px; background: var(--surface-solid); border: 1px solid var(--border); border-radius: var(--radius-md); margin-bottom: 14px; flex-wrap: wrap; }
 
@@ -342,6 +334,11 @@ function reset() {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 1000px) {
-  .play-grid { grid-template-columns: 1fr; }
+  .play-grid { grid-template-columns: 1fr; min-height: auto; }
+  .play-pane { min-height: 380px; }
+}
+@media (max-width: 640px) {
+  .play-pane { min-height: 320px; }
+  .play-body { padding: 14px 16px; }
 }
 </style>

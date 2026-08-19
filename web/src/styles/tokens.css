@@ -40,10 +40,13 @@
 
   --text-1: #1d1d1f;             /* 主文字 */
   --text-2: #49494f;             /* 次级 */
-  --text-3: #86868b;             /* 三级 */
+  --text-3: #6e6e73;             /* 三级（WCAG AA 4.5:1 对比度） */
 
   --border: rgba(0, 0, 0, 0.09);
   --border-strong: rgba(0, 0, 0, 0.15);
+
+  /* 焦点环 */
+  --focus-ring: rgba(0, 113, 227, 0.35);
 
   --blue: #0071e3;
   --blue-hover: #0077ed;
@@ -83,6 +86,9 @@
   --border: rgba(255, 255, 255, 0.10);
   --border-strong: rgba(255, 255, 255, 0.18);
 
+  /* 焦点环 */
+  --focus-ring: rgba(10, 132, 255, 0.4);
+
   --blue: #0a84ff;
   --blue-hover: #409cff;
   --blue-soft: rgba(10, 132, 255, 0.16);
@@ -121,6 +127,9 @@
 
     --border: rgba(255, 255, 255, 0.10);
     --border-strong: rgba(255, 255, 255, 0.18);
+
+    /* 焦点环 */
+    --focus-ring: rgba(10, 132, 255, 0.4);
 
     --blue: #0a84ff;
     --blue-hover: #409cff;

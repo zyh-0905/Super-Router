@@ -35,6 +35,34 @@ a:hover { text-decoration: underline; }
 
 ::selection { background: var(--blue-soft); }
 
+/* ---------- 可访问性：焦点可见 ---------- */
+:focus-visible {
+  outline: 2.5px solid var(--focus-ring, var(--blue));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+/* 鼠标点击时不显示焦点环 */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ---------- 屏幕阅读器专用 ---------- */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
+/* ---------- 减少动效偏好 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  html { scroll-behavior: auto !important; }
+}
+
 /* 滚动条 */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -204,6 +232,10 @@ tbody tr.clickable:hover { background: var(--surface-hover); }
 }
 .toggle.on { background: var(--green); }
 .toggle.on::after { transform: translateX(18px); }
+.toggle:focus-visible {
+  outline: 2.5px solid var(--focus-ring, var(--blue));
+  outline-offset: 2px;
+}
 
 /* ---------- 代码块 ---------- */
 .code {
@@ -214,6 +246,21 @@ tbody tr.clickable:hover { background: var(--surface-hover); }
   font-family: var(--font-mono); font-size: 12px;
   color: var(--text-2); overflow-x: auto; line-height: 1.7;
   white-space: pre-wrap; word-break: break-all;
+}
+
+/* ---------- 分段控制器（Seg） ---------- */
+.seg {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 13px; border-radius: var(--radius-full);
+  border: 1px solid var(--border-strong); background: var(--surface-solid);
+  color: var(--text-2); font-size: 12.5px; font-weight: 500; font-family: inherit;
+  cursor: pointer; transition: all var(--dur) var(--ease);
+}
+.seg:hover { color: var(--text-1); }
+.seg.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+.seg-count {
+  background: rgba(255,255,255,0.22); border-radius: var(--radius-full);
+  padding: 0 6px; font-size: 10.5px; font-weight: 600;
 }
 
 /* ---------- 工具类 ---------- */
@@ -235,10 +282,58 @@ tbody tr.clickable:hover { background: var(--surface-hover); }
 .fade-in { animation: fadeIn var(--dur) var(--ease); }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
+/* ---------- 页面加载进度条 ---------- */
+.page-loading-bar {
+  position: fixed; top: 0; left: 0; right: 0; height: 2.5px;
+  z-index: 9999; pointer-events: none;
+  background: transparent;
+  overflow: hidden;
+}
+.page-loading-bar::after {
+  content: ''; display: block; height: 100%;
+  background: var(--blue);
+  animation: loadSlide 1.2s ease-in-out infinite;
+  border-radius: 0 2px 2px 0;
+}
+@keyframes loadSlide {
+  0% { width: 0; margin-left: 0; }
+  50% { width: 60%; margin-left: 20%; }
+  100% { width: 0; margin-left: 100%; }
+}
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 900px) {
   .stat-grid { grid-template-columns: repeat(2, 1fr); }
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
   .app-content { padding: 20px 18px 40px; }
   .page-title { font-size: 24px; }
+}
+
+@media (max-width: 640px) {
+  /* 表格卡片化降级 */
+  .table-card-mode table, .table-card-mode thead, .table-card-mode tbody,
+  .table-card-mode th, .table-card-mode td, .table-card-mode tr {
+    display: block;
+  }
+  .table-card-mode thead { display: none; }
+  .table-card-mode tr {
+    margin-bottom: 12px; padding: 14px 16px;
+    background: var(--surface-solid);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+  .table-card-mode td {
+    padding: 6px 0; border-bottom: none;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  .table-card-mode td::before {
+    content: attr(data-label);
+    font-size: 11px; font-weight: 600; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    flex-shrink: 0;
+  }
+  .table-card-mode td:last-child { padding-bottom: 0; }
+
+  .stat-grid { grid-template-columns: 1fr; }
+  .form-grid-2 { grid-template-columns: 1fr; }
 }

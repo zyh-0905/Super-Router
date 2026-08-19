@@ -109,8 +109,6 @@ const modelOption = computed(() => {
   }
 })
 
-// ---- 告警 ----
-const alertIcon = a => (a.sev === 'critical' ? 'alert' : 'alert')
 
 // ---- 站点综合信息（抽屉叠放）----
 const metricsStackEl = ref(null)
@@ -132,6 +130,32 @@ function scrollRatioTo(i) {
   const idx = Math.max(0, Math.min(i, metricChannels.value.length - 1))
   el.scrollTo({ top: idx * el.clientHeight, behavior: 'smooth' })
   currentRatioIdx.value = idx
+}
+
+// 触摸滑动支持（移动端）
+let touchStartY = 0
+let touchStartScrollTop = 0
+
+function onRatioTouchStart(e) {
+  const el = metricsStackEl.value
+  if (!el) return
+  touchStartY = e.touches[0].clientY
+  touchStartScrollTop = el.scrollTop
+}
+
+function onRatioTouchMove(e) {
+  const el = metricsStackEl.value
+  if (!el) return
+  const dy = touchStartY - e.touches[0].clientY
+  el.scrollTop = touchStartScrollTop + dy
+}
+
+function onRatioTouchEnd() {
+  const el = metricsStackEl.value
+  if (!el) return
+  // 吸附到最近的一页
+  const idx = Math.round(el.scrollTop / el.clientHeight)
+  scrollRatioTo(idx)
 }
 
 async function probeChannelRatio(ch) {
@@ -410,7 +434,12 @@ onMounted(load)
       <div v-if="loading" class="skeleton" style="height:430px;margin:0 18px 18px" />
       <EmptyState v-else-if="metricChannels.length === 0" icon="server" title="暂无站点数据"
         desc="添加站点并完成一次实测后，这里会显示每个站点的倍率、余额、健康、成功率与延迟" style="padding:48px 0" />
-      <div v-else ref="metricsStackEl" class="ratio-stack" style="height:448px" @scroll="onRatioScroll">
+      <div v-else ref="metricsStackEl" class="ratio-stack" style="height:448px"
+        @scroll="onRatioScroll"
+        @touchstart.passive="onRatioTouchStart"
+        @touchmove.passive="onRatioTouchMove"
+        @touchend="onRatioTouchEnd"
+      >
         <div v-for="ch in metricChannels" :key="ch.id" class="ratio-drawer">
           <div class="row gap-2" style="align-items:center;flex-wrap:wrap">
             <span class="dot" :class="!ch.enabled ? 'dot dot-gray' : ch.over_limit ? 'dot dot-red dot-pulse' : 'dot dot-green'" />
