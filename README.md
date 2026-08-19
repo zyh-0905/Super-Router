@@ -8,6 +8,7 @@
 
 ### 🧭 智能路由引擎
 - 不可变健康快照（Redis 缓存 + SHA256 校验）+ 确定性决策（相同输入 = 相同输出）
+- **快照批量加载**：健康/价格/探针/历史/熔断按表各一次查询装配，往返次数与站点数无关（缓存到期瞬间不会被 N+1 放大成 DB 尖峰）
 - **请求体透明转发**：网关只解析路由所需字段，其余字段（`top_p`/`stop`/`response_format`/`tool_choice`/多模态内容等）原样转发上游，仅移除网关扩展字段 `group`，OpenAI 兼容语义不被破坏
 - **5 种路由策略**：`custom_priority`（自定义优先级，默认）、`price_first`（低价）、`latency_first`（低延迟）、`reliability_first`（高成功率）、`balanced`（加权综合）
 - 策略查找链：Token×模型 → Token → **分组默认** → 系统默认
@@ -25,13 +26,14 @@
 
 ### 🔌 接口协议与中转站类型
 - **站点级接口协议**：`openai`（OpenAI 兼容，默认）/ `anthropic`（Claude 原生）。网关对外始终是 OpenAI 接口，anthropic 站点自动完成请求/响应/SSE 流式双向转换与 `x-api-key` 认证，健康检查/推理探针/模型列表同步适配
+- **协议转换覆盖范围**：文本消息、**多模态内容块**（`image_url` 的 data URL 转 base64 源、外链转 url 源）、system 提示、**工具调用双向转换**（请求侧 `tools`/`tool_calls`/`tool` 角色 → `input_schema`/`tool_use`/`tool_result`；响应侧 `tool_use` → `tool_calls`，非流式与流式 `input_json_delta` 均已覆盖）
 - **中转站类型**：`newapi`（new-api/one-api 系）/ `sub2api`（Sub2API）/ `custom`（自定义）。选择类型后自动配置余额接口：new-api → `/api/user/self`，sub2api → `/api/v1/auth/me`；余额接口地址留空时按类型自动探测
 - 余额响应自动识别多格式：one-api `data.quota`（quota 单位自动换算美元）、new-api 会话嵌套 `data.user.quota`、`data.balance`、OpenAI `total_available`；仅支持 POST 的余额接口自动 GET→POST 回退
 
 ### 🩺 健康检测（checker 进程）
 - 分组感知调度器（5 秒 tick，每站点按有效间隔独立调度）
 - **存活探测**（默认 30s）：`GET /v1/models`（按站点协议自动选择认证头）
-- **价格同步**（默认 10m）：同步上游声明的 prompt/completion 倍率
+- **价格同步**（默认 10m）：同步上游声明的 prompt/completion 倍率；空模型名或非正倍率的条目**入库前丢弃并告警**（零价格会被成本估算视为"免费"而扭曲低价策略排序）
 - **推理探针**（默认 1h）：真实推理，**余额差值反推真实倍率**，全局/分组/站点三重预算保护；失败的探针退避重试（默认 6h）
 - **余额检测**（默认 10m）：见下节
 
@@ -83,17 +85,24 @@ docker version
 docker compose version
 ```
 
-### 2. 一键启动完整栈（推荐）
+### 2. 一键启动完整栈（本地开发）
 
 ```bash
 docker compose -p smart-router up -d --build
 docker compose -p smart-router ps
 ```
 
-该命令会启动四个服务：PostgreSQL 16、Redis 7、Gateway 和 Checker。Gateway 对外提供 API/Web，Checker 在后台执行存活、价格、推理探针和余额检测，不占用宿主机端口。**数据库迁移由应用启动时自动执行**（版本化迁移器，带 advisory lock 与 `schema_migrations` 记录；存量数据卷会自动识别已应用的迁移并补齐缺失版本，不再依赖 `/docker-entrypoint-initdb.d` 首次初始化）。API Key 引导行为由 `configs/config.yaml` 的 `server.bootstrap_default_keys` 控制：
+该命令会启动四个服务：PostgreSQL 16、Redis 7、Gateway 和 Checker。Gateway 对外提供 API/Web，Checker 在后台执行存活、价格、推理探针和余额检测，不占用宿主机端口。**数据库迁移由应用启动时自动执行**（版本化迁移器，带 advisory lock 与 `schema_migrations` 记录；存量数据卷会自动识别已应用的迁移并补齐缺失版本，不再依赖 `/docker-entrypoint-initdb.d` 首次初始化）。
 
-- **本地开发**（`config.local.yaml`，`bootstrap_default_keys: true`）：表为空时自动创建 `test-admin-key`（管理员）与 `test-caller-key`（调用方）；
-- **生产**（默认 `false`）：空库时生成一次性随机管理员 Key（`sr-` 前缀），只在启动日志打印一次，请立即妥善保存。
+> ⚠️ **当前 compose 栈是开发配置，不能直接对外部署。**
+> `docker-compose.yml` 显式加载 `configs/config.local.yaml`，与 `configs/config.yaml` 的生产默认值有两处实质差异：
+>
+> | 配置项 | 开发（compose 当前） | 生产（`config.yaml`） |
+> |---|---|---|
+> | `bootstrap_default_keys` | `true` —— 空库写入 `test-admin-key` / `test-caller-key` | `false` —— 生成一次性随机管理员 Key（`sr-` 前缀），仅启动日志打印一次 |
+> | `allow_private_upstream` / `allow_http_upstream` | `true` —— **SSRF 防护关闭**，允许 http 与私网上游 | `false` —— 仅允许 https 公网上游 |
+>
+> 对外部署时请把 compose 的 `command` 改回 `configs/config.yaml`，或将这两处差异挪到 `docker-compose.override.yml`，使主文件保持生产安全默认。
 
 查看状态和日志：
 
@@ -232,6 +241,31 @@ security:
 环境变量覆盖：`DATABASE_HOST/PORT/USER/PASSWORD/NAME`、`REDIS_HOST/PORT`、`SR_ENC_KEY`。
 
 启动时会对配置做 schema/范围校验（端口、间隔、预算、权重、熔断参数等），非法配置直接 fail fast。
+
+### 路由数据口径
+
+策略排序依赖的三类指标各有明确来源与精度边界，理解它们才能解释决策结果：
+
+**延迟（TTFT）** —— 取每个「站点 × 模型」最近 **20 次成功探测**的 `percentile_cont` 真实 P50/P95。
+单次探测抖动可达数倍（同一站点同一模型实测区间可从 2.2s 到 15.4s），因此不使用单点采样。
+无探测数据的站点按一个大值参与排序，即"未知延迟排在已知低延迟之后"。
+
+**成本** —— 按以下优先级估算，越靠前越可信：
+
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| 1 | 实测倍率 `official` | 倍率 × **探测当时快照的官网价**，价格库后续调整不影响历史一致性 |
+| 2 | 实测倍率 `baseline` | 倍率 × $10/1M 混合基准（价格库未收录该模型时的旧口径） |
+| 3 | 声明价格 `declared_prices` | 上游 `/api/pricing` 倍率 × 基准单价；仅取正值条目 |
+| 4 | 保守兜底 | 输入 $10/1M、输出 $30/1M |
+
+兜底刻意取偏高值：把未知价格当作免费会让该站点在 `price_first`/`balanced` 下永远排第一。
+声明价格的基准单价（`declaredRatioBasePerM`）是未经上游核实的假设值，仅作为无实测数据时的兜底，
+精确化应通过实测倍率而非调整该常量。
+
+**输入 token** —— 无分词器，按字符类别启发式估算（ASCII 约 4 字符/token，CJK 约 1.7 字符/token），
+计入工具定义与多模态块。**仅用于成本估算与 `max_price_cap` 硬过滤，不用于计费**；
+真实用量以上游返回的 `usage` 为准。
 
 ### 上游凭据加密（P1-07 整改）
 

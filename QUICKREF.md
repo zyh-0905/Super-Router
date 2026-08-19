@@ -45,7 +45,7 @@ docker compose -p smart-router logs -f gateway checker
 | PostgreSQL | gateway / gateway_pass · db: smart_router |
 | Grafana | admin / admin |
 
-默认凭证只适用于本地开发；生产环境 `bootstrap_default_keys: false` 会在空库时生成随机 `sr-` 管理员 Key（仅日志打印一次），请及时替换并停用默认 Key。
+默认凭证只适用于本地开发。**当前 compose 栈加载 `configs/config.local.yaml`，属于开发配置**：`bootstrap_default_keys: true`，且 SSRF 防护（`allow_private_upstream` / `allow_http_upstream`）均为关闭。对外部署请改用 `configs/config.yaml`——空库时生成随机 `sr-` 管理员 Key（仅日志打印一次），并强制 https 公网上游。详见 README「一键启动完整栈」。
 
 ## 🧪 调用网关
 
@@ -82,8 +82,16 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | 项 | 取值 | 作用 |
 |-----|------|------|
 | 中转站类型 | `newapi` / `sub2api` / `custom` | 自动配置余额接口：new-api → `/api/user/self`，sub2api → `/api/v1/auth/me`；留空按类型自动探测 |
-| 接口协议 | `openai` / `anthropic` | anthropic 站点自动 OpenAI↔Anthropic 转换 + `x-api-key` 认证，对外仍是 OpenAI 接口 |
+| 接口协议 | `openai` / `anthropic` | anthropic 站点自动 OpenAI↔Anthropic 转换 + `x-api-key` 认证，对外仍是 OpenAI 接口；覆盖文本、多模态内容块与工具调用（双向） |
 | 默认测试模型 | 每站点独立 | 测试台选择站点后自动预填该模型 |
+
+## 📐 路由数据口径
+
+| 指标 | 来源 | 注意 |
+|-----|------|------|
+| 延迟 P50/P95 | 每「站点×模型」最近 20 次成功探测的真实分位数 | 无探测数据时按大值排序（未知延迟排在已知低延迟之后） |
+| 成本 | 实测倍率 `official` → `baseline` → 声明价格 → 保守兜底（$10/$30 每 1M） | 兜底刻意偏高：未知价格若当作免费会让该站点在低价策略下永远第一 |
+| 输入 token | 按字符类别启发式估算（ASCII ≈4 字符/token，CJK ≈1.7），含工具定义与多模态块 | **仅用于路由决策与价格上限过滤，不用于计费**；真实用量以上游 `usage` 为准 |
 
 ## 💰 余额检测速查
 

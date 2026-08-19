@@ -62,7 +62,8 @@ web/
     │   └── base.css         # 基础样式与通用类
     ├── components/
     │   ├── AppSidebar.vue    # 毛玻璃侧边栏
-    │   ├── BaseModal.vue     # 弹窗
+    │   ├── BaseModal.vue     # 弹窗（ESC 关闭 / 焦点陷阱 / aria 属性 / 滚动锁定）
+    │   ├── ConfirmDialog.vue # 确认对话框（替代原生 confirm，支持 danger 态）
     │   ├── BaseChart.vue     # ECharts 封装（主题自适应）
     │   ├── RadarChart.vue    # 手绘 SVG 六维雷达图（决策候选评分/总览决策雷达）
     │   ├── StatCard.vue      # 统计卡
@@ -90,6 +91,7 @@ web/
 - **真流式**：测试台使用 fetch + ReadableStream 解析 SSE，逐字渲染
 - **统一下拉体验**：全站下拉选择器由 `SelectBox.vue` 统一提供（弹层式选项、键盘导航、自适应方向、选中对勾）
 - **告警弹窗**：全局轮询系统告警，新告警/严重度升级时从右下角弹出预警卡片（弹跳动效 + 倒计时进度条），可一键跳转处理页
+- **可访问性**：全局 `:focus-visible` 焦点环（`--focus-ring` 令牌）保证键盘导航可见；弹窗支持 ESC 关闭与焦点陷阱；三级文字色满足 WCAG AA 4.5:1 对比度；破坏性操作统一走 `ConfirmDialog` 而非原生 `confirm()`
 - **生产安全**：生产构建不预填开发 Key（凭据存 sessionStorage）；中文响应头由网关 URI 编码、前端解码还原
 
 ## 与后端的接口对照
