@@ -16,6 +16,7 @@ import (
 	"smart-router/internal/config"
 	"smart-router/internal/crypto"
 	"smart-router/internal/migrate"
+	"smart-router/internal/quality"
 	"smart-router/internal/store"
 	"smart-router/internal/telegram"
 
@@ -122,6 +123,14 @@ func main() {
 		}
 	}
 
+	// Quality Worker：领取并执行 API 接口质量检测任务（默认 3 并发）。
+	// 与 Telegram/告警 Worker 相互独立，任一失败不影响其他。
+	qualityRepo := quality.NewPostgresRepository(db)
+	qualityExecutor := quality.NewExecutor(db, qualityRepo,
+		quality.NewRedisPublisher(redisClient), cfg.Security.EncryptionKey, cfg.Checker.ProbeModel, logger.Named("quality"))
+	go quality.NewWorker(qualityRepo, qualityExecutor, checkerWorkerID(), logger.Named("quality-worker")).Run(ctx)
+	logger.Info("Quality worker started (max 3 concurrent)")
+
 	logger.Info("Scheduler started (tick 5s), alert reconciler started (30s)")
 
 	// 等待中断信号
@@ -140,6 +149,12 @@ func boolToStr(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// checkerWorkerID 质量 Worker 实例标识（进程级唯一；多实例时用于心跳所有权校验）。
+func checkerWorkerID() string {
+	host, _ := os.Hostname()
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }
 
 // pgAdvisoryLock 返回基于 PostgreSQL 会话级 advisory lock 的选主函数
@@ -269,6 +284,7 @@ func (s *scheduler) runCleanup(ctx context.Context) {
 		{"balance_checks", "checked_at"},
 		{"request_history", "created_at"},
 		{"decision_logs", "decided_at"},
+		{"quality_check_runs", "created_at"}, // 质量检测结果经外键级联删除
 	}
 	for _, t := range targets {
 		ct, err := s.db.Pool.Exec(ctx,
