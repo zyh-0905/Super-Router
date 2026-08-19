@@ -14,8 +14,10 @@ import (
 	"smart-router/internal/alert"
 	"smart-router/internal/checker"
 	"smart-router/internal/config"
+	"smart-router/internal/crypto"
 	"smart-router/internal/migrate"
 	"smart-router/internal/store"
+	"smart-router/internal/telegram"
 
 	"go.uber.org/zap"
 )
@@ -99,6 +101,26 @@ func main() {
 	alertReconciler := alert.NewReconciler(alert.NewEvaluator(db), alert.NewSQLStore(db), logger.Named("alert"))
 	go alertReconciler.Run(ctx, 30*time.Second)
 
+	// Telegram Worker：默认关闭（telegram_config.enabled=false 时 idle）。
+	// 配置启用后长轮询命令 + 每小时整点汇总；advisory lock 保证多实例只有一个 poller/report owner。
+	// Telegram 失败只记日志，不影响 alive/pricing/probe/balance。
+	tgStore := telegram.NewSQLConfigStore(db)
+	if tgCfg, terr := tgStore.LoadConfig(ctx); terr != nil {
+		logger.Warn("Telegram config load failed, worker disabled", zap.Error(terr))
+	} else if tgCfg.Enabled {
+		token, terr := tgStore.BotToken(ctx, crypto.Decrypt, cfg.Security.EncryptionKey)
+		if terr != nil || token == "" {
+			logger.Warn("Telegram enabled but bot token unavailable, worker disabled", zap.Error(terr))
+		} else {
+			telegram.RegisterAlertQueries(db)
+			tgWorker := telegram.NewWorker(tgStore, telegram.NewClient(token),
+				telegram.NewCommandService(telegram.NewSQLQueryService(db)), logger.Named("telegram"))
+			tgWorker.SetLock(pgAdvisoryLock(db))
+			go tgWorker.Run(ctx)
+			logger.Info("Telegram worker started (long polling + hourly reports)")
+		}
+	}
+
 	logger.Info("Scheduler started (tick 5s), alert reconciler started (30s)")
 
 	// 等待中断信号
@@ -117,6 +139,27 @@ func boolToStr(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// pgAdvisoryLock 返回基于 PostgreSQL 会话级 advisory lock 的选主函数
+// （连接断开时锁自动释放，其他 Checker 可接管）。
+func pgAdvisoryLock(db *store.DB) telegram.LockFn {
+	return func(ctx context.Context, key int64) (func(), error) {
+		conn, err := db.Pool.Acquire(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+			conn.Release()
+			return nil, err
+		}
+		return func() {
+			unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.Exec(unlockCtx, `SELECT pg_advisory_unlock($1)`, key)
+			conn.Release()
+		}, nil
+	}
 }
 
 // ============================================================

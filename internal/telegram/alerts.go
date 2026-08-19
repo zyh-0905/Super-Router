@@ -1,0 +1,84 @@
+package telegram
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"smart-router/internal/alert"
+	"smart-router/internal/store"
+)
+
+// AlertQueries 告警只读查询（Telegram /alerts /status 与小时汇总共用）。
+type AlertQueries struct {
+	svc *alert.Service
+}
+
+// NewAlertQueries 创建告警查询（内部使用共享 alert.Service 读取持久化事件）。
+func NewAlertQueries(db *store.DB) *AlertQueries {
+	return &AlertQueries{svc: alert.NewService(db)}
+}
+
+// ListActive 返回格式化的活跃告警列表（criticalOnly 只看严重告警）。
+func (a *AlertQueries) ListActive(ctx context.Context, groupIDs []int, criticalOnly bool) (string, error) {
+	alerts, err := a.svc.ActiveForGroups(ctx, groupIDs)
+	if err != nil {
+		return "", err
+	}
+	if criticalOnly {
+		filtered := alerts[:0]
+		for _, al := range alerts {
+			if al.Severity == alert.SeverityCritical {
+				filtered = append(filtered, al)
+			}
+		}
+		alerts = filtered
+	}
+	return FormatAlerts(alerts, time.Now()), nil
+}
+
+// FormatAlerts 格式化告警列表（Telegram 消息）。
+func FormatAlerts(alerts []alert.Alert, now time.Time) string {
+	if len(alerts) == 0 {
+		return "✅ <b>当前没有活跃告警</b>"
+	}
+	var b strings.Builder
+	critical, warning := 0, 0
+	for _, a := range alerts {
+		if a.Severity == alert.SeverityCritical {
+			critical++
+		} else {
+			warning++
+		}
+	}
+	b.WriteString(fmt.Sprintf("🚨 <b>活跃告警 %d 条</b>（🔴 %d / 🟠 %d）\n", len(alerts), critical, warning))
+	for _, a := range alerts {
+		icon := "🟠"
+		if a.Severity == alert.SeverityCritical {
+			icon = "🔴"
+		}
+		b.WriteString(fmt.Sprintf("\n%s <b>%s</b>\n", icon, EscapeHTML(a.Title)))
+		if a.ChannelName != "" {
+			b.WriteString("站点：" + EscapeHTML(a.ChannelName) + "\n")
+		}
+		if a.Model != "" {
+			b.WriteString("模型：" + EscapeHTML(a.Model) + "\n")
+		}
+		if a.CurrentValue != nil && a.ThresholdValue != nil {
+			b.WriteString(fmt.Sprintf("当前：%.4g%s / 阈值：%.4g%s\n", *a.CurrentValue, a.Unit, *a.ThresholdValue, a.Unit))
+		}
+		if !a.FirstSeenAt.IsZero() {
+			b.WriteString("持续：" + alert.FormatDuration(now.Sub(a.FirstSeenAt)) + "\n")
+		}
+		b.WriteString("Key：" + EscapeHTML(a.Key) + "\n")
+	}
+	b.WriteString("\n/alert &lt;alert_key&gt; 查看单条详情")
+	return b.String()
+}
+
+// RegisterAlertQueries 将告警查询注入命令服务（Worker 装配时调用一次）。
+func RegisterAlertQueries(db *store.DB) {
+	q := NewAlertQueries(db)
+	SetAlertsQuery(q.ListActive)
+}
