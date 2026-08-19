@@ -27,14 +27,14 @@
 ### 🔌 接口协议与中转站类型
 - **站点级接口协议**：`openai`（OpenAI 兼容，默认）/ `anthropic`（Claude 原生）。网关对外始终是 OpenAI 接口，anthropic 站点自动完成请求/响应/SSE 流式双向转换与 `x-api-key` 认证，健康检查/推理探针/模型列表同步适配
 - **协议转换覆盖范围**：文本消息、**多模态内容块**（`image_url` 的 data URL 转 base64 源、外链转 url 源）、system 提示、**工具调用双向转换**（请求侧 `tools`/`tool_calls`/`tool` 角色 → `input_schema`/`tool_use`/`tool_result`；响应侧 `tool_use` → `tool_calls`，非流式与流式 `input_json_delta` 均已覆盖）
-- **中转站类型**：`newapi`（new-api/one-api 系）/ `sub2api`（Sub2API）/ `custom`（自定义）。选择类型后自动配置余额接口：new-api → `/api/user/self`，sub2api → `/api/v1/auth/me`；余额接口地址留空时按类型自动探测
+- **中转站类型**：`newapi`（new-api/one-api 系）/ `sub2api`（Sub2API）/ `custom`（自定义）。选择类型后自动按「Base URL + 类型默认路径」补全余额接口完整地址：new-api → `{base_url}/api/user/self`，sub2api → `{base_url}/api/v1/auth/me?timezone=Asia%2FShanghai`；修改 Base URL 时若余额接口未手动改过会跟随更新；余额接口地址留空时按类型自动探测
 - 余额响应自动识别多格式：one-api `data.quota`（quota 单位自动换算美元）、new-api 会话嵌套 `data.user.quota`、`data.balance`、OpenAI `total_available`；仅支持 POST 的余额接口自动 GET→POST 回退
 
 ### 🩺 健康检测（checker 进程）
 - 分组感知调度器（5 秒 tick，每站点按有效间隔独立调度）
 - **存活探测**（默认 30s）：`GET /v1/models`（按站点协议自动选择认证头）
-- **价格同步**（默认 10m）：同步上游声明的 prompt/completion 倍率；空模型名或非正倍率的条目**入库前丢弃并告警**（零价格会被成本估算视为"免费"而扭曲低价策略排序）
-- **推理探针**（默认 1h）：真实推理，**余额差值反推真实倍率**，全局/分组/站点三重预算保护；失败的探针退避重试（默认 6h）
+- **价格同步**（默认 10m）：同步上游声明的 prompt/completion 倍率（仅 `newapi` 类型——`/api/pricing` 为 new-api/one-api 系接口，sub2api/custom 自动跳过）。空模型名或非正倍率的条目**入库前丢弃并告警**（零价格会被成本估算视为"免费"而扭曲低价策略排序）；**每轮查询计入该站点 request_history**（`is_probe` 标记），失败按错误类别归类（auth_error/rate_limited/timeout/upstream_error/decode_error 等），最近 30 分钟同步失败的站点产生「价格同步失败」告警
+- **推理探针**（默认 1h）：真实推理，**余额差值反推真实倍率**，全局/分组/站点三重预算保护；失败的探针退避重试（默认 6h）；**模型使用站点默认测试模型（test_model）**，未配置时回退全局 `checker.probe_model`
 - **余额检测**（默认 10m）：见下节
 
 ### ✨ 实时倍率（实测真实价格）
@@ -45,6 +45,7 @@
 
 ### 💰 余额自动检测
 - **多协议自动探测**：站点自定义接口 → 中转站类型默认接口 → one-api/new-api（`/api/user/self`）→ OpenAI 官方（`credit_grants`）
+- **Sub2API 余额自动登录**：站点配置余额登录邮箱/密码后，checker 自动调用登录接口换取会话 JWT 查询余额，免去手动抓包令牌；令牌缓存于 Redis（TTL 跟随 expires_in），余额接口 401 时自动重登重试一次；登录失败回退静态令牌链。密码与其它凭据一致应用层信封加密入库，接口只回显邮箱
 - **站点级自定义接口**：余额接口地址 + 独立令牌均可逐站点配置（适配不开放标准管理 API 的中转站，如网页控制台 JWT 会话令牌）；401/403 时解析响应错误码并提示令牌过期
 - 站点卡片余额徽章、详情页余额历史折线；**低余额告警**（阈值可在设置页配置，默认 $1）
 
@@ -53,7 +54,8 @@
 - Prometheus 指标（11 个核心指标）+ Grafana 仪表板 + 13 条告警规则
 - 结构化日志（Zap + trace_id 全链路）
 - 决策重放 CLI（`./bin/replay`）：历史决策回放与策略对比
-- **预警弹窗**：Web 控制台每 30 秒轮询系统告警（低余额/倍率超标/熔断开闸/站点禁用），新告警或严重度升级时从**右下角弹出预警卡片**（弹跳动效 + 倒计时进度条，自动消失），可一键跳转到对应处理页
+- **告警页**：`/alerts` 汇总全部活跃告警（低余额/倍率超标/熔断开闸降级/站点禁用/价格同步失败），按严重度排序、跟随分组筛选、30s 自动刷新，一键跳转对应处理页
+- **预警弹窗**：Web 控制台每 30 秒轮询系统告警，**仅 critical 级别**（低余额/倍率超标/熔断开闸）新出现或严重度升级时从**右下角弹出预警卡片**（弹跳动效 + 倒计时进度条，自动消失），可一键跳转告警页
 
 ### 🖥 Web 控制台（Vue 3 + Vite）
 苹果风格、明暗双主题（跟随系统）、全真实数据：
@@ -61,11 +63,12 @@
 | 页面 | 功能 |
 |---|---|
 | 总览 | 24h 请求/成功率/延迟（同比）、趋势图、模型分布、告警、分组切换器、站点综合信息抽屉（倍率/余额/健康/成功率/延迟五图） |
-| 站点 | 分组筛选、站点增删改（接口协议/中转站类型/默认测试模型）、健康/统计/余额/倍率详情、倍率检测分组、上游模型列表一键映射 |
-| 测试台 | 真流式请求、站点选择自动预填该站点默认测试模型、分组限定路由、路由决策信息（渠道/策略/分组/Trace ID） |
-| 决策 | 决策审计表格（分组列）、筛选、详情抽屉（候选六维评分雷达图/排除原因） |
+| 站点 | 分组筛选、站点增删改（接口协议/中转站类型/默认测试模型/余额自动登录）、健康/统计/余额/倍率详情、倍率检测分组、上游模型列表一键映射 |
+| 测试台 | 真流式请求、站点选择自动预填该站点默认测试模型、分组限定路由、路由决策信息（渠道/策略/分组/Trace ID）、请求中等待动画 |
+| 决策 | 决策审计表格（分组列）、筛选、详情抽屉（候选六维评分雷达图/排除原因）、**编辑模式多选/全选删除与导出** |
 | 策略中心 | 路由策略按「系统默认」与「每个分组」分别配置；5 种内置策略做成可视化卡片（卡片内展示各因素权重），「加权均衡」支持成本/可靠性/延迟/负载四维权重滑块，未配置的分组一键恢复跟随系统默认，保存立即生效 |
 | 熔断 | 四态熔断器、分组切换、手动重置 |
+| 告警 | 全部活跃告警统一视图（低余额/倍率超标/熔断开闸降级/站点禁用/价格同步失败），按严重度排序、跟随分组筛选、30s 自动刷新、按类型跳转处理页 |
 | 设置 | 连接配置、API Keys（分组绑定）、每站点默认测试模型、官方模型价格库、低余额阈值 |
 
 ## 快速开始
@@ -119,7 +122,7 @@ docker compose -p smart-router restart checker
 - Gateway 就绪检查（readiness，检查 PostgreSQL/Redis）：<http://localhost:8080/ready>
 - Prometheus 指标：<http://localhost:8080/metrics>
 
-Checker 默认周期为存活 30 秒、价格 10 分钟、余额 10 分钟、推理探针 1 小时；失败的推理探针默认退避 6 小时后重试。推理探针会调用真实上游并可能产生费用，全局每日预算默认为 `$5`，按「全局/渠道/分组三重取最小值 + Redis 原子预留」执行（定时与手动探测共享同一预算记账）。如不希望产生探针费用，可在 `configs/config.yaml` 或分组设置中调整探针周期/预算。历史数据默认保留 30 天（`checker.retention_days`），快照归档随决策日志保留期同步回收。
+Checker 默认周期为存活 30 秒、价格 10 分钟、余额 10 分钟、推理探针 1 小时；失败的推理探针默认退避 6 小时后重试。推理探针会调用真实上游并可能产生费用，全局每日预算默认为 `$5`，按「全局/渠道/分组三重取最小值 + Redis 原子预留」执行（定时与手动探测共享同一预算记账）。定时探针的模型为各站点默认测试模型（`test_model`，测试台自动预填的同一字段），未配置的站点回退 `checker.probe_model`。如不希望产生探针费用，可在 `configs/config.yaml` 或分组设置中调整探针周期/预算。历史数据默认保留 30 天（`checker.retention_days`），快照归档随决策日志保留期同步回收。
 
 PostgreSQL 和 Redis 使用命名数据卷持久化。不要使用 `docker compose down -v`，除非确认要删除全部本地数据。
 
@@ -188,13 +191,14 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | 站点健康 / 余额 | `GET /admin/health/:id` · `GET /admin/channels/:id/balance` |
 | 上游模型列表 | `GET /admin/channels/:id/models` · `POST /admin/upstream/models`（按站点协议发送认证头） |
 | 实时倍率 | `GET /admin/channels/:id/ratio` · `POST /admin/channels/:id/probe-ratio`（按需实测，计入每日探测预算） |
+| 告警列表 | `GET /admin/alerts[?group_id=]`（全部活跃告警，告警页专用） |
 | 倍率检测分组 | `POST/PATCH/DELETE /admin/channels/:id/ratio-groups[/:gid]` · `POST /admin/channels/:id/ratio-groups/:gid/probe`（每组自定义默认检测模型） |
 | 官方模型价格库 | `GET/POST /admin/model-prices` · `DELETE /admin/model-prices/:model` |
 | 分组 CRUD | `GET/POST /admin/groups` · `PATCH/DELETE /admin/groups/:id` |
 | 系统默认策略 | `GET/PUT /admin/policies`（策略中心：5 种内置策略选择 + balanced 四维权重） |
 | 分组策略 | `GET/PUT /admin/groups/:id/strategy`（每分组独立策略与权重；空 = 跟随系统默认） |
 | 统计聚合 | `GET /admin/stats[?group_id=]` · `GET /admin/channel-metrics`（站点综合指标） |
-| 决策日志 | `GET /admin/decisions?limit=[&group_id=]`（含候选六维评分与故障切换明细） |
+| 决策日志 | `GET /admin/decisions?limit=[&group_id=]`（含候选六维评分与故障切换明细） · `DELETE /admin/decisions`（批量删除，body `{"request_ids":[...]}`） |
 | 熔断 | `GET /admin/circuit[?group_id=]` · `POST /admin/circuit/:id/reset` |
 | API Keys | `GET/POST /admin/keys` · `PATCH/DELETE /admin/keys/:id`（支持分组绑定） |
 | 系统设置 | `GET/PATCH /admin/settings`（低余额阈值） |

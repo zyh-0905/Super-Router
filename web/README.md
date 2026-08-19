@@ -37,11 +37,12 @@ open http://localhost:5173/
 | 路由 | 页面 | 说明 |
 |---|---|---|
 | `#/` | 总览 | 24h 请求/成功率/延迟（同比）、趋势图、模型分布、告警、**决策雷达**（最近一次决策六维对比 + 近 10 次最优站点，可点击切换）、**分组切换器**、站点综合信息抽屉 |
-| `#/channels` | 站点 | 站点列表（**分组筛选**、**余额徽章**、OpenAI/Anthropic 协议徽章、中转站类型徽章、角色中文徽章）、详情（信息/健康/统计/余额/**倍率**）、新增/编辑（**接口协议**、**中转站类型**、**默认测试模型**、多选分组、乐观锁）、**分组管理**、**倍率检测分组**、获取上游模型 |
-| `#/playground` | 测试台 | 真实流式请求、**站点选择自动预填该站点默认测试模型**、**分组选择**（限定路由范围且站点列表联动过滤）、路由决策信息 |
-| `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉（候选**六维评分雷达图** + 真实指标/人话排名/排除原因/故障切换明细） |
+| `#/channels` | 站点 | 站点列表（**分组筛选**、**余额徽章**、OpenAI/Anthropic 协议徽章、中转站类型徽章、角色中文徽章）、详情（信息/健康/统计/余额/**倍率**）、新增/编辑（**接口协议**、**中转站类型**、**默认测试模型**、**余额自动登录邮箱密码**、多选分组、乐观锁、**测试连接**）、**分组管理**、**倍率检测分组**、获取上游模型 |
+| `#/playground` | 测试台 | 真实流式请求、**站点选择自动预填该站点默认测试模型**、**分组选择**（限定路由范围且站点列表联动过滤）、路由决策信息、**请求中等待动画**（进行中状态条 + 三点弹跳 + 实时计时） |
+| `#/decisions` | 决策 | 决策日志表格（含分组列）、**分组筛选**、详情抽屉（候选**六维评分雷达图** + 真实指标/人话排名/排除原因/故障切换明细）、**编辑模式多选/全选删除与导出** |
 | `#/strategy` | 策略中心 | 路由策略按「系统默认」与**每个分组**分别配置；5 种策略可视化卡片（因素权重条）、「加权均衡」四维权重滑块、分组一键恢复跟随系统默认 |
 | `#/circuit` | 熔断 | 四态熔断器（分组隔离）、**分组切换器**、重置 |
+| `#/alerts` | 告警 | **全部活跃告警统一视图**（低余额/倍率超标/熔断开闸降级/站点禁用/价格同步失败），摘要卡 + 按严重度排序列表、**分组切换器**、30s 自动刷新、按类型跳转处理页 |
 | `#/settings` | 设置 | 连接配置、API Keys（**分组绑定**）、**每站点默认测试模型**（表格逐站点设置）、**官方模型价格库**、**低余额告警阈值** |
 
 ## 项目结构
@@ -61,15 +62,15 @@ web/
     │   ├── tokens.css       # 设计令牌（明暗双主题）
     │   └── base.css         # 基础样式与通用类
     ├── components/
-    │   ├── AppSidebar.vue    # 毛玻璃侧边栏
+    │   ├── AppSidebar.vue    # 毛玻璃侧边栏（含告警徽标）
     │   ├── BaseModal.vue     # 弹窗（ESC 关闭 / 焦点陷阱 / aria 属性 / 滚动锁定）
     │   ├── ConfirmDialog.vue # 确认对话框（替代原生 confirm，支持 danger 态）
-    │   ├── BaseChart.vue     # ECharts 封装（主题自适应）
+    │   ├── BaseChart.vue     # ECharts 封装（主题自适应 / tooltip 挂 body 逃逸裁剪 / 渲染去重）
     │   ├── RadarChart.vue    # 手绘 SVG 六维雷达图（决策候选评分/总览决策雷达）
     │   ├── StatCard.vue      # 统计卡
     │   ├── GroupSwitcher.vue # 分组切换器（胶囊模式 / compact 下拉模式）
     │   ├── SelectBox.vue     # 通用下拉选择器（键盘导航/自适应弹层/选中对勾）
-    │   ├── AlertPopupHost.vue# 右下角预警弹窗（弹跳动效 + 倒计时 + 一键跳转）
+    │   ├── AlertPopupHost.vue# 右下角预警弹窗（仅 critical 级，弹跳动效 + 倒计时 + 跳转告警页）
     │   ├── EmptyState.vue    # 空状态
     │   ├── ToastHost.vue     # Toast 通知
     │   └── Icon.vue          # SF Symbols 风格图标集
@@ -80,6 +81,7 @@ web/
         ├── DecisionsView.vue
         ├── StrategyView.vue
         ├── CircuitView.vue
+        ├── AlertsView.vue
         └── SettingsView.vue
 ```
 
@@ -90,7 +92,8 @@ web/
 - **真数据无演示**：全部页面接真实后端接口（统计聚合、决策富化、熔断、API Keys CRUD）
 - **真流式**：测试台使用 fetch + ReadableStream 解析 SSE，逐字渲染
 - **统一下拉体验**：全站下拉选择器由 `SelectBox.vue` 统一提供（弹层式选项、键盘导航、自适应方向、选中对勾）
-- **告警弹窗**：全局轮询系统告警，新告警/严重度升级时从右下角弹出预警卡片（弹跳动效 + 倒计时进度条），可一键跳转处理页
+- **告警弹窗**：全局轮询系统告警，**仅 critical 级**新告警/严重度升级时从右下角弹出预警卡片（弹跳动效 + 倒计时进度条），可一键跳转告警页；全部告警在「告警」页统一查看
+- **图表 tooltip**：BaseChart 统一将 tooltip 挂到 body 逃逸 overflow 裁剪（迷你图/滚动容器内不再被切），滚动祖先容器时自动收起，渲染去重避免刷新闪掉悬停
 - **可访问性**：全局 `:focus-visible` 焦点环（`--focus-ring` 令牌）保证键盘导航可见；弹窗支持 ESC 关闭与焦点陷阱；三级文字色满足 WCAG AA 4.5:1 对比度；破坏性操作统一走 `ConfirmDialog` 而非原生 `confirm()`
 - **生产安全**：生产构建不预填开发 Key（凭据存 sessionStorage）；中文响应头由网关 URI 编码、前端解码还原
 
@@ -106,7 +109,8 @@ web/
 | **分组 CRUD** | `GET/POST /admin/groups` · `PATCH/DELETE /admin/groups/:id` |
 | **策略中心** | `GET/PUT /admin/policies`（系统默认策略） · `GET/PUT /admin/groups/:id/strategy`（每分组策略与权重） |
 | 统计聚合 | `GET /admin/stats[?group_id=]` · `GET /admin/channel-metrics` |
-| 决策日志 | `GET /admin/decisions?limit=[&group_id=]` |
+| 告警列表 | `GET /admin/alerts[?group_id=]`（全部活跃告警） |
+| 决策日志 | `GET /admin/decisions?limit=[&group_id=]` · `DELETE /admin/decisions`（批量删除） |
 | 熔断 | `GET /admin/circuit[?group_id=]` · `POST /admin/circuit/:id/reset` |
 | API Keys | `GET/POST /admin/keys` · `PATCH/DELETE /admin/keys/:id`（支持 group_ids 绑定） |
 | 运行配置 | `GET /admin/config` |
@@ -129,6 +133,7 @@ web/
 ## 余额自动检测
 
 - **多协议探测**：优先站点自定义接口（`balance_api_url`，完整 URL 或路径）→ 中转站类型默认接口 → one-api/new-api（`/api/user/self`，Access Token）→ OpenAI 官方（`/v1/dashboard/billing/credit_grants`，API Key）；均不支持时标记"不可用"而非误报
+- **Sub2API 余额自动登录**：sub2api 站点可配置余额登录邮箱/密码，checker 自动登录换取会话 JWT（Redis 缓存，401 自动重登），免手动抓包令牌
 - **响应格式自动识别**：one-api `data.quota` / new-api 会话嵌套 `data.user.quota`（quota 单位自动换算美元，1 USD = 500,000 quota）→ `data.balance`（美元）→ OpenAI `total_available`；仅支持 POST 的接口 GET 失败自动回退 POST
 - **自定义余额接口**：部分中转站的管理 API 不在标准路径或独立域名——在网页控制台 F12 → Network 找到余额请求地址，填入站点编辑表单的「余额接口地址」即可；401/403 时界面提示令牌可能已过期
 - **自动调度**：checker 每 10 分钟检测一次（分组可覆盖 `balance_interval_seconds`）；新站点加入后立即检测

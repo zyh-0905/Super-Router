@@ -73,7 +73,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | 站点归属分组 | 站点编辑表单（多选）；新建默认归入「默认分组」 |
 | 请求指定分组 | body `"group":"组名"` 或 `X-Group` 头（支持名称/ID） |
 | Key 绑定分组 | Web「设置 → API Keys → 分组」；未指定组时自动限定绑定组并集 |
-| 按组筛选 | `/admin/stats?group_id=` · `/admin/decisions?group_id=` · `/admin/circuit?group_id=` |
+| 按组筛选 | `/admin/stats?group_id=` · `/admin/decisions?group_id=` · `/admin/circuit?group_id=` · `/admin/alerts?group_id=` |
 
 策略查找链：Token×模型 → Token → **分组默认** → 系统默认
 
@@ -81,9 +81,10 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 | 项 | 取值 | 作用 |
 |-----|------|------|
-| 中转站类型 | `newapi` / `sub2api` / `custom` | 自动配置余额接口：new-api → `/api/user/self`，sub2api → `/api/v1/auth/me`；留空按类型自动探测 |
+| 中转站类型 | `newapi` / `sub2api` / `custom` | 自动按「Base URL + 类型默认路径」补全余额接口：new-api → `/api/user/self`，sub2api → `/api/v1/auth/me?timezone=Asia%2FShanghai`；改 Base URL 时未手动改过的余额接口跟随更新 |
 | 接口协议 | `openai` / `anthropic` | anthropic 站点自动 OpenAI↔Anthropic 转换 + `x-api-key` 认证，对外仍是 OpenAI 接口；覆盖文本、多模态内容块与工具调用（双向） |
-| 默认测试模型 | 每站点独立 | 测试台选择站点后自动预填该模型 |
+| 默认测试模型 | 每站点独立 | 测试台选择站点后自动预填该模型；**定时推理探针也用它**（未配置回退全局 `probe_model`） |
+| 余额自动登录 | 仅 sub2api 显示 | 填邮箱+密码后 checker 自动登录换会话令牌查余额，免手动抓包；令牌 Redis 缓存、401 自动重登 |
 
 ## 📐 路由数据口径
 
@@ -98,7 +99,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | 项 | 值 |
 |-----|-----|
 | 默认频率 | 10 分钟（分组可覆盖 `balance_interval_seconds`） |
-| 探测顺序 | 站点自定义接口（`balance_api_url` + `balance_api_token`）→ 类型默认接口 → one-api `/api/user/self` → OpenAI `credit_grants` |
+| 探测顺序 | 站点自定义接口（`balance_api_url` + `balance_api_token`）→ 类型默认接口 → one-api `/api/user/self` → OpenAI `credit_grants`；配置了余额自动登录（sub2api）时优先自动登录会话令牌 |
 | 响应格式 | 自动识别 `data.quota`（quota 自动换算美元）/ `data.user.quota` / `data.balance` / `total_available`；GET 失败自动回退 POST |
 | 低余额告警阈值 | 设置页配置，默认 $1（`GET/PATCH /admin/settings`） |
 | 查看 | 站点卡片徽章 / 站点详情「余额」页签 / `GET /admin/channels/:id/balance` |
