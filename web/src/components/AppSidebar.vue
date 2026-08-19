@@ -10,6 +10,7 @@ const nav = [
   { to: '/decisions', name: 'list', label: '决策' },
   { to: '/strategy', name: 'gauge', label: '策略中心' },
   { to: '/circuit', name: 'bolt', label: '熔断' },
+  { to: '/alerts', name: 'alert', label: '告警' },
   { to: '/settings', name: 'gear', label: '设置' },
 ]
 
@@ -40,7 +41,7 @@ const themeLabel = { auto: '自动', light: '浅色', dark: '深色' }
       >
         <Icon :name="item.name" :size="17" aria-hidden="true" />
         <span>{{ item.label }}</span>
-        <span v-if="item.name === 'bolt' && store.alerts.length" class="sb-badge" :aria-label="store.alerts.length + ' 条告警'">{{ store.alerts.length }}</span>
+        <span v-if="item.name === 'alert' && store.alerts.length" class="sb-badge" :aria-label="store.alerts.length + ' 条告警'">{{ store.alerts.length }}</span>
       </router-link>
     </nav>
 

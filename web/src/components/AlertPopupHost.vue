@@ -19,12 +19,9 @@ function ttlMs(sev) {
   return sev === 'critical' ? 30000 : 15000
 }
 
-// 告警 id 前缀 → 处理页面
+// 告警 id 前缀 → 处理页面（统一到告警页，页内按类型跳转处理页）
 function targetRoute(id) {
-  if (!id) return '/'
-  if (id.startsWith('cb_')) return '/circuit'
-  if (id.startsWith('bal_') || id.startsWith('ratio_') || id.startsWith('dis_')) return '/channels'
-  return '/'
+  return id ? '/alerts' : '/'
 }
 
 function goHandle(p) {

@@ -110,7 +110,7 @@ export const api = {
   updateRatioGroup: (id, gid, p) => api.patch(`/admin/channels/${id}/ratio-groups/${gid}`, p),
   deleteRatioGroup: (id, gid) => api.del(`/admin/channels/${id}/ratio-groups/${gid}`),
   probeRatioGroup: (id, gid) => api.post(`/admin/channels/${id}/ratio-groups/${gid}/probe`, {}, { timeout: 120000 }),
-  probeUpstreamModels: (base_url, api_key, protocol) => api.post('/admin/upstream/models', { base_url, api_key, protocol }, { timeout: 120000 }),
+  probeUpstreamModels: (base_url, api_key, protocol, access_token) => api.post('/admin/upstream/models', { base_url, api_key, protocol, access_token }, { timeout: 120000 }),
   getSettings: () => api.get('/admin/settings'),
   updateSettings: (p) => api.patch('/admin/settings', p),
 
@@ -122,7 +122,9 @@ export const api = {
 
   // ===== 统计 / 决策 / 熔断（支持分组筛选） =====
   stats: (groupId) => api.get('/admin/stats' + (groupId ? `?group_id=${groupId}` : '')),
+  alerts: (groupId) => api.get('/admin/alerts' + (groupId ? `?group_id=${groupId}` : '')),
   decisions: (limit = 50, groupId) => api.get(`/admin/decisions?limit=${limit}` + (groupId ? `&group_id=${groupId}` : '')),
+  deleteDecisions: (requestIds) => api.del('/admin/decisions', { body: { request_ids: requestIds } }),
   circuit: (groupId) => api.get('/admin/circuit' + (groupId ? `?group_id=${groupId}` : '')),
   resetCircuit: (id) => api.post(`/admin/circuit/${id}/reset`, {}),
 

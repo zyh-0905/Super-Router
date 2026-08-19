@@ -87,7 +87,8 @@ export function toast(message, type = 'info', duration = 3200) {
 // 语义：
 //   - 首次喂入的告警集合作为基线（不弹窗）；
 //   - 之后「新出现」或「严重度升级」的告警入队弹窗；
-//   - 告警消失后再次出现会重新弹（恢复后再告警）。
+//   - 告警消失后再次出现会重新弹（恢复后再告警）；
+//   - 仅 critical 级别弹窗（warning 只在侧边栏徽标与告警页体现）。
 // ============================================================
 const SEV_RANK = { critical: 2, warning: 1, info: 0 }
 const alertSeen = new Map() // 告警 id -> 当前严重度 rank
@@ -102,6 +103,7 @@ export function feedAlerts(alerts) {
     if (!a || !a.id) continue
     current.set(a.id, a)
     const rank = SEV_RANK[a.sev] ?? 1
+    if (rank < 2) continue // 非 critical 不弹窗
     const prev = alertSeen.get(a.id)
     if (prev === undefined || rank > prev) {
       store.alertPopups.push({
@@ -109,7 +111,7 @@ export function feedAlerts(alerts) {
         id: a.id,
         name: a.name,
         channel: a.channel || '',
-        sev: rank >= 2 ? 'critical' : 'warning',
+        sev: 'critical',
         ago: a.ago || '',
         ts: Date.now(),
       })
