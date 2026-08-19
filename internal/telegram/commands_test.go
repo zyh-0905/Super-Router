@@ -46,6 +46,10 @@ func (f *fakeQueryService) RatioDetail(ctx context.Context, id int, groupIDs []i
 	f.lastMethod, f.lastID, f.lastGroups = "ratio_detail", id, groupIDs
 	return f.results["ratio_detail"], nil
 }
+func (f *fakeQueryService) QualityLatest(ctx context.Context, channelID int, groupIDs []int) (string, error) {
+	f.lastMethod, f.lastID, f.lastGroups = "quality_latest", channelID, groupIDs
+	return f.results["quality_latest"], nil
+}
 
 const unauthorizedText = "⛔ 当前 Chat ID 未授权，请联系管理员。"
 
@@ -155,10 +159,30 @@ func TestUnknownCommandReturnsHelp(t *testing.T) {
 	svc.SetSubscribers([]Subscriber{
 		{ID: 1, ChatID: 7, Enabled: true, AlertEnabled: true, QueryEnabled: true},
 	})
-	out, _ := svc.Handle(context.Background(), 7, "/quality 5")
-	// 计划 A 阶段 /quality 未接入：未知命令返回帮助，不伪造质量结果
+	out, _ := svc.Handle(context.Background(), 7, "/frobnicate 5")
+	// 未知命令返回帮助，不伪造结果
 	if !strings.Contains(out, "/alerts") {
 		t.Fatalf("unknown command should return help: %s", out)
+	}
+}
+
+func TestQualityCommandRoutesToQuery(t *testing.T) {
+	q := &fakeQueryService{results: map[string]string{"quality_latest": "QUALITY"}}
+	svc := NewCommandService(q)
+	svc.SetSubscribers([]Subscriber{
+		{ID: 1, ChatID: 7, Enabled: true, AlertEnabled: true, QueryEnabled: true, GroupIDs: []int{2}},
+	})
+	out, _ := svc.Handle(context.Background(), 7, "/quality 5")
+	if out != "QUALITY" {
+		t.Fatalf("out = %q", out)
+	}
+	if q.lastID != 5 || len(q.lastGroups) != 1 || q.lastGroups[0] != 2 {
+		t.Fatalf("id=%d groups=%v, want 5/[2]", q.lastID, q.lastGroups)
+	}
+	// 无参数 → 用法提示
+	out, _ = svc.Handle(context.Background(), 7, "/quality")
+	if !strings.Contains(out, "用法") {
+		t.Fatalf("empty args should return usage: %s", out)
 	}
 }
 

@@ -17,6 +17,7 @@ type QueryService interface {
 	HealthDetail(ctx context.Context, id int, groupIDs []int) (string, error)
 	RatioList(ctx context.Context, groupIDs []int) (string, error)
 	RatioDetail(ctx context.Context, id int, groupIDs []int) (string, error)
+	QualityLatest(ctx context.Context, channelID int, groupIDs []int) (string, error)
 }
 
 // CommandService 解析命令、校验授权并分发查询。
@@ -49,7 +50,8 @@ const helpText = `📋 <b>可用命令</b>
 /relay &lt;id&gt; — 站点详情
 /balance — 余额列表
 /health — 健康列表
-/ratio — 倍率列表`
+/ratio — 倍率列表
+/quality &lt;id&gt; — 最近一次接口质量检测`
 
 // unauthorized 统一拒绝文案（未授权 Chat ID / 停用订阅者 / 无查询权限）。
 const unauthorized = "⛔ 当前 Chat ID 未授权，请联系管理员。"
@@ -123,8 +125,18 @@ func (c *CommandService) Handle(ctx context.Context, chatID int64, text string) 
 			return c.query.RatioDetail(ctx, id, sub.GroupIDs)
 		}
 		return c.query.RatioList(ctx, sub.GroupIDs)
+	case "/quality":
+		// 只读最近一次检测结果，不启动新任务（避免 Telegram 触发上游费用）
+		if len(args) == 0 {
+			return "用法：/quality &lt;channel_id&gt;", nil
+		}
+		id, err := parseID(args[0])
+		if err != nil {
+			return helpText, nil
+		}
+		return c.query.QualityLatest(ctx, id, sub.GroupIDs)
 	default:
-		// 未知命令（含 /quality，计划 B 接入）返回帮助，不伪造结果
+		// 未知命令返回帮助，不伪造结果
 		return helpText, nil
 	}
 }
