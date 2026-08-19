@@ -85,6 +85,11 @@ const result = ref(null) // { status, meta, body, displayText, raw, ttftMs, tota
 const tab = ref('response')
 const autoScroll = ref(true) // TODO: 实现自动滚动到底部
 
+// 等待动画：实时计时 + 阶段文案（首字节前「路由中」，首字节后「生成中」）
+const elapsedMs = ref(0)
+const waitPhase = ref('正在路由请求…')
+let waitTimer = null
+
 const statusCls = computed(() => {
   if (!result.value) return ''
   const s = result.value.status
@@ -104,7 +109,10 @@ async function send() {
   streamText.value = ''
   result.value = null
   tab.value = 'response'
+  waitPhase.value = '正在路由请求…'
   const t0 = performance.now()
+  elapsedMs.value = 0
+  waitTimer = setInterval(() => { elapsedMs.value = Math.round(performance.now() - t0) }, 100)
 
   try {
     const r = await api.chatCompletion({
@@ -118,6 +126,7 @@ async function send() {
       onDelta: (delta) => {
         if (result.value?.ttftMs == null) {
           result.value = { ...(result.value || {}), ttftMs: Math.round(performance.now() - t0) }
+          waitPhase.value = '正在生成…'
         }
         streamText.value += delta
       },
@@ -155,6 +164,8 @@ async function send() {
       raw: e.message,
     }
   } finally {
+    clearInterval(waitTimer)
+    waitTimer = null
     loading.value = false
   }
 }
@@ -275,16 +286,36 @@ function reset() {
             <span v-if="result.meta?.strategy" class="badge badge-purple">{{ result.meta.strategy }}</span>
           </div>
 
+          <!-- 请求进行中状态条 -->
+          <div v-if="loading && !result" class="row gap-3 resp-status waiting-bar">
+            <span class="wait-dot" />
+            <span class="wait-label">{{ waitPhase }}</span>
+            <span class="mono wait-timer">{{ (elapsedMs / 1000).toFixed(1) }}s</span>
+          </div>
+
           <!-- 内容 -->
           <div v-if="tab === 'response'" class="resp-text" :class="{ streaming: loading }">
-            <template v-if="loading">{{ streamText }}<span class="cursor" /></template>
+            <template v-if="loading && streamText">
+              {{ streamText }}<span class="cursor" />
+            </template>
+            <!-- 首字节前的等待动画 -->
+            <div v-else-if="loading" class="wait-anim">
+              <div class="dots"><span v-for="i in 3" :key="i" :style="{ animationDelay: `${(i - 1) * 0.18}s` }" /></div>
+              <div class="wait-line"><span class="wait-line-dot" />{{ waitPhase }}</div>
+              <div class="wait-sub mono">{{ (elapsedMs / 1000).toFixed(1) }}s · 正在等待上游响应</div>
+            </div>
             <template v-else-if="result">{{ result.displayText }}</template>
             <EmptyState v-else icon="terminal" title="等待请求" desc="构建左侧请求后点击「发送请求」" style="padding:40px 0" />
           </div>
 
           <!-- 路由决策 -->
           <div v-else-if="tab === 'decision'">
-            <EmptyState v-if="!result" icon="bolt" title="暂无路由信息" desc="发送请求后展示网关实时路由结果" style="padding:40px 0" />
+            <div v-if="loading" class="wait-anim" style="padding:36px 0">
+              <div class="dots"><span v-for="i in 3" :key="i" :style="{ animationDelay: `${(i - 1) * 0.18}s` }" /></div>
+              <div class="wait-line"><span class="wait-line-dot" />{{ waitPhase }}</div>
+              <div class="wait-sub mono">请求完成前路由信息暂不可用</div>
+            </div>
+            <EmptyState v-else-if="!result" icon="bolt" title="暂无路由信息" desc="发送请求后展示网关实时路由结果" style="padding:40px 0" />
             <div v-else>
               <div class="form-grid-2">
                 <div class="field"><label class="field-label">选中渠道</label><div class="code">{{ result.meta?.channel || '—' }}</div></div>
@@ -300,7 +331,12 @@ function reset() {
 
           <!-- 原始 -->
           <div v-else>
-            <div class="code" style="max-height:100%;overflow-y:auto">{{ result?.raw || '—' }}</div>
+            <div v-if="loading && !result" class="wait-anim" style="padding:36px 0">
+              <div class="dots"><span v-for="i in 3" :key="i" :style="{ animationDelay: `${(i - 1) * 0.18}s` }" /></div>
+              <div class="wait-line"><span class="wait-line-dot" />{{ waitPhase }}</div>
+              <div class="wait-sub mono">响应原文将在请求完成后展示</div>
+            </div>
+            <div v-else class="code" style="max-height:100%;overflow-y:auto">{{ result?.raw || '—' }}</div>
           </div>
         </div>
         <div v-if="result" class="play-foot">
@@ -329,6 +365,47 @@ function reset() {
   white-space: pre-wrap; word-break: break-all; color: var(--text-1);
 }
 .cursor { display: inline-block; width: 7px; height: 14px; background: var(--blue); vertical-align: -2px; margin-left: 2px; animation: blink 0.8s step-end infinite; }
+
+/* ===== 响应等待动画（请求进行中） ===== */
+/* 顶部进行中状态条 */
+.waiting-bar { background: var(--blue-soft); border-color: transparent; }
+.wait-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--blue); flex-shrink: 0;
+  animation: waitPulse 1.6s ease-in-out infinite;
+}
+.wait-label { font-size: 12.5px; color: var(--text-2); }
+.wait-timer { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+
+/* 居中等待动画：iMessage 三点错峰弹跳 + 呼吸文案 */
+.wait-anim {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 18px; padding: 72px 0 64px; text-align: center;
+}
+.wait-anim .dots { display: flex; gap: 9px; }
+.wait-anim .dots span {
+  width: 11px; height: 11px; border-radius: 50%; background: var(--blue);
+  animation: dotBounce 1.15s ease-in-out infinite;
+}
+.wait-anim .wait-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.wait-anim .wait-line-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--blue); flex-shrink: 0;
+  animation: waitPulse 1.6s ease-in-out infinite;
+}
+.wait-anim .wait-sub { font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+
+@keyframes dotBounce {
+  0%, 55%, 100% { transform: translateY(0); opacity: 0.55; }
+  25% { transform: translateY(-9px); opacity: 1; }
+}
+@keyframes waitPulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+/* 用户偏好减少动态时：静止圆点 + 纯透明度呼吸（不位移） */
+@media (prefers-reduced-motion: reduce) {
+  .wait-anim .dots span { animation-name: waitPulse; }
+  .wait-dot, .wait-anim .wait-line-dot { animation: none; opacity: 0.8; }
+}
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

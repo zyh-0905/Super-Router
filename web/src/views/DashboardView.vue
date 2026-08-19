@@ -192,7 +192,7 @@ function ratioBarOption(ch) {
       trigger: 'item',
       formatter: p => {
         const d = p.data
-        return `${d.model}<br/>实测倍率: <b>${Number(d.value).toFixed(4)}x</b><br/>单价: $${(d.value * 10).toFixed(2)}/1M<br/>来源: ${d.source === 'manual' ? '手动' : '定时'}<br/>时间: ${fmtDate(d.checked)}`
+        return `${d.model}<br/>实测倍率: <b>${Number(d.value).toFixed(4)}x</b>${d.over ? ' <span style="color:#ff453a">（超上限）</span>' : ''}<br/>来源: ${d.source === 'manual' ? '手动' : '定时'}<br/>时间: ${fmtDate(d.checked)}`
       },
     },
     series: [{ type: 'bar', data, barMaxWidth: 11 }],
