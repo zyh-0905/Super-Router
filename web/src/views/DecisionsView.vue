@@ -2,9 +2,10 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api'
-import { store } from '../store'
+import { store, toast } from '../store'
 import RadarChart from '../components/RadarChart.vue'
 import EmptyState from '../components/EmptyState.vue'
+import ConfirmDialog from '../components/ConfirmDialog.vue'
 import GroupSwitcher from '../components/GroupSwitcher.vue'
 import SelectBox from '../components/SelectBox.vue'
 import Icon from '../components/Icon.vue'
@@ -15,6 +16,45 @@ const route = useRoute()
 const loading = ref(true)
 const decisions = ref([])
 const selected = ref(null)
+
+// ---- 编辑模式（多选删除 / 导出）----
+const editMode = ref(false) // 进入编辑模式才显示复选框与批量操作
+const checkedIds = ref([]) // 勾选的 request_id 列表
+const showDeleteConfirm = ref(false)
+const deleting = ref(false)
+
+function toggleEdit() {
+  editMode.value = !editMode.value
+  if (!editMode.value) checkedIds.value = []
+}
+
+const allChecked = computed(() =>
+  filtered.value.length > 0 && filtered.value.every(d => checkedIds.value.includes(d.request_id)))
+const someChecked = computed(() =>
+  checkedIds.value.length > 0 && !allChecked.value)
+
+function toggleCheck(id) {
+  const i = checkedIds.value.indexOf(id)
+  if (i >= 0) checkedIds.value.splice(i, 1)
+  else checkedIds.value.push(id)
+}
+
+function toggleAll() {
+  if (allChecked.value) checkedIds.value = []
+  else checkedIds.value = filtered.value.map(d => d.request_id)
+}
+
+async function confirmDelete() {
+  deleting.value = true
+  try {
+    const r = await api.deleteDecisions(checkedIds.value)
+    toast(`已删除 ${r.deleted ?? checkedIds.value.length} 条决策记录`, 'success')
+    checkedIds.value = []
+    showDeleteConfirm.value = false
+    await load()
+  } catch { /* api 层已提示 */ }
+  finally { deleting.value = false }
+}
 
 // ---- 六维评分雷达图（美化版）----
 const dimMeta = [
@@ -149,8 +189,12 @@ const exclusionLabel = r => ({
   group_not_allowed: '不在允许分组', 
 }[r] || r)
 
-function exportAll() {
-  downloadJSON('decisions.json', filtered.value)
+// 导出：勾选了条目则导出勾选的，否则导出当前筛选结果
+function exportSelection() {
+  const list = checkedIds.value.length
+    ? filtered.value.filter(d => checkedIds.value.includes(d.request_id))
+    : filtered.value
+  downloadJSON('decisions.json', list)
 }
 
 onMounted(load)
@@ -168,7 +212,9 @@ watch(() => route.query.id, load)
       <div class="row gap-2">
         <GroupSwitcher @change="onGroupChange" />
         <button class="btn btn-ghost" @click="load" :disabled="loading"><Icon name="refresh" :size="15" />刷新</button>
-        <button class="btn btn-ghost" @click="exportAll"><Icon name="download" :size="15" />导出 JSON</button>
+        <button class="btn btn-ghost" @click="toggleEdit">
+          <Icon :name="editMode ? 'check' : 'pencil'" :size="15" />{{ editMode ? '完成' : '编辑' }}
+        </button>
       </div>
     </div>
 
@@ -185,6 +231,16 @@ watch(() => route.query.id, load)
             <SelectBox v-model="channelFilter" :options="channelOpts" width="132px" />
             <SelectBox v-model="strategyFilter" :options="strategyOpts" width="150px" />
           </div>
+          <!-- 编辑模式工具栏：多选 + 导出 + 删除 -->
+          <div v-if="editMode && filtered.length" class="row gap-2 mt-2" style="align-items:center">
+            <input type="checkbox" class="dec-check" :checked="allChecked" :indeterminate="someChecked" @change="toggleAll" aria-label="全选当前筛选结果" />
+            <span class="text-3" style="font-size:12px">已选 {{ checkedIds.length }} 项</span>
+            <span class="spacer" />
+            <button class="btn btn-ghost btn-sm" @click="exportSelection"><Icon name="download" :size="13" />导出 JSON</button>
+            <button class="btn btn-danger btn-sm" :disabled="!checkedIds.length" @click="showDeleteConfirm = true">
+              <Icon name="trash" :size="13" />删除选中
+            </button>
+          </div>
         </div>
 
         <div class="dec-list">
@@ -198,6 +254,7 @@ watch(() => route.query.id, load)
             @click="selected = d"
           >
             <div class="row gap-2">
+              <input v-if="editMode" type="checkbox" class="dec-check" :checked="checkedIds.includes(d.request_id)" @change="toggleCheck(d.request_id)" @click.stop aria-label="选择此条决策" />
               <span class="mono text-3 nowrap" style="font-size:11px">{{ fmtTime(d.decided_at) }}</span>
               <span class="badge badge-blue">{{ d.model }}</span>
               <span class="grow truncate" style="font-weight:600;font-size:13px">{{ d.selected_channel || '—' }}</span>
@@ -290,6 +347,17 @@ watch(() => route.query.id, load)
         </template>
       </div>
     </div>
+    <!-- 删除确认对话框 -->
+    <ConfirmDialog
+      v-if="showDeleteConfirm"
+      title="删除决策记录"
+      :message="`确定要删除选中的 ${checkedIds.length} 条决策记录吗？此操作不可撤销。`"
+      confirm-text="删除"
+      cancel-text="取消"
+      danger
+      @confirm="confirmDelete"
+      @cancel="showDeleteConfirm = false"
+    />
   </div>
 </template>
 
@@ -302,6 +370,7 @@ watch(() => route.query.id, load)
   overflow-y: auto; padding-right: 2px;
 }
 .dec-row { padding: 10px 14px; cursor: pointer; transition: all var(--dur) var(--ease); }
+.dec-check { width: 15px; height: 15px; accent-color: var(--blue); cursor: pointer; flex-shrink: 0; margin: 0; }
 .dec-row:hover { transform: translateY(-1px); box-shadow: var(--shadow-raised); }
 .dec-row.selected { border-color: var(--blue); box-shadow: 0 0 0 3.5px var(--blue-soft); }
 
