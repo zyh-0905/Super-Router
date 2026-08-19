@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"smart-router/internal/alert"
 	"smart-router/internal/checker"
 	"smart-router/internal/config"
 	"smart-router/internal/migrate"
@@ -93,7 +94,12 @@ func main() {
 	sched := newScheduler(db, redisClient, logger, cfg, aliveChecker, pricingChecker, probeChecker, balanceChecker)
 	go sched.run(ctx)
 
-	logger.Info("Scheduler started (tick 5s)")
+	// 告警 Reconciler：评估并持久化告警生命周期（启动立即一次 + 每 30s 一轮）。
+	// 使用固定 30s 间隔独立于调度 tick，且自身带 advisory lock 保证多实例只有一方写库。
+	alertReconciler := alert.NewReconciler(alert.NewEvaluator(db), alert.NewSQLStore(db), logger.Named("alert"))
+	go alertReconciler.Run(ctx, 30*time.Second)
+
+	logger.Info("Scheduler started (tick 5s), alert reconciler started (30s)")
 
 	// 等待中断信号
 	quit := make(chan os.Signal, 1)
