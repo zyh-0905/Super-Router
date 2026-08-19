@@ -9,6 +9,7 @@ import EmptyState from '../components/EmptyState.vue'
 import BaseChart from '../components/BaseChart.vue'
 import Icon from '../components/Icon.vue'
 import SelectBox from '../components/SelectBox.vue'
+import QualityCheckPanel from '../components/QualityCheckPanel.vue'
 
 // ---- 下拉选项（统一 SelectBox 组件）----
 const filterOpts = [
@@ -31,6 +32,8 @@ const roleOpts = [
   { value: 'backup', label: '备用' },
   { value: 'emergency', label: '应急' },
 ]
+// 全局探针模型（质量检测 fallback 提示用；从运行配置读取）
+const probeModelGlobal = ref('')
 import { fmtDate, fmtTime, fmtNum, fmtMs, fmtPct } from '../utils'
 
 const route = useRoute()
@@ -903,7 +906,7 @@ onMounted(() => { load(); loadGroups() })
 
           <!-- 页签 -->
           <div class="ch-tabs">
-            <button v-for="t in [{k:'info',l:'基本信息'},{k:'health',l:'健康'},{k:'stats',l:'统计'},{k:'balance',l:'余额'},{k:'ratio',l:'倍率'}]" :key="t.k"
+            <button v-for="t in [{k:'info',l:'基本信息'},{k:'health',l:'健康'},{k:'stats',l:'统计'},{k:'balance',l:'余额'},{k:'ratio',l:'倍率'},{k:'quality',l:'质量检测'}]" :key="t.k"
               class="ch-tab" :class="{ active: detailTab === t.k }" @click="detailTab = t.k; t.k === 'health' && loadHealth(); t.k === 'balance' && loadBalance(); t.k === 'ratio' && loadRatio()">
               {{ t.l }}
             </button>
@@ -1164,7 +1167,7 @@ onMounted(() => { load(); loadGroups() })
             </div>
 
             <!-- 余额 -->
-            <div v-else>
+            <div v-else-if="detailTab === 'balance'">
               <div v-if="balanceLoading" class="skeleton" style="height:180px" />
               <template v-else-if="balance?.latest">
                 <div class="row gap-4 mb-3" style="flex-wrap:wrap">
@@ -1204,6 +1207,11 @@ onMounted(() => { load(); loadGroups() })
                 </div>
               </template>
               <EmptyState v-else icon="layers" title="暂无余额记录" desc="请启动 checker 进程，余额每 10 分钟自动检测一次" style="padding:40px 0" />
+            </div>
+
+            <!-- 质量检测 -->
+            <div v-else-if="detailTab === 'quality'">
+              <QualityCheckPanel :channel="selected" :probe-model-fallback="probeModelGlobal" />
             </div>
           </div>
         </template>
