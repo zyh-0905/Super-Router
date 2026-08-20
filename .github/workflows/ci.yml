@@ -41,6 +41,8 @@ jobs:
         run: npm ci
       - name: eslint
         run: npm run lint
+      - name: unit tests
+        run: npm run test:quality
       - name: build
         run: npm run build
       - name: npm audit (high+)
@@ -52,15 +54,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # 与真实部署一致：同时挂载 prometheus.yml 与告警规则文件（P2-10）
+      # prom/prometheus 的 ENTRYPOINT 是 /bin/prometheus，必须显式覆盖为 promtool，
+      # 否则参数会被当成 prometheus 主程序的 flag（error: unexpected promtool）
       - name: promtool check config
         run: |
-          docker run --rm -v "$PWD/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
             -v "$PWD/prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro" \
-            prom/prometheus promtool check config /etc/prometheus/prometheus.yml
+            prom/prometheus check config /etc/prometheus/prometheus.yml
       - name: promtool test rules
         run: |
-          docker run --rm -v "$PWD:/etc/prometheus:ro" \
-            prom/prometheus promtool test rules /etc/prometheus/prometheus-alerts.test.yml
+          docker run --rm --entrypoint promtool \
+            -v "$PWD:/etc/prometheus:ro" \
+            prom/prometheus test rules /etc/prometheus/prometheus-alerts.test.yml
 
   compose:
     name: docker compose config validation
