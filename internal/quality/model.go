@@ -89,7 +89,10 @@ const probeQuestion = "Reply with exactly the word: pong"
 // BuildProbeScenario 按站点能力构造探测场景：
 //   - text-only：普通文本；
 //   - vision：附带固定、体积极小的 data URL 图片内容块；
-//   - tools：附带固定函数定义和明确 tool_choice；
+//   - tools：仅附带固定函数定义，不强制 tool_choice——
+//     强制工具调用会让模型只返回 tool_calls 而非文本（下游 stream/behavior
+//     阶段误判空内容），且部分中转站拒绝嵌套格式的 tool_choice（400）。
+//     能力探测只验证端点能接受工具定义即可。
 //   - tools + vision：分别放入同一请求，不新增第三次聊天请求。
 func BuildProbeScenario(capabilities []string, model string, maxTokens int) ProbeScenario {
 	sc := ProbeScenario{Model: model, MaxTokens: maxTokens}
@@ -125,7 +128,6 @@ func BuildProbeScenario(capabilities []string, model string, maxTokens int) Prob
 				},
 			},
 		}}
-		sc.ForceToolChoice = true
 	}
 	return sc
 }

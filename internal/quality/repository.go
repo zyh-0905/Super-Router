@@ -280,11 +280,28 @@ func (r *PostgresRepository) Heartbeat(ctx context.Context, runID int64, workerI
 }
 
 // RequestCancel 请求取消（仅活跃任务）。
+// queued 任务没有执行者会推进状态：直接置为 cancelled 终态，
+// 否则任务永远卡在 cancel_requested（ClaimNext 只领 queued），
+// 并持续占用同渠道活跃任务唯一索引（C2）。
 func (r *PostgresRepository) RequestCancel(ctx context.Context, runID int64) error {
+	// 1. queued → 直接取消
 	ct, err := r.Pool.Exec(ctx, `
 		UPDATE quality_check_runs
+		SET status = 'cancelled', finished_at = NOW(), heartbeat_at = NOW()
+		WHERE id = $1 AND status = 'queued'
+	`, runID)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() > 0 {
+		return nil
+	}
+
+	// 2. running → 请求取消（执行者在阶段间检查并推进到 cancelled）
+	ct, err = r.Pool.Exec(ctx, `
+		UPDATE quality_check_runs
 		SET status = 'cancel_requested'
-		WHERE id = $1 AND status IN ('queued', 'running')
+		WHERE id = $1 AND status = 'running'
 	`, runID)
 	if err != nil {
 		return err
@@ -340,6 +357,8 @@ func (r *PostgresRepository) Cancel(ctx context.Context, runID int64) error {
 // RecoverStale 回收心跳超时的 running 任务：
 //   - 未超重试次数 → 回 queued；
 //   - 已超重试次数 → 标 expired。
+// 心跳超时的 cancel_requested 任务（执行者已崩溃）直接置 cancelled，
+// 否则同样永久卡在非终态并占用活跃任务唯一索引（C2）。
 // 返回回收数量。
 func (r *PostgresRepository) RecoverStale(ctx context.Context, olderThan time.Time, maxAttempts int) (int64, error) {
 	ct, err := r.Pool.Exec(ctx, `
@@ -357,7 +376,17 @@ func (r *PostgresRepository) RecoverStale(ctx context.Context, olderThan time.Ti
 	if err != nil {
 		return 0, fmt.Errorf("recover stale: %w", err)
 	}
-	return ct.RowsAffected(), nil
+
+	ct2, err := r.Pool.Exec(ctx, `
+		UPDATE quality_check_runs
+		SET status = 'cancelled', worker_id = '', finished_at = NOW(), heartbeat_at = NOW()
+		WHERE status = 'cancel_requested'
+		  AND heartbeat_at < $1
+	`, olderThan)
+	if err != nil {
+		return ct.RowsAffected(), fmt.Errorf("recover stale cancel: %w", err)
+	}
+	return ct.RowsAffected() + ct2.RowsAffected(), nil
 }
 
 // rowScanner 行扫描接口（pgx.Row / pgx.Rows 都满足）。

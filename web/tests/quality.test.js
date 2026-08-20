@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseSSEChunk, mergeQualityEvent, sanitizeQualityDetails, isTerminalStatus, qualityLabel, stageLabel } from '../src/quality.js'
+import { parseSSEChunk, mergeQualityEvent, sanitizeQualityDetails, isTerminalStatus, qualityLabel, stageLabel, normalizeStages } from '../src/quality.js'
 
 test('parses split SSE frames', () => {
   const first = parseSSEChunk('', 'event: stage_result\ndata: {"stage":"stream"')
@@ -64,10 +64,40 @@ test('stageLabel maps stages', () => {
 test('mergeQualityEvent handles progress events', () => {
   const state = mergeQualityEvent({}, { event: 'task_progress', data: { progress: 42, current_stage: 'stream' } })
   assert.equal(state.progress, 42)
-  assert.equal(state.currentStage, 'stream')
+  assert.equal(state.current_stage, 'stream')
 })
 
 test('mergeQualityEvent ignores unknown events', () => {
   const state = mergeQualityEvent({ x: 1 }, { event: 'something_else', data: {} })
   assert.equal(state.x, 1)
+})
+
+test('normalizeStages converts array snapshots to keyed object', () => {
+  const out = normalizeStages([
+    { stage: 'connectivity', status: 'passed' },
+    { stage: 'stream', status: 'running' },
+  ])
+  assert.equal(out.connectivity.status, 'passed')
+  assert.equal(out.stream.status, 'running')
+})
+
+test('mergeQualityEvent keeps completed stages from task_progress snapshot', () => {
+  // 检测过程中每个 task_progress 都带完整快照（数组形式）——
+  // 已完成阶段必须保留，不能退回「待检测」
+  const state = mergeQualityEvent({}, {
+    event: 'task_progress',
+    data: { progress: 40, current_stage: 'stream', stages: [{ stage: 'connectivity', status: 'passed' }] },
+  })
+  assert.equal(state.stages.connectivity.status, 'passed')
+  assert.equal(state.progress, 40)
+})
+
+test('mergeQualityEvent merges array snapshot without clobbering richer live state', () => {
+  // 数组快照不含 error 时不应清掉已有的 error 字段
+  const state = mergeQualityEvent({ stages: { stream: { status: 'attention', error: 'done_marker_missing' } } }, {
+    event: 'task_progress',
+    data: { stages: [{ stage: 'stream', status: 'attention' }] },
+  })
+  assert.equal(state.stages.stream.status, 'attention')
+  assert.equal(state.stages.stream.error, 'done_marker_missing')
 })

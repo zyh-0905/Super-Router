@@ -136,7 +136,7 @@ func (h *QualityHandler) ListQualityChecks(c *gin.Context) {
 	}
 	out := make([]gin.H, 0, len(runs))
 	for i := range runs {
-		out = append(out, h.runSummary(&runs[i], nil))
+		out = append(out, h.publicRunSummary(&runs[i], nil))
 	}
 	c.JSON(200, gin.H{"runs": out, "total": len(out)})
 }
@@ -153,7 +153,7 @@ func (h *QualityHandler) GetQualityCheck(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "run not found"})
 		return
 	}
-	c.JSON(200, h.runSummary(run, results))
+	c.JSON(200, h.publicRunSummary(run, results))
 }
 
 // CancelQualityCheck POST /admin/quality-checks/:run_id/cancel
@@ -170,6 +170,11 @@ func (h *QualityHandler) CancelQualityCheck(c *gin.Context) {
 	}
 	c.JSON(200, gin.H{"message": "cancel requested"})
 }
+
+// sseMaxLease SSE 连接最长存活时间（C2）：防止永久非终态任务
+// （如卡住的 cancel_requested）让连接无限挂起并每秒查库。
+// 到期发送断开事件并正常关闭；客户端收到后按需重连/退化为轮询。
+const sseMaxLease = 10 * time.Minute
 
 // EventsQualityCheck GET /admin/quality-checks/:run_id/events - SSE 实时进度。
 // 先发送当前 DB snapshot，再每秒 poll DB；Redis 可用时订阅加速（本实现以 poll 为主，
@@ -191,6 +196,8 @@ func (h *QualityHandler) EventsQualityCheck(c *gin.Context) {
 	ctx := c.Request.Context()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	lease := time.NewTimer(sseMaxLease)
+	defer lease.Stop()
 
 	send := func(typ string, data interface{}) bool {
 		payload, _ := json.Marshal(data)
@@ -208,13 +215,17 @@ func (h *QualityHandler) EventsQualityCheck(c *gin.Context) {
 		send("task_failed", gin.H{"error": "run not found"})
 		return
 	}
-	if !send("task_started", h.runSummary(run, results)) {
+	if !send("task_started", h.publicRunSummary(run, results)) {
 		return
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-lease.C:
+			// 租约到期：发送断开事件并结束（客户端会重连或退化轮询）
+			send("sse_lease_expired", gin.H{"run_id": quality.PublicRunID(runID)})
 			return
 		case <-ticker.C:
 			run, results, err = h.Repo.Get(ctx, runID)
@@ -231,11 +242,11 @@ func (h *QualityHandler) EventsQualityCheck(c *gin.Context) {
 				} else if run.Status == quality.RunExpired {
 					eventType = "task_failed"
 				}
-				send(eventType, h.runSummary(run, results))
+				send(eventType, h.publicRunSummary(run, results))
 				return
 			}
 			// 非终态：发送进度事件（每秒一次，避免刷屏）
-			send("task_progress", h.runSummary(run, results))
+			send("task_progress", h.publicRunSummary(run, results))
 		}
 	}
 }
@@ -279,6 +290,60 @@ func (h *QualityHandler) runSummary(run *quality.Run, results []quality.StageRes
 		summary["stages"] = stages
 	}
 	return summary
+}
+
+// publicRunSummary 组装对外响应：details 经 allowlist 过滤，
+// 防止上游响应回显形状的字段（含凭据）进入浏览器/Telegram。
+func (h *QualityHandler) publicRunSummary(run *quality.Run, results []quality.StageResult) gin.H {
+	summary := h.runSummary(run, results)
+	if stages, ok := summary["stages"].([]gin.H); ok {
+		for _, st := range stages {
+			st["details"] = filterDetails(st["details"])
+		}
+	}
+	return summary
+}
+
+// detailAllowlist 允许下发到客户端的 details 键（白名单）。
+// 任何未列出的键整体丢弃：上游响应可能回显请求形状（含 Authorization 头等），
+// 必须主动过滤而不是逐字段黑名单。
+var detailAllowlist = map[string]bool{
+	"http_status":       true,
+	"model_count":       true,
+	"code":              true,
+	"reason":            true,
+	"responded":         true,
+	"usage_present":     true,
+	"events_received":   true,
+	"done_received":     true,
+	"text_length":       true,
+	"expected_total":    true,
+	"requested_model":   true,
+	"mapped_model":      true,
+	"evidence":          true,
+}
+
+// filterDetails 递归过滤 details（白名单；值仅保留标量/布尔与 evidence 对象）。
+func filterDetails(v interface{}) interface{} {
+	switch d := v.(type) {
+	case map[string]interface{}:
+		out := map[string]interface{}{}
+		for k, val := range d {
+			if !detailAllowlist[k] {
+				continue
+			}
+			out[k] = filterDetails(val)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, 0, len(d))
+		for _, item := range d {
+			out = append(out, filterDetails(item))
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func parseLimit(c *gin.Context) int {

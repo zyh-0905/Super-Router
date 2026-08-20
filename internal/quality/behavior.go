@@ -8,18 +8,15 @@ import (
 // JudgeUsage usage 阶段判定：
 //   - prompt/completion/total 都存在且 total == 两者之和 → passed；
 //   - usage 缺失但响应可用 → attention；
-//   - 负数或明显不一致 → failed。
+//   - 负数或明显不一致 → attention（部分中转站 total 含缓存 token，常见现象）。
+// 证据不可用（HTTPStatus=0）→ unknown，不虚构判定。
 func JudgeUsage(ev *ChatEvidence) StageResult {
 	res := StageResult{Stage: StageUsage, CheckName: "usage_consistency", Details: map[string]interface{}{}}
-	if ev == nil {
+	if ev == nil || ev.HTTPStatus == 0 {
 		res.Status = StatusUnknown
 		res.Details["reason"] = "no_chat_evidence"
 		return res
 	}
-	// 复用证据时同步 HTTP/耗时字段（阶段结果记录完整指标）
-	res.HTTPStatus = intPtr(ev.HTTPStatus)
-	res.TTFBMS = intPtr(ev.TTFBMS)
-	res.LatencyMS = intPtr(ev.TotalMS)
 	u := ev.Usage
 	res.Details["usage_present"] = u.Present
 	if u.Present {
@@ -36,8 +33,11 @@ func JudgeUsage(ev *ChatEvidence) StageResult {
 		res.Status = StatusFailed
 		res.Error = "negative_tokens"
 	case u.TotalTokens != u.PromptTokens+u.CompletionTokens:
-		res.Status = StatusFailed
+		// 部分中转站 total 含缓存命中/推理 token，与 prompt+completion 不一致
+		// 属于常见现象，是启发式信号而非功能故障 → attention 而非 failed
+		res.Status = StatusAttention
 		res.Error = "usage_inconsistent"
+		res.Details["code"] = "usage_inconsistent"
 		res.Details["expected_total"] = u.PromptTokens + u.CompletionTokens
 	default:
 		res.Status = StatusPassed
@@ -67,20 +67,22 @@ func JudgeBehavior(ev *ChatEvidence, requestedModel, mappedModel string) StageRe
 		res.Details["mapped_model"] = mappedModel
 	}
 
-	// 结构判定：响应空/不可解析 → failed
-	if strings.TrimSpace(ev.Text) == "" && !strings.HasPrefix(ev.Text, "pong") {
-		// 探测问题要求精确回答 "pong"；空响应 = 结构异常
-		if strings.TrimSpace(ev.Text) == "" {
-			res.Status = StatusFailed
-			res.Error = "empty_response"
-			res.Details["code"] = "empty_response"
-			return res
-		}
+	// 请求根本没得到响应（超时/连接失败）且无任何文本 → 无法判断，
+	// 不能归因为「空响应」（empty_response 暗示上游已响应但内容为空）
+	if ev.HTTPStatus == 0 && strings.TrimSpace(ev.Text) == "" {
+		res.Status = StatusUnknown
+		res.Error = "no_chat_response"
+		res.Details["code"] = "no_chat_response"
+		return res
 	}
-	// 标准测试问题是否获得可解析回答（启发式：包含 pong 或非空）
+
+	// 结构判定：响应空/不可解析 → failed
+	// 注：HTTPStatus==0（请求未获响应）已在上方归为 unknown，此处是
+	// HTTP 200 但内容为空 —— 上游确实响应了空内容，是结构异常。
 	if strings.TrimSpace(ev.Text) == "" {
 		res.Status = StatusFailed
 		res.Error = "empty_response"
+		res.Details["code"] = "empty_response"
 		return res
 	}
 
@@ -108,7 +110,10 @@ func JudgeBehavior(ev *ChatEvidence, requestedModel, mappedModel string) StageRe
 // JudgeProtocol protocol 阶段判定：请求/响应协议转换与非流式响应结构。
 // 复用非流式证据；请求已按协议构造，响应已成功解析 → passed；
 // HTTP 非 200 → failed；解析失败由 RunChat 错误路径体现。
-func JudgeProtocol(ev *ChatEvidence) StageResult {
+// ttfbTimedOut：请求已发出但首字节超时 → attention 而非 failed——
+// 实测存在「非流式挂起、流式完全正常」的上游（如聚合生成型中转站），
+// 对这类站点非流式超时是启发式信号，不是功能故障。
+func JudgeProtocol(ev *ChatEvidence, ttfbTimedOut bool) StageResult {
 	res := StageResult{Stage: StageProtocol, CheckName: "protocol_conversion", Details: map[string]interface{}{}}
 	if ev == nil {
 		res.Status = StatusUnknown
@@ -119,9 +124,16 @@ func JudgeProtocol(ev *ChatEvidence) StageResult {
 	res.TTFBMS = intPtr(ev.TTFBMS)
 	res.LatencyMS = intPtr(ev.TotalMS)
 	switch {
+	case ev.HTTPStatus == 0 && ttfbTimedOut:
+		res.Status = StatusAttention
+		res.Error = "non_stream_first_byte_timeout"
+		res.Details["code"] = "non_stream_first_byte_timeout"
 	case ev.HTTPStatus == 0:
-		res.Status = StatusUnknown
-		res.Error = "no_response"
+		// 请求已发出但上游无响应（超时/连接中断）→ 失败而非 unknown；
+		// unknown 仅保留给「无证据」（ev == nil）的情况
+		res.Status = StatusFailed
+		res.Error = "no_http_response"
+		res.Details["code"] = "no_http_response"
 	case ev.HTTPStatus >= 400:
 		res.Status = StatusFailed
 		res.Error = classifyHTTPStatus(ev.HTTPStatus)
@@ -138,7 +150,7 @@ func JudgeProtocol(ev *ChatEvidence) StageResult {
 }
 
 // JudgeStream stream 阶段判定：SSE 建立、事件解析、首字节与 [DONE] 完整性。
-func JudgeStream(ev *ChatEvidence) StageResult {
+func JudgeStream(ev *ChatEvidence, ttfbTimedOut bool) StageResult {
 	res := StageResult{Stage: StageStream, CheckName: "stream_integrity", Details: map[string]interface{}{}}
 	if ev == nil {
 		res.Status = StatusUnknown
@@ -153,9 +165,15 @@ func JudgeStream(ev *ChatEvidence) StageResult {
 	res.Details["text_length"] = len([]rune(ev.Text))
 
 	switch {
+	case ev.HTTPStatus == 0 && ttfbTimedOut:
+		res.Status = StatusAttention
+		res.Error = "stream_first_byte_timeout"
+		res.Details["code"] = "stream_first_byte_timeout"
 	case ev.HTTPStatus == 0:
-		res.Status = StatusUnknown
-		res.Error = "no_response"
+		// 请求已发出但上游无响应（超时/连接中断）→ 失败而非 unknown
+		res.Status = StatusFailed
+		res.Error = "no_http_response"
+		res.Details["code"] = "no_http_response"
 	case ev.HTTPStatus >= 400:
 		res.Status = StatusFailed
 		res.Error = classifyHTTPStatus(ev.HTTPStatus)

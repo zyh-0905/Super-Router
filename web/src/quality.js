@@ -48,16 +48,47 @@ export function parseSSEChunk(buffer, chunk) {
 }
 
 /**
+ * 规范化 stages：后端返回数组 [{stage, ...}]，页面状态与时间线用
+ * 对象 {stage: {...}}。数组（API 直读/轮询回退路径）在此统一转换。
+ */
+export function normalizeStages(stages) {
+  if (Array.isArray(stages)) {
+    const out = {}
+    for (const st of stages) {
+      if (st && st.stage) out[st.stage] = st
+    }
+    return out
+  }
+  return stages || {}
+}
+
+/**
+ * 把后端快照中的 stages 数组合并进页面状态（数组 → 对象键化）。
+ */
+function mergeStageSnapshot(s, data) {
+  if (!data || !data.stages) return
+  const norm = normalizeStages(data.stages)
+  for (const [k, v] of Object.entries(norm)) {
+    s.stages[k] = { ...(s.stages[k] || {}), ...v }
+  }
+}
+
+/**
  * 合并 SSE 事件到页面状态。阶段结果累积，进度/当前阶段更新。
+ * task_progress / task_started / task_* 均携带完整阶段快照，
+ * 一律合并——否则检测过程中已完成的阶段会退回到「待检测」灰圈。
+ *
+ * 字段命名与后端 API 快照保持一致（snake_case：current_stage/overall_status），
+ * 模板直接读取这些字段；不再混用 camelCase 导致实时阶段不更新。
  */
 export function mergeQualityEvent(state, ev) {
-  const s = { ...(state || {}), stages: { ...((state || {}).stages || {}) } }
+  const s = { ...(state || {}), stages: normalizeStages((state || {}).stages) }
   switch (ev.event) {
     case 'stage_started': {
       const stage = ev.data?.stage
       if (stage) s.stages[stage] = { ...(s.stages[stage] || {}), status: 'running' }
       if (ev.data?.progress != null) s.progress = ev.data.progress
-      if (stage) s.currentStage = stage
+      if (stage) s.current_stage = stage
       break
     }
     case 'stage_result': {
@@ -69,8 +100,9 @@ export function mergeQualityEvent(state, ev) {
     case 'stage_progress':
     case 'task_progress': {
       if (ev.data?.progress != null) s.progress = ev.data.progress
-      if (ev.data?.current_stage) s.currentStage = ev.data.current_stage
+      if (ev.data?.current_stage) s.current_stage = ev.data.current_stage
       if (ev.data?.status) s.status = ev.data.status
+      mergeStageSnapshot(s, ev.data)
       break
     }
     case 'task_started':
@@ -80,14 +112,10 @@ export function mergeQualityEvent(state, ev) {
       if (ev.data) {
         if (ev.data.status) s.status = ev.data.status
         if (ev.data.progress != null) s.progress = ev.data.progress
-        if (ev.data.overall_status) s.overallStatus = ev.data.overall_status
-        if (ev.data.current_stage) s.currentStage = ev.data.current_stage
+        if (ev.data.overall_status) s.overall_status = ev.data.overall_status
+        if (ev.data.current_stage) s.current_stage = ev.data.current_stage
         // 完整快照事件直接合并全部阶段
-        if (ev.data.stages) {
-          for (const st of ev.data.stages) {
-            s.stages[st.stage] = { ...(s.stages[st.stage] || {}), ...st }
-          }
-        }
+        mergeStageSnapshot(s, ev.data)
       }
       break
     }

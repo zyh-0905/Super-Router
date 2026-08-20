@@ -162,41 +162,41 @@ export const api = {
 
   /**
    * 带认证的 fetch SSE 流（原生 EventSource 无法携带 Bearer Header）。
-   * 返回 { stop }；事件经 onEvent({event, data}) 回调，断开经 onDisconnect()。
+   * 同步返回 { stop } 控制器（内部异步建立连接）；
+   * 事件经 onEvent({event, data}) 回调，断开经 onDisconnect()。
    */
-  async streamQualityEvents(runId, { signal, onEvent, onDisconnect } = {}) {
+  streamQualityEvents(runId, { signal, onEvent, onDisconnect } = {}) {
     const ctrl = new AbortController()
     const abortFromSignal = () => ctrl.abort()
     if (signal) {
       if (signal.aborted) ctrl.abort()
       else signal.addEventListener('abort', abortFromSignal, { once: true })
     }
-    const stop = () => ctrl.abort()
 
-    let resp
-    try {
-      resp = await fetch(base() + `/admin/quality-checks/${runId}/events`, {
-        headers: { ...authHeaders(), Accept: 'text/event-stream' },
-        signal: ctrl.signal,
-      })
-    } catch (e) {
-      if (!ctrl.signal.aborted) store.connected = false
-      if (signal) signal.removeEventListener('abort', abortFromSignal)
-      if (onDisconnect) onDisconnect()
-      throw e
-    }
-    if (!resp.ok || !resp.body) {
-      if (signal) signal.removeEventListener('abort', abortFromSignal)
-      if (onDisconnect) onDisconnect()
-      throw new Error(`SSE ${resp.status}`)
-    }
-
-    const reader = resp.body.getReader()
-    const dec = new TextDecoder()
-    const { parseSSEChunk } = await import('./quality')
-
-    let buf = ''
     const pump = async () => {
+      let resp
+      try {
+        resp = await fetch(base() + `/admin/quality-checks/${runId}/events`, {
+          headers: { ...authHeaders(), Accept: 'text/event-stream' },
+          signal: ctrl.signal,
+        })
+      } catch (e) {
+        if (!ctrl.signal.aborted) store.connected = false
+        if (signal) signal.removeEventListener('abort', abortFromSignal)
+        if (onDisconnect) onDisconnect()
+        return
+      }
+      if (!resp.ok || !resp.body) {
+        if (signal) signal.removeEventListener('abort', abortFromSignal)
+        if (onDisconnect) onDisconnect()
+        return
+      }
+
+      const reader = resp.body.getReader()
+      const dec = new TextDecoder()
+      const { parseSSEChunk } = await import('./quality')
+
+      let buf = ''
       try {
         while (true) {
           const { done, value } = await reader.read()
@@ -222,7 +222,7 @@ export const api = {
       }
     }
     pump() // 后台泵，不阻塞调用方
-    return { stop }
+    return { stop: () => ctrl.abort() }
   },
 
   // ===== 策略中心 =====

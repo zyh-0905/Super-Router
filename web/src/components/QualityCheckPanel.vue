@@ -5,7 +5,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { api } from '../api'
 import { toast } from '../store'
-import { mergeQualityEvent, isTerminalStatus, qualityLabel, stageLabel } from '../quality'
+import { mergeQualityEvent, isTerminalStatus, qualityLabel, normalizeStages } from '../quality'
 import QualityStageTimeline from './QualityStageTimeline.vue'
 import Icon from './Icon.vue'
 
@@ -17,7 +17,7 @@ const props = defineProps({
 const state = ref('idle') // idle | loading | queued | running | cancel_requested | completed | failed | cancelled
 const runId = ref(null)
 const selectedModel = ref('')
-const runState = ref(null) // { status, overallStatus, progress, currentStage, stages, error }
+const runState = ref(null) // { status, overall_status, progress, current_stage, stages, error }（字段与后端 API 快照一致，snake_case）
 const history = ref([])
 const elapsed = ref(0)
 let timer = null
@@ -44,16 +44,6 @@ const modelOptions = computed(() => {
 
 const canRun = computed(() => modelOptions.value.length > 0 && !['queued', 'running', 'cancel_requested'].includes(state.value))
 
-const stageList = computed(() => {
-  const stages = runState.value?.stages || {}
-  return Object.entries(stages).map(([k, v]) => ({
-    stage: k,
-    label: stageLabel(k),
-    status: v.status,
-    ...v,
-  }))
-})
-
 function resetPanel() {
   state.value = 'idle'
   runId.value = null
@@ -70,14 +60,17 @@ function stopAll() {
   if (abortCtrl) { abortCtrl.abort(); abortCtrl = null }
 }
 
-// 页面刷新恢复：读取当前活跃任务
+// 页面刷新恢复：读取当前活跃任务。
+// 捕获请求发起时的 channel id：快速切换站点时旧响应不得覆盖新站点面板。
 async function restoreActive() {
+  const cid = props.channel?.id
   try {
-    const r = await api.listQualityChecks(props.channel.id, 1)
+    const r = await api.listQualityChecks(cid, 1)
+    if (props.channel?.id !== cid) return false // 已切换站点，丢弃过期响应
     const active = (r.runs || []).find(x => !isTerminalStatus(x.status))
     if (active) {
       runId.value = active.run_id
-      runState.value = { ...active, stages: active.stages || {} }
+      runState.value = { ...active, stages: normalizeStages(active.stages) }
       state.value = active.status === 'cancel_requested' ? 'cancel_requested' : 'running'
       openStream()
       return true
@@ -87,8 +80,10 @@ async function restoreActive() {
 }
 
 async function loadHistory() {
+  const cid = props.channel?.id
   try {
-    const r = await api.listQualityChecks(props.channel.id, 5)
+    const r = await api.listQualityChecks(cid, 5)
+    if (props.channel?.id !== cid) return // 已切换站点，丢弃过期响应
     history.value = r.runs || []
   } catch { /* 已提示 */ }
 }
@@ -166,7 +161,7 @@ async function fallbackPolling() {
   if (pollTimer) return
   try {
     const r = await api.getQualityCheck(runId.value)
-    runState.value = { ...r, stages: r.stages || {} }
+    runState.value = { ...r, stages: normalizeStages(r.stages) }
     if (isTerminalStatus(r.status)) {
       finish(r.status === 'completed' ? 'completed' : r.status, runState.value)
       return
@@ -175,7 +170,7 @@ async function fallbackPolling() {
   pollTimer = setInterval(async () => {
     try {
       const r = await api.getQualityCheck(runId.value)
-      runState.value = { ...r, stages: r.stages || {} }
+      runState.value = { ...r, stages: normalizeStages(r.stages) }
       if (isTerminalStatus(r.status)) {
         finish(r.status === 'completed' ? 'completed' : r.status, runState.value)
       }
@@ -213,9 +208,11 @@ function summaryOf(run) {
 // 历史项查看：加载完整任务详情（阶段结果；details 已由后端 allowlist 组装，
 // 此处二次过滤防凭据形状字段）
 function viewRun(run) {
+  const cid = props.channel?.id
   runId.value = run.run_id
   api.getQualityCheck(run.run_id).then(detail => {
-    runState.value = { ...detail, stages: detail.stages || {} }
+    if (props.channel?.id !== cid) return // 已切换站点，丢弃过期响应
+    runState.value = { ...detail, stages: normalizeStages(detail.stages) }
     state.value = 'completed'
   }).catch(() => { /* 已提示 */ })
 }
@@ -281,33 +278,17 @@ onUnmounted(() => stopAll())
       ⚠ 该站点没有可用的模型映射，请在「编辑站点 → 模型映射」中配置后再检测。
     </div>
 
-    <!-- 阶段时间线 -->
+    <!-- 阶段圆圈：状态/进度/hover 详情全部在圆圈中表达 -->
     <template v-if="runState">
       <QualityStageTimeline
         :stages="runState.stages || {}"
         :current-stage="runState.current_stage"
         :progress="runState.progress || 0"
+        :depth="runState.depth || 'full'"
         :reduced-motion="reducedMotion"
       />
       <div v-if="runState.error" class="qc-error">⚠ {{ runState.error }}</div>
-
-      <!-- 阶段结果详情（完成时折叠展示） -->
-      <div v-if="state === 'completed' && stageList.length" class="qc-stages">
-        <div v-for="s in stageList" :key="s.stage" class="qc-stage-row">
-          <span class="badge" :class="s.status === 'passed' ? 'badge-green' : s.status === 'attention' ? 'badge-orange' : s.status === 'failed' ? 'badge-red' : s.status === 'skipped' ? 'badge-gray' : 'badge-gray'">
-            {{ s.status }}
-          </span>
-          <span style="font-weight:600;font-size:13px">{{ s.label }}</span>
-          <span class="text-3 mono" style="font-size:11.5px">
-            <template v-if="s.ttfb_ms != null">TTFB {{ s.ttfb_ms }}ms</template>
-            <template v-if="s.latency_ms != null"> · 耗时 {{ s.latency_ms }}ms</template>
-            <template v-if="s.http_status"> · HTTP {{ s.http_status }}</template>
-            <template v-if="s.actual_model"> · 模型 {{ s.actual_model }}</template>
-            <template v-if="s.prompt_tokens != null"> · {{ s.prompt_tokens }}+{{ s.completion_tokens }} tokens</template>
-          </span>
-          <span v-if="s.error" class="text-red" style="font-size:11.5px" :title="s.error">⚠</span>
-        </div>
-      </div>
+      <div v-if="runState" class="qc-tip-hint">悬停各阶段圆圈查看具体信息</div>
     </template>
 
     <!-- 历史 -->
@@ -344,8 +325,7 @@ onUnmounted(() => stopAll())
   padding: 8px 12px; border-radius: var(--radius-md);
   background: var(--red-soft); color: var(--red); font-size: 12px; margin-bottom: 10px;
 }
-.qc-stages { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
-.qc-stage-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.qc-tip-hint { font-size: 11px; color: var(--text-3); margin-top: 4px; }
 .qc-history { border-top: 1px solid var(--border); padding-top: 12px; }
 .qc-history-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 0; border-bottom: 1px solid var(--border); }
 .qc-history-row:last-child { border-bottom: none; }

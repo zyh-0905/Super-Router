@@ -46,14 +46,12 @@ func NewWorker(repo Repository, executor ExecutorRunner, workerID string, logger
 }
 
 // Run 主循环：启动时 RecoverStale，随后按 PollInterval 领取并执行任务，
-// 直到 ctx 取消（取消时等待在途 goroutine 完成）。
+// 并周期性执行过期回收（C1：启动瞬间的回收无法覆盖之后才 stale 的任务，
+// 若只在启动时扫一次，晚于启动才超时的遗留任务会永久卡在 running）。
+// ctx 取消时等待在途 goroutine 完成。
 func (w *Worker) Run(ctx context.Context) {
 	// 启动时回收崩溃遗留任务
-	if n, err := w.Repo.RecoverStale(ctx, time.Now().Add(-w.StaleAfter), w.MaxAttempts); err != nil {
-		w.Logger.Warn("RecoverStale failed at startup", zap.Error(err))
-	} else if n > 0 {
-		w.Logger.Info("Recovered stale quality runs", zap.Int64("count", n))
-	}
+	w.recoverStale(ctx)
 
 	sem := make(chan struct{}, w.MaxConcurrent)
 	var wg sync.WaitGroup
@@ -62,10 +60,21 @@ func (w *Worker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.PollInterval)
 	defer ticker.Stop()
 
+	// C1：周期性过期回收（间隔为 StaleAfter 的 1/3，明显短于回收阈值；
+	// SQL 按 heartbeat_at 条件原子更新，多实例并发执行安全）
+	recoverEvery := w.StaleAfter / 3
+	if recoverEvery < 5*time.Second {
+		recoverEvery = 5 * time.Second
+	}
+	recoverTicker := time.NewTicker(recoverEvery)
+	defer recoverTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-recoverTicker.C:
+			w.recoverStale(ctx)
 		case <-ticker.C:
 			// 有并发额度才尝试领取
 			select {
@@ -93,6 +102,16 @@ func (w *Worker) Run(ctx context.Context) {
 				w.executeTask(ctx, r)
 			}(run)
 		}
+	}
+}
+
+// recoverStale 执行一轮过期回收（日志化计数）。
+func (w *Worker) recoverStale(ctx context.Context) {
+	n, err := w.Repo.RecoverStale(ctx, time.Now().Add(-w.StaleAfter), w.MaxAttempts)
+	if err != nil {
+		w.Logger.Warn("RecoverStale failed", zap.Error(err))
+	} else if n > 0 {
+		w.Logger.Info("Recovered stale quality runs", zap.Int64("count", n))
 	}
 }
 

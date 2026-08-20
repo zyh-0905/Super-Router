@@ -99,8 +99,13 @@ func TestBuildProbeScenarioVisionIncludesImage(t *testing.T) {
 
 func TestBuildProbeScenarioTools(t *testing.T) {
 	sc := BuildProbeScenario([]string{"tools"}, "gpt-4o", 32)
-	if sc.Tools == nil || len(sc.Tools) == 0 || !sc.ForceToolChoice {
+	if sc.Tools == nil || len(sc.Tools) == 0 {
 		t.Fatalf("tools scenario = %+v", sc)
+	}
+	// 不强制 tool_choice：强制后模型只返回工具调用而非文本，
+	// 会污染下游 stream/behavior 阶段的文本判定
+	if sc.ForceToolChoice {
+		t.Fatalf("scenario must not force tool_choice: %+v", sc)
 	}
 }
 
