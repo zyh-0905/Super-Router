@@ -26,9 +26,9 @@ func AuthMiddleware(db *store.DB) gin.HandlerFunc {
 			return
 		}
 
-		// 解析 Bearer token
+		// 解析 Bearer token（HTTP scheme 大小写不敏感：Bearer/bearer/BEARER 均合法）
 		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" {
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
 			c.JSON(401, gin.H{
 				"error": "invalid authorization header format, expected: Bearer <token>",
 			})

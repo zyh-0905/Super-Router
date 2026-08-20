@@ -378,20 +378,29 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 
 		if req.Stream {
 			// 流式：边读边转发；首字节写给客户端后无法再切换
-			committed, ok := h.streamResponse(c, upstreamBody, func() {
+			committed, ok, clientGone := h.streamResponse(c, upstreamBody, func() {
 				h.setRoutingHeaders(c, requestID, channel, routeResult)
 				c.Set("model", req.Model)
 				c.Set("channel", fmt.Sprintf("%d", channel.ID))
 			})
 			if !ok {
+				if clientGone && committed {
+					// H5：客户端主动断开 ≠ 上游故障。
+					// 只记历史（error_class=client_canceled，熔断统计排除），
+					// 不更新熔断、不记上游失败指标。
+					h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, true,
+						int(time.Since(attemptStart).Milliseconds()), groupID, "client_canceled")
+					c.Set("proxy_outcome", "client_canceled")
+					return
+				}
 				if committed {
-					// 客户端已收到部分数据，只能中断连接
+					// 客户端已收到部分数据，只能中断连接（上游中断）
 					c.Set("proxy_outcome", "stream_interrupted")
 					h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart,
 						fmt.Errorf("stream interrupted: %w", io.ErrUnexpectedEOF), &attempts, i, true, probeReserved)
 					return
 				}
-				// 客户端未收到任何字节，安全切换
+				// 客户端未收到任何字节（含 H4 空 SSE），安全切换
 				h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart,
 					fmt.Errorf("stream failed before first byte"), &attempts, i, false, probeReserved)
 				continue
@@ -413,7 +422,12 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 			}
 			readCtx, cancelRead = context.WithTimeout(ctx, time.Duration(remaining)*time.Millisecond)
 		}
+		// H3：读取超时必须能中断已阻塞的网络读。ctxReader 只在读前检查
+		// context，无法打断阻塞中的 body.Read——把 readCtx 与上游请求
+		// context 联动：readCtx 到期 → 取消 attemptCtx → 阻塞读立即返回。
+		stopAfter := context.AfterFunc(readCtx, cancelAttempt)
 		data, readErr := io.ReadAll(io.LimitReader(ctxReader{ctx: readCtx, r: upstreamBody}, 64<<20))
+		stopAfter()
 		cancelRead()
 		upstreamBody.Close()
 		if readErr != nil {
@@ -557,6 +571,10 @@ func (h *ProxyHandler) failAttempt(ctx context.Context, requestID string, req *C
 		time.Since(attemptStart).Seconds(),
 	)
 
+	// H1：先写请求历史（含当前失败结果），再更新熔断——
+	// 开闸判定读 10 分钟窗口，必须包含当前请求本身。
+	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, firstByteCommitted, int(time.Since(attemptStart).Milliseconds()), groupID, errClass)
+
 	if h.circuit != nil {
 		if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, false, errClass); cerr != nil {
 			h.logger.Warn("Failed to update circuit state (failure)",
@@ -572,8 +590,6 @@ func (h *ProxyHandler) failAttempt(ctx context.Context, requestID string, req *C
 			errClass,
 		)
 	}
-
-	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, firstByteCommitted, int(time.Since(attemptStart).Milliseconds()), groupID)
 
 	h.logger.Warn("Upstream call failed",
 		zap.String("channel", channel.Name),
@@ -604,6 +620,9 @@ func (h *ProxyHandler) succeedAttempt(ctx context.Context, requestID string, req
 		time.Since(attemptStart).Seconds(),
 	)
 
+	// H1：先写请求历史（含当前成功结果），再更新熔断
+	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, true, true, int(time.Since(attemptStart).Milliseconds()), groupID, "")
+
 	if h.circuit != nil {
 		if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, true, ""); cerr != nil {
 			h.logger.Warn("Failed to update circuit state (success)",
@@ -619,8 +638,6 @@ func (h *ProxyHandler) succeedAttempt(ctx context.Context, requestID string, req
 			"success_after_retry",
 		)
 	}
-
-	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, true, true, int(time.Since(attemptStart).Milliseconds()), groupID)
 }
 
 // cloneMap 浅拷贝 JSON map（值不被改写，仅顶层键操作）。
@@ -685,9 +702,11 @@ func (h *ProxyHandler) callUpstream(ctx context.Context, channel *router.Channel
 	}
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		// C4：不读取上游错误正文——上游可能在错误中回显请求头
+		// （含我们附加的上游 API Key），正文会被返回给 caller 并写入日志。
+		// 只保留状态码与稳定错误类别，诊断靠 checker 侧脱敏日志。
 		resp.Body.Close()
-		return nil, &upstreamError{StatusCode: resp.StatusCode, Body: string(body)}
+		return nil, &upstreamError{StatusCode: resp.StatusCode}
 	}
 
 	return resp.Body, nil
@@ -721,12 +740,10 @@ func (h *ProxyHandler) callAnthropic(ctx context.Context, channel *router.Channe
 	}
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		// C4：不读取/传播上游错误正文（可能回显我们附加的 x-api-key）。
+		// 只保留状态码与稳定错误类别。
 		resp.Body.Close()
-		if status, msg, ok := protocol.AnthropicError(body); ok {
-			return nil, &upstreamError{StatusCode: status, Body: msg}
-		}
-		return nil, &upstreamError{StatusCode: resp.StatusCode, Body: string(body)}
+		return nil, &upstreamError{StatusCode: resp.StatusCode}
 	}
 
 	if req.Stream {
@@ -747,9 +764,13 @@ func (h *ProxyHandler) callAnthropic(ctx context.Context, channel *router.Channe
 }
 
 // streamResponse 边读边转发 SSE 流。
-// 返回 (committed, ok)：committed 表示是否已向客户端写出数据；
-// ok 表示流是否正常结束。首字节到达后、写出前通过 setHeaders 设置路由响应头。
-func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHeaders func()) (committed bool, ok bool) {
+// 返回 (committed, ok, clientGone)：
+//   - committed：是否已向客户端写出数据；
+//   - ok：流是否正常结束（H4：从未写出任何字节就 EOF → ok=false，
+//     视为上游未产出任何内容，调用方可切换下一个候选）；
+//   - clientGone：客户端主动断开（H5：与上游故障严格区分，
+//     调用方不得将其计入上游熔断/失败指标）。
+func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHeaders func()) (committed bool, ok bool, clientGone bool) {
 	defer body.Close()
 
 	c.Header("Content-Type", "text/event-stream")
@@ -764,26 +785,31 @@ func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHea
 				setHeaders()
 			}
 			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
-				// 客户端已断开
-				return committed, false
+				// 客户端已断开：不是上游故障
+				return committed, false, true
 			}
 			c.Writer.Flush()
 			committed = true
 		}
 		if err != nil {
-			return committed, err == io.EOF
+			if err == io.EOF {
+				// H4：首字节前就 EOF = 空 SSE 响应，不算成功
+				return committed, committed, false
+			}
+			return committed, false, false
 		}
 	}
 }
 
-// recordRequestHistory 写入请求历史（requestID 复用本次请求，便于全链路追踪）
-func (h *ProxyHandler) recordRequestHistory(ctx context.Context, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int) {
+// recordRequestHistory 写入请求历史（requestID 复用本次请求，便于全链路追踪）。
+// errorClass 用于熔断样本过滤（client_canceled 不参与开闸统计）。
+func (h *ProxyHandler) recordRequestHistory(ctx context.Context, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int, errorClass string) {
 	_, err := h.db.Pool.Exec(ctx, `
 		INSERT INTO request_history (
 			request_id, channel_id, model, success, first_byte_commit,
-			ttft_ms, total_duration_ms, group_id, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-	`, requestID, channelID, model, success, firstByte, durationMS, durationMS, groupID)
+			ttft_ms, total_duration_ms, group_id, error_class, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+	`, requestID, channelID, model, success, firstByte, durationMS, durationMS, groupID, errorClass)
 
 	if err != nil {
 		h.logger.Warn("Failed to record request history", zap.Error(err))

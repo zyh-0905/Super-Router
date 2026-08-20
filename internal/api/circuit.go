@@ -2,12 +2,10 @@ package api
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"smart-router/internal/store"
 
-	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 )
 
@@ -58,6 +56,18 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 	}
 	defer tx.Rollback(ctx)
 
+	// H2：目标行不存在时 FOR UPDATE 无法锁住「虚空行」，两个并发事务
+	// 都会读到 ErrNoRows 各自从 0 起算，后写者覆盖先写者 → 丢计数。
+	// 先 INSERT ... ON CONFLICT DO NOTHING 预建行，使后续 FOR UPDATE
+	// 有真实行可锁、可串行化。
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO circuit_states (channel_id, model, capability, group_id, state)
+		VALUES ($1, $2, '', $3, 'closed')
+		ON CONFLICT (channel_id, model, capability, group_id) DO NOTHING
+	`, channelID, model, bucket); err != nil {
+		return err
+	}
+
 	// 锁定行并读取当前状态（串行化同一 (渠道, 模型, 分组桶) 的并发更新）
 	var currentState string
 	var failureCount, successCount int
@@ -70,12 +80,7 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 		FOR UPDATE
 	`, channelID, model, bucket).Scan(&currentState, &failureCount, &successCount, &coolingUntil)
 
-	if errors.Is(err, pgx.ErrNoRows) {
-		// 没有记录：从 closed 开始
-		currentState = "closed"
-		failureCount = 0
-		successCount = 0
-	} else if err != nil {
+	if err != nil {
 		// DB 错误：不 fail-open，避免把已开闸状态误重置
 		return err
 	}
@@ -89,9 +94,12 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 		successCount = 0 // 失败后重置成功计数
 	}
 
-	// 应否开闸判定（仅 closed/degraded 需要样本统计；样本按分组桶过滤）
+	// H1：开闸判定必须包含当前请求结果，且成功请求绝不能触发开闸。
+	// 调用方（proxy）保证顺序：先写 request_history（含当前结果），
+	// 再调用本函数——shouldOpen 的 10 分钟窗口自然包含当前请求。
+	// 这里再显式守卫 success：成功结果不参与开闸判定。
 	var shouldOpen bool
-	if currentState == "closed" || currentState == "degraded" {
+	if !success && (currentState == "closed" || currentState == "degraded") {
 		shouldOpen = m.shouldOpen(ctx, channelID, model, bucket, cfg)
 	}
 
@@ -125,6 +133,7 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 
 	return tx.Commit(ctx)
 }
+
 
 // transitionCircuitState 计算熔断状态转换（纯函数，便于测试）。
 // coolingUntil 为当前记录的冷却截止时间：open 且已到期 → 按 half_open 处理，
@@ -185,6 +194,8 @@ func nextCoolingDuration(failureCount int, cfg CircuitBreakerConfig) time.Durati
 // shouldOpen 统计最近 10 分钟内最多 MinSamples 个样本的失败率。
 // P1-04：样本按分组桶过滤——bucket=0 匹配 request_history.group_id IS NULL 的全局流量，
 // 否则只统计该分组的流量，实现组间熔断隔离。
+// H5：客户端主动断开（error_class=client_canceled）不计入样本，
+// 用户停止生成不应污染上游失败率。
 func (m *CircuitBreakerManager) shouldOpen(ctx context.Context, channelID int, model string, bucket int, cfg CircuitBreakerConfig) bool {
 	var totalAttempts, failedAttempts int
 	err := m.db.Pool.QueryRow(ctx, `
@@ -197,6 +208,7 @@ func (m *CircuitBreakerManager) shouldOpen(ctx context.Context, channelID int, m
 			WHERE channel_id = $1 AND model = $2
 			  AND created_at >= NOW() - INTERVAL '10 minutes'
 			  AND (($3 = 0 AND group_id IS NULL) OR group_id = $3)
+			  AND COALESCE(error_class, '') <> 'client_canceled'
 			ORDER BY created_at DESC
 			LIMIT $4
 		) recent

@@ -1637,8 +1637,8 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 			COALESCE(SUM(CASE WHEN created_at >= NOW() - INTERVAL '24 hours' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN created_at >= NOW() - INTERVAL '24 hours' AND NOT success THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN created_at >= NOW() - INTERVAL '48 hours' AND created_at < NOW() - INTERVAL '24 hours' THEN 1 ELSE 0 END), 0),
-			COALESCE(AVG(CASE WHEN created_at >= NOW() - INTERVAL '24 hours' AND success THEN 1.0 ELSE NULL END), 0),
-			COALESCE(AVG(CASE WHEN created_at >= NOW() - INTERVAL '48 hours' AND created_at < NOW() - INTERVAL '24 hours' AND success THEN 1.0 ELSE NULL END), 0),
+			COALESCE(AVG(CASE WHEN created_at >= NOW() - INTERVAL '24 hours' THEN CASE WHEN success THEN 1.0 ELSE 0.0 END END), 0),
+			COALESCE(AVG(CASE WHEN created_at >= NOW() - INTERVAL '48 hours' AND created_at < NOW() - INTERVAL '24 hours' THEN CASE WHEN success THEN 1.0 ELSE 0.0 END END), 0),
 			COALESCE(AVG(CASE WHEN created_at >= NOW() - INTERVAL '24 hours' THEN total_duration_ms ELSE NULL END), 0),
 			COALESCE(AVG(CASE WHEN created_at >= NOW() - INTERVAL '48 hours' AND created_at < NOW() - INTERVAL '24 hours' THEN total_duration_ms ELSE NULL END), 0)
 		FROM request_history
@@ -2156,9 +2156,15 @@ func (h *AdminHandler) buildRatioSummary(ctx context.Context, gid *int) []map[st
 func (h *AdminHandler) ListKeys(c *gin.Context) {
 	ctx := c.Request.Context()
 
+	// E2：一次 JOIN 查询全部 Key 与分组（消除 1+N 查询），
+	// 分组在 Go 侧按 key 聚合。
 	rows, err := h.db.Pool.Query(ctx, `
-		SELECT id, key_prefix, role, enabled, created_at
-		FROM api_keys ORDER BY id
+		SELECT k.id, k.key_prefix, k.role, k.enabled, k.created_at,
+		       COALESCE(g.id, 0), COALESCE(g.name, '')
+		FROM api_keys k
+		LEFT JOIN api_key_groups ak ON ak.api_key_id = k.id
+		LEFT JOIN channel_groups g ON g.id = ak.group_id
+		ORDER BY k.id, g.id
 	`)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "failed to query api keys"})
@@ -2167,23 +2173,33 @@ func (h *AdminHandler) ListKeys(c *gin.Context) {
 	defer rows.Close()
 
 	keys := []map[string]interface{}{}
+	byID := map[int]int{} // key id -> keys 下标
 	for rows.Next() {
-		var id int
-		var prefix, role string
+		var id, gid int
+		var prefix, role, gname string
 		var enabled bool
 		var createdAt time.Time
-		if err := rows.Scan(&id, &prefix, &role, &enabled, &createdAt); err != nil {
+		if err := rows.Scan(&id, &prefix, &role, &enabled, &createdAt, &gid, &gname); err != nil {
 			continue
 		}
-		groups, _ := h.keyGroups(ctx, id)
-		keys = append(keys, map[string]interface{}{
-			"id":         id,
-			"prefix":     prefix,
-			"role":       role,
-			"enabled":    enabled,
-			"groups":     groups,
-			"created_at": createdAt.Format(time.RFC3339),
-		})
+		idx, ok := byID[id]
+		if !ok {
+			idx = len(keys)
+			byID[id] = idx
+			keys = append(keys, map[string]interface{}{
+				"id":         id,
+				"prefix":     prefix,
+				"role":       role,
+				"enabled":    enabled,
+				"groups":     []map[string]interface{}{},
+				"created_at": createdAt.Format(time.RFC3339),
+			})
+		}
+		if gid > 0 {
+			k := keys[idx]
+			groups := k["groups"].([]map[string]interface{})
+			k["groups"] = append(groups, map[string]interface{}{"id": gid, "name": gname})
+		}
 	}
 
 	c.JSON(200, gin.H{"keys": keys, "total": len(keys)})
