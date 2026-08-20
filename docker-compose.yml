@@ -98,6 +98,13 @@ services:
     networks:
       - router_net
     restart: unless-stopped
+    # D2：checker 无业务端口，用自身最小存活端点（容器内 8081）探活
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8081/health >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   # ===== 监控（可选：docker compose --profile monitoring up -d）=====
   # P2-10：Prometheus + Alertmanager 作为同一部署单元，规则文件随仓库挂载，

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"smart-router/internal/store"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // HealthSnapshot 健康数据快照（不可变）
@@ -128,8 +130,14 @@ func InvalidateSnapshotCache(ctx context.Context, redis *store.RedisClient) {
 	redis.Client.Del(ctx, snapshotCacheKey)
 }
 
+// snapshotGroup 进程内 singleflight：缓存失效瞬间的并发请求
+// 合并为一次重建（E1），避免 N 个请求同时执行 N 轮全表查询
+// 造成 DB 尖峰与路由延迟抖动。
+var snapshotGroup singleflight.Group
+
 // LoadSnapshot 加载当前快照（带 Redis 缓存）。
 // 缓存未命中重建后，将快照按内容哈希归档到 snapshot_archive（供确定性重放，P1-05）。
+// 缓存失效时并发重建由 singleflight 合并（E1）。
 func LoadSnapshot(ctx context.Context, db *store.DB, redis *store.RedisClient) (*HealthSnapshot, error) {
 	// 1. 尝试从 Redis 读取缓存
 	if redis != nil {
@@ -142,25 +150,31 @@ func LoadSnapshot(ctx context.Context, db *store.DB, redis *store.RedisClient) (
 		}
 	}
 
-	// 2. 缓存未命中，从 PG 重建
-	snapshot, err := buildSnapshot(ctx, db)
+	// 2. 缓存未命中：singleflight 合并并发重建（同实例内一次实际查询）
+	v, err, _ := snapshotGroup.Do("snapshot", func() (interface{}, error) {
+		snapshot, err := buildSnapshot(ctx, db)
+		if err != nil {
+			return nil, err
+		}
+
+		// 3. 计算内容哈希（不含 epoch：相同内容共享哈希，归档去重）
+		snapshot.ContentHash = computeSnapshotHash(snapshot)
+
+		// 4. 归档历史快照（best-effort：归档失败不影响路由，仅影响重放确定性）
+		archiveSnapshot(ctx, db, snapshot)
+
+		// 5. 写入 Redis 缓存
+		if redis != nil {
+			data, _ := json.Marshal(snapshot)
+			redis.Client.Set(ctx, snapshotCacheKey, data, snapshotCacheTTL)
+		}
+
+		return snapshot, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	// 3. 计算内容哈希（不含 epoch：相同内容共享哈希，归档去重）
-	snapshot.ContentHash = computeSnapshotHash(snapshot)
-
-	// 4. 归档历史快照（best-effort：归档失败不影响路由，仅影响重放确定性）
-	archiveSnapshot(ctx, db, snapshot)
-
-	// 5. 写入 Redis 缓存
-	if redis != nil {
-		data, _ := json.Marshal(snapshot)
-		redis.Client.Set(ctx, snapshotCacheKey, data, snapshotCacheTTL)
-	}
-
-	return snapshot, nil
+	return v.(*HealthSnapshot), nil
 }
 
 // archiveSnapshot 将快照写入 snapshot_archive（按内容哈希去重）。
