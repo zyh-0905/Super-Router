@@ -160,18 +160,23 @@ func (c *CommandService) handleAlerts(ctx context.Context, sub Subscriber, args 
 	return alertsQuery(ctx, sub.GroupIDs, criticalOnly)
 }
 
-// handleAlertDetail 单条告警详情（/alert <alert_key>）。
+// alertDetailQuery 由 RegisterAlertQueries 注入的单条详情实现（见 alerts.go）。
+var alertDetailQuery func(ctx context.Context, key string, groupIDs []int) (string, error)
+
+// SetAlertDetailQuery 注入单条告警详情查询（避免 commands ↔ alert/telegram 循环依赖）。
+func SetAlertDetailQuery(fn func(ctx context.Context, key string, groupIDs []int) (string, error)) {
+	alertDetailQuery = fn
+}
+
+// handleAlertDetail 单条告警详情（/alert <alert_key>，按 key 精确查询并校验分组授权）。
 func (c *CommandService) handleAlertDetail(ctx context.Context, sub Subscriber, args []string) (string, error) {
-	if alertsQuery == nil {
+	if alertDetailQuery == nil {
 		return "⚠️ 告警服务暂不可用，请稍后再试。", nil
 	}
 	if len(args) == 0 {
 		return "用法：/alert &lt;alert_key&gt;", nil
 	}
-	// 复用 alertsQuery 的过滤语义：把 key 作为 criticalOnly=false 查询的补充参数不可行，
-	// 这里直接用分组过滤查询全部后由 Worker 侧按 key 过滤（见 worker 实现）。
-	// 保持接口简单：本阶段先返回全部告警，由上层按 key 过滤。
-	return alertsQuery(ctx, sub.GroupIDs, false)
+	return alertDetailQuery(ctx, args[0], sub.GroupIDs)
 }
 
 // handleStatus 系统状态摘要（复用 RelayList + 告警计数）。

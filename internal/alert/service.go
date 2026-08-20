@@ -154,6 +154,37 @@ func (s *Service) GetByKey(ctx context.Context, key string) (*Alert, error) {
 	return a, err
 }
 
+// GetByKeyForGroups 按 key 查询最近一条告警（active 或 recovered），
+// 并校验该告警对给定分组集合可见（与 ActiveForGroups 相同的授权语义）。
+// 不存在或无权查看时返回 nil, nil（调用方显示「未找到」）。
+func (s *Service) GetByKeyForGroups(ctx context.Context, key string, groupIDs []int) (*Alert, error) {
+	row := s.DB.Pool.QueryRow(ctx, `
+		SELECT `+selectAlertColumns+`
+		FROM alert_events ae
+		`+alertJoin+`
+		WHERE ae.alert_key = $1
+		  AND (
+		        $2::int[] IS NULL OR cardinality($2::int[]) = 0
+		        OR ae.group_id = ANY($2)
+		        OR (
+		             ae.group_id IS NULL
+		             AND ae.channel_id IS NOT NULL
+		             AND EXISTS (
+		                 SELECT 1 FROM channel_group_members cgm
+		                 WHERE cgm.channel_id = ae.channel_id AND cgm.group_id = ANY($2)
+		             )
+		           )
+		      )
+		ORDER BY ae.id DESC
+		LIMIT 1
+	`, key, intArray(groupIDs))
+	a, err := scanAlert(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return a, err
+}
+
 // intArray nil/空切片 → SQL NULL（不筛选）；否则 pg 数组。
 func intArray(ids []int) interface{} {
 	if len(ids) == 0 {

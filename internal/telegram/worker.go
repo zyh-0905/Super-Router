@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
@@ -149,8 +150,12 @@ func (w *Worker) pollOnce(ctx context.Context) error {
 		w.cmds.SetSubscribers(subs)
 	}
 	for _, u := range updates {
-		w.handleUpdate(ctx, u)
-		// 成功处理一条 update 后事务性推进 offset（update_id+1）
+		// A1：仅在回复全部成功后才推进 offset。
+		// 处理/发送失败时保留当前 offset（返回错误触发退避），
+		// 下一轮 getUpdates 会重新投递该 update，消息不丢失。
+		if err := w.handleUpdate(ctx, u); err != nil {
+			return err
+		}
 		if err := w.store.UpdateLastUpdateID(ctx, u.UpdateID+1); err != nil {
 			return fmt.Errorf("update last_update_id: %w", err)
 		}
@@ -160,22 +165,24 @@ func (w *Worker) pollOnce(ctx context.Context) error {
 }
 
 // handleUpdate 处理单条消息：授权校验 → 命令分发 → 回复发送。
-func (w *Worker) handleUpdate(ctx context.Context, u Update) {
+// 返回错误表示该 update 未能完成处理（offset 不得推进）。
+func (w *Worker) handleUpdate(ctx context.Context, u Update) error {
 	if u.Text == "" {
-		return
+		return nil
 	}
 	reply, err := w.cmds.Handle(ctx, u.ChatID, u.Text)
 	if err != nil {
 		w.logger.Warn("Command handling failed", zap.Int64("chat_id", u.ChatID), zap.Error(err))
 		_ = w.store.UpdateLastError(ctx, truncateStr(err.Error(), 500))
-		return
+		return err
 	}
 	for _, part := range SplitMessage(reply, MaxTelegramMessageLen) {
 		if err := w.sendToSubscriber(ctx, u.ChatID, part); err != nil {
 			w.logger.Warn("Reply send failed", zap.Int64("chat_id", u.ChatID), zap.Error(err))
-			return
+			return err
 		}
 	}
+	return nil
 }
 
 // sendToSubscriber 向单个订阅者发送消息（拆分为多段分别记录投递）。
@@ -234,14 +241,16 @@ func (w *Worker) tryReport(ctx context.Context, now time.Time) {
 }
 
 // sendReportWindow 向全部 enabled + alert_enabled 订阅者发送窗口报告（幂等）。
+// A2：报告按订阅者的 GroupIDs 分别构建（授权边界）——
+// 分组受限的订阅者只能看到自己分组的数据，系统概况计数同样应用分组过滤。
 func (w *Worker) sendReportWindow(ctx context.Context, start, end time.Time) {
 	subs, err := w.store.LoadSubscribers(ctx)
 	if err != nil {
 		w.logger.Warn("Load subscribers for report failed", zap.Error(err))
 		return
 	}
-	// 组装一次报告内容（订阅者间共享；组过滤在查询层完成）
-	report := w.buildReport(ctx, start, end)
+	// 按分组集合缓存报告内容（相同分组的订阅者共享一份）
+	reportCache := map[string]string{}
 	for _, s := range subs {
 		if !s.Enabled || !s.AlertEnabled {
 			continue
@@ -253,12 +262,29 @@ func (w *Worker) sendReportWindow(ctx context.Context, start, end time.Time) {
 		if already {
 			continue // 该订阅者该窗口已成功投递（崩溃后新 owner 不重复发送）
 		}
+		cacheKey := groupIDsKey(s.GroupIDs)
+		report, ok := reportCache[cacheKey]
+		if !ok {
+			report = w.buildReport(ctx, start, end, s.GroupIDs)
+			reportCache[cacheKey] = report
+		}
 		w.deliverReport(ctx, s, report, start, end)
 	}
 }
 
-// buildReport 组装报告内容（ReportBuilder 组装系统概况 + 告警变化）。
-func (w *Worker) buildReport(ctx context.Context, start, end time.Time) string {
+// groupIDsKey 把分组集合归一化成缓存键（排序后拼接，空集合 = "all"）。
+func groupIDsKey(ids []int) string {
+	if len(ids) == 0 {
+		return "all"
+	}
+	sorted := append([]int(nil), ids...)
+	sort.Ints(sorted)
+	return fmt.Sprintf("%v", sorted)
+}
+
+// buildReport 组装报告内容（ReportBuilder 组装系统概况 + 告警变化；
+// groupIDs 控制查询范围，订阅者的分组授权边界在此生效）。
+func (w *Worker) buildReport(ctx context.Context, start, end time.Time, groupIDs []int) string {
 	if w.builder == nil {
 		return "🛰 <b>Smart Router 告警汇总</b>\n━━━━━━━━━━━━━━━━\n时间：" +
 			start.Format("2006-01-02 15:04") + "\n告警服务暂不可用。\n"
@@ -267,7 +293,7 @@ func (w *Worker) buildReport(ctx context.Context, start, end time.Time) string {
 	if err != nil {
 		cfg = Config{}
 	}
-	msg, err := w.builder.Build(ctx, start, int(end.Sub(start)/time.Hour), cfg, nil)
+	msg, err := w.builder.Build(ctx, start, int(end.Sub(start)/time.Hour), cfg, groupIDs)
 	if err != nil {
 		w.logger.Warn("Report build failed", zap.Error(err))
 		return "🛰 <b>Smart Router 告警汇总</b>\n时间：" + start.Format("2006-01-02 15:04") + "\n告警查询失败。\n"

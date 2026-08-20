@@ -77,8 +77,63 @@ func FormatAlerts(alerts []alert.Alert, now time.Time) string {
 	return b.String()
 }
 
+// Detail 单条告警详情（/alert <key>，含已恢复的告警）。
+// 未找到或无权查看返回「未找到」提示（不区分两者，避免探测越权存在性）。
+func (a *AlertQueries) Detail(ctx context.Context, key string, groupIDs []int) (string, error) {
+	al, err := a.svc.GetByKeyForGroups(ctx, key, groupIDs)
+	if err != nil {
+		return "", err
+	}
+	if al == nil {
+		return "🔍 <b>未找到该告警</b>\nKey：" + EscapeHTML(key), nil
+	}
+	var b strings.Builder
+	icon := "🟠"
+	if al.Severity == alert.SeverityCritical {
+		icon = "🔴"
+	}
+	b.WriteString(fmt.Sprintf("%s <b>%s</b>\n", icon, EscapeHTML(al.Title)))
+	b.WriteString("Key：" + EscapeHTML(al.Key) + "\n")
+	if al.ChannelName != "" {
+		b.WriteString("站点：" + EscapeHTML(al.ChannelName) + "\n")
+	}
+	if al.Model != "" {
+		b.WriteString("模型：" + EscapeHTML(al.Model) + "\n")
+	}
+	b.WriteString("状态：" + statusLabel(al.Status) + "\n")
+	if al.Message != "" {
+		b.WriteString("详情：" + EscapeHTML(al.Message) + "\n")
+	}
+	if al.CurrentValue != nil && al.ThresholdValue != nil {
+		b.WriteString(fmt.Sprintf("当前：%.4g%s / 阈值：%.4g%s\n", *al.CurrentValue, al.Unit, *al.ThresholdValue, al.Unit))
+	}
+	if al.Impact != "" {
+		b.WriteString("影响：" + EscapeHTML(al.Impact) + "\n")
+	}
+	if al.Recommendation != "" {
+		b.WriteString("建议：" + EscapeHTML(al.Recommendation) + "\n")
+	}
+	if !al.FirstSeenAt.IsZero() {
+		b.WriteString("首次出现：" + al.FirstSeenAt.Format("2006-01-02 15:04") + "\n")
+	}
+	if al.RecoveredAt != nil {
+		b.WriteString("恢复时间：" + al.RecoveredAt.Format("2006-01-02 15:04") + "\n")
+	} else {
+		b.WriteString("持续：" + alert.FormatDuration(time.Since(al.FirstSeenAt)) + "\n")
+	}
+	return b.String(), nil
+}
+
+func statusLabel(s alert.AlertStatus) string {
+	if s == alert.StatusRecovered {
+		return "✅ 已恢复"
+	}
+	return "⏳ 活跃中"
+}
+
 // RegisterAlertQueries 将告警查询注入命令服务（Worker 装配时调用一次）。
 func RegisterAlertQueries(db *store.DB) {
 	q := NewAlertQueries(db)
 	SetAlertsQuery(q.ListActive)
+	SetAlertDetailQuery(q.Detail)
 }

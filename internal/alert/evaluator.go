@@ -3,6 +3,8 @@ package alert
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"smart-router/internal/store"
@@ -45,18 +47,31 @@ func (e *Evaluator) Evaluate(ctx context.Context, groupID *int) ([]Alert, error)
 	now := time.Now()
 	threshold := e.LowBalanceThreshold(ctx)
 
-	// 1. 低余额告警（最新成功余额 <= 阈值）
+	// 1. 低余额告警（B1：连续 2 次成功检测余额均 <= 阈值才告警，
+	//    单次抖动不触发/不恢复，避免边界值反复横跳产生告警风暴）
 	rows, err := e.DB.Pool.Query(ctx, `
-		SELECT DISTINCT ON (b.channel_id) b.channel_id, u.name, b.balance
-		FROM balance_checks b
+		SELECT b.channel_id, u.name, b.balance
+		FROM (
+			SELECT channel_id, balance,
+			       ROW_NUMBER() OVER (PARTITION BY channel_id ORDER BY checked_at DESC) AS rn
+			FROM balance_checks
+			WHERE source != ''
+		) b
 		JOIN upstreams u ON u.id = b.channel_id
-		WHERE b.source != ''
+		WHERE b.rn <= 2
 		  AND `+fmt.Sprintf(groupFilterSQL, "b.channel_id")+`
-		ORDER BY b.channel_id, b.checked_at DESC
+		ORDER BY b.channel_id, b.rn
 	`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("query low balance: %w", err)
 	}
+	type balanceSample struct {
+		cid  int
+		name string
+		vals []float64
+	}
+	byChannel := map[int]*balanceSample{}
+	var order []int
 	for rows.Next() {
 		var cid int
 		var name string
@@ -64,15 +79,31 @@ func (e *Evaluator) Evaluate(ctx context.Context, groupID *int) ([]Alert, error)
 		if err := rows.Scan(&cid, &name, &balance); err != nil {
 			continue
 		}
-		if balance > threshold {
+		s, ok := byChannel[cid]
+		if !ok {
+			s = &balanceSample{cid: cid, name: name}
+			byChannel[cid] = s
+			order = append(order, cid)
+		}
+		s.vals = append(s.vals, balance)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scan low balance: %w", err)
+	}
+	for _, cid := range order {
+		s := byChannel[cid]
+		// 连续 2 次样本全部 <= 阈值才告警
+		if len(s.vals) < 2 || s.vals[0] > threshold || s.vals[1] > threshold {
 			continue
 		}
+		balance := s.vals[0]
 		alerts = append(alerts, Alert{
 			Key: StableKey(AlertInput{Type: TypeLowBalance, ChannelID: cid}),
 			Type: TypeLowBalance, Severity: SeverityCritical,
 			ChannelID: intPtr(cid),
 			Title:     "余额不足",
-			Message:   fmt.Sprintf("余额不足: %s 剩余 $%.2f（阈值 $%.2f）", name, balance, threshold),
+			Message:   fmt.Sprintf("余额不足: %s 剩余 $%.2f（阈值 $%.2f）", s.name, balance, threshold),
 			CurrentValue: fPtr(balance), ThresholdValue: fPtr(threshold), Unit: "USD",
 			Impact:         "余额耗尽后该站点将无法响应请求",
 			Recommendation: "为上游账户充值，或临时停用该站点",
@@ -80,24 +111,32 @@ func (e *Evaluator) Evaluate(ctx context.Context, groupID *int) ([]Alert, error)
 			FirstSeenAt:    now, LastSeenAt: now,
 		})
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scan low balance: %w", err)
-	}
 
-	// 2. 倍率超限告警（最新实测倍率 > 站点上限）
+	// 2. 倍率超限告警（B1：连续 2 次实测均 > 上限才告警，同上滞回语义）
 	rows, err = e.DB.Pool.Query(ctx, `
-		SELECT DISTINCT ON (p.upstream_id, p.model) p.upstream_id, u.name, p.model, p.real_ratio, u.ratio_limit
-		FROM probe_results p
+		SELECT p.upstream_id, u.name, p.model, p.real_ratio, u.ratio_limit
+		FROM (
+			SELECT upstream_id, model, real_ratio,
+			       ROW_NUMBER() OVER (PARTITION BY upstream_id, model ORDER BY checked_at DESC) AS rn
+			FROM probe_results
+			WHERE success = true
+		) p
 		JOIN upstreams u ON u.id = p.upstream_id
-		WHERE p.success = true
+		WHERE p.rn <= 2
 		  AND u.ratio_limit > 0
 		  AND `+fmt.Sprintf(groupFilterSQL, "p.upstream_id")+`
-		ORDER BY p.upstream_id, p.model, p.checked_at DESC
+		ORDER BY p.upstream_id, p.model, p.rn
 	`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("query ratio exceeded: %w", err)
 	}
+	type ratioSample struct {
+		key  string
+		name string
+		vals []float64
+	}
+	byModel := map[string]*ratioSample{}
+	var ratioOrder []string
 	for rows.Next() {
 		var cid int
 		var name, model string
@@ -105,15 +144,35 @@ func (e *Evaluator) Evaluate(ctx context.Context, groupID *int) ([]Alert, error)
 		if err := rows.Scan(&cid, &name, &model, &ratio, &limit); err != nil {
 			continue
 		}
-		if ratio <= limit {
+		key := fmt.Sprintf("%d|%s", cid, model)
+		s, ok := byModel[key]
+		if !ok {
+			s = &ratioSample{key: key, name: name, vals: []float64{limit}}
+			byModel[key] = s
+			ratioOrder = append(ratioOrder, key)
+		}
+		s.vals = append(s.vals, ratio)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scan ratio exceeded: %w", err)
+	}
+	for _, key := range ratioOrder {
+		s := byModel[key]
+		// vals[0] 是 limit，其后是连续样本（最多 2 个）
+		if len(s.vals) < 3 || s.vals[1] <= s.vals[0] || s.vals[2] <= s.vals[0] {
 			continue
 		}
+		parts := strings.SplitN(key, "|", 2)
+		cid, _ := strconv.Atoi(parts[0])
+		model := parts[1]
+		ratio, limit := s.vals[1], s.vals[0]
 		alerts = append(alerts, Alert{
 			Key: StableKey(AlertInput{Type: TypeRatioExceeded, ChannelID: cid, Model: model}),
 			Type: TypeRatioExceeded, Severity: SeverityCritical,
 			ChannelID: intPtr(cid), Model: model,
 			Title:     "倍率超限",
-			Message:   fmt.Sprintf("倍率超标: %s %s 实测 %.4fx 超过上限 %.4fx", name, model, ratio, limit),
+			Message:   fmt.Sprintf("倍率超标: %s %s 实测 %.4fx 超过上限 %.4fx", s.name, model, ratio, limit),
 			CurrentValue: fPtr(ratio), ThresholdValue: fPtr(limit), Unit: "x",
 			Impact:         "该模型可能参与成本路由，抬高转发成本",
 			Recommendation: "检查价格同步或调整倍率上限",
@@ -241,8 +300,88 @@ func (e *Evaluator) Evaluate(ctx context.Context, groupID *int) ([]Alert, error)
 		return nil, fmt.Errorf("scan pricing failed: %w", err)
 	}
 
+	// 6. 接口质量检测失败告警：每个 (渠道, 模型) 最近一次 completed 检测中
+	//    关键阶段（connectivity/protocol/stream）存在 failed → active；
+	//    后续一次检测中关键阶段全部通过即恢复。
+	//    由 Evaluator 统一评估后，QualityAlertSink 不再单独写库
+	//    （避免全量 Reconcile 语义误恢复其它告警）。
+	rows, err = e.DB.Pool.Query(ctx, `
+		SELECT DISTINCT ON (r.channel_id, r.model)
+		       r.channel_id, r.model, u.name, r.id
+		FROM quality_check_runs r
+		JOIN upstreams u ON u.id = r.channel_id
+		WHERE r.status = 'completed'
+		  AND `+fmt.Sprintf(groupFilterSQL, "r.channel_id")+`
+		ORDER BY r.channel_id, r.model, r.created_at DESC
+	`, groupID)
+	if err != nil {
+		return nil, fmt.Errorf("query quality runs: %w", err)
+	}
+	type latestRun struct {
+		channelID int
+		model     string
+		name      string
+		runID     int64
+	}
+	var latest []latestRun
+	for rows.Next() {
+		var lr latestRun
+		if err := rows.Scan(&lr.channelID, &lr.model, &lr.name, &lr.runID); err != nil {
+			continue
+		}
+		latest = append(latest, lr)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scan quality runs: %w", err)
+	}
+
+	for _, lr := range latest {
+		failedStages, err := e.qualityFailedCriticalStages(ctx, lr.runID)
+		if err != nil {
+			continue
+		}
+		if len(failedStages) == 0 {
+			continue // 关键阶段无失败：不告警
+		}
+		alerts = append(alerts, Alert{
+			Key: StableKey(AlertInput{Type: TypeQualityCheckFailed, ChannelID: lr.channelID, Model: lr.model}),
+			Type: TypeQualityCheckFailed, Severity: SeverityWarning,
+			ChannelID: intPtr(lr.channelID), Model: lr.model,
+			Title:   "接口质量检测失败",
+			Message: fmt.Sprintf("质量检测失败: %s (%s) 关键阶段: %s", lr.name, lr.model, strings.Join(failedStages, "/")),
+			Impact:         "该站点×模型的接口可能异常，路由质量受影响",
+			Recommendation: "在站点详情查看质量检测结果，检查上游服务状态",
+			AdminPath:      "/channels",
+			FirstSeenAt:    now, LastSeenAt: now,
+		})
+	}
+
 	SortAlerts(alerts)
 	return alerts, nil
+}
+
+// qualityFailedCriticalStages 读取指定 run 中 failed 的关键阶段名
+// （connectivity/protocol/stream），用于质量失败告警的说明与判定。
+func (e *Evaluator) qualityFailedCriticalStages(ctx context.Context, runID int64) ([]string, error) {
+	rows, err := e.DB.Pool.Query(ctx, `
+		SELECT stage FROM quality_check_results
+		WHERE run_id = $1 AND status = 'failed'
+		  AND stage IN ('connectivity', 'protocol', 'stream')
+		ORDER BY stage
+	`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var stages []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err == nil {
+			stages = append(stages, s)
+		}
+	}
+	return stages, rows.Err()
 }
 
 func intPtr(v int) *int { return &v }

@@ -62,21 +62,24 @@ type telegramConfigPatch struct {
 	WebBaseURL            *string `json:"web_base_url"`
 }
 
-// validateTelegramConfigPatch 校验 PATCH 字段（纯函数，便于测试）。
-func validateTelegramConfigPatch(payload map[string]interface{}) error {
-	if v, ok := payload["report_interval_minutes"].(float64); ok {
-		if v <= 0 {
+// validateTelegramConfigPatch 校验 PATCH 字段（直接校验绑定后的结构体）。
+// 注意：不能再在 ShouldBindJSON 之后 GetRawData 二次读 body——
+// gin 的绑定已消费请求体，raw 恒为空，导致校验被整体绕过（已实证
+// report_minute=99 可写入数据库）。
+func validateTelegramConfigPatch(req telegramConfigPatch) error {
+	if req.ReportIntervalMinutes != nil {
+		if *req.ReportIntervalMinutes <= 0 {
 			return fmt.Errorf("report_interval_minutes must be positive")
 		}
 	}
-	if v, ok := payload["report_minute"].(float64); ok {
-		if v < 0 || v > 59 {
+	if req.ReportMinute != nil {
+		if *req.ReportMinute < 0 || *req.ReportMinute > 59 {
 			return fmt.Errorf("report_minute must be between 0 and 59")
 		}
 	}
-	if v, ok := payload["timezone"].(string); ok && v != "" {
-		if _, err := time.LoadLocation(v); err != nil {
-			return fmt.Errorf("timezone invalid: %s", v)
+	if req.Timezone != nil && *req.Timezone != "" {
+		if _, err := time.LoadLocation(*req.Timezone); err != nil {
+			return fmt.Errorf("timezone invalid: %s", *req.Timezone)
 		}
 	}
 	return nil
@@ -154,12 +157,8 @@ func (h *TelegramHandler) UpdateConfig(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	// 先做纯字段校验
-	raw := map[string]interface{}{}
-	if b, err := c.GetRawData(); err == nil {
-		_ = json.Unmarshal(b, &raw)
-	}
-	if err := validateTelegramConfigPatch(raw); err != nil {
+	// 先做纯字段校验（直接校验绑定后的字段，不再二次读 body）
+	if err := validateTelegramConfigPatch(req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}

@@ -24,8 +24,12 @@ func NewQualityAlertSink(store *SQLStore) *QualityAlertSink {
 	return &QualityAlertSink{store: store}
 }
 
-// QualityFailure 写入质量检测硬失败告警。
-// 同 key 再失败只更新 occurrence 与 last_seen_at；行为 attention 不产生 Critical。
+// QualityFailure 写入质量检测硬失败告警（按 key 单条 upsert）。
+// 同 key 再失败只更新 occurrence 与 last_seen_at；行为 attention 不产生告警。
+// 注意：不能复用全量语义的 Reconcile——它会把不在集合中的
+// 其它全部 active 告警误标为 recovered（C1）。
+// 告警的最终生命周期由 Evaluator（已纳入 quality_check_failed）+ Reconciler 维护，
+// 此处写入只是让告警即时可见（不必等下一轮 30s reconcile）。
 func (q *QualityAlertSink) QualityFailure(ctx context.Context, channelID int, model, stage, message string, metadata map[string]interface{}) error {
 	if q == nil || q.store == nil {
 		return fmt.Errorf("alert store unavailable")
@@ -47,10 +51,7 @@ func (q *QualityAlertSink) QualityFailure(ctx context.Context, channelID int, mo
 		AdminPath:      "/channels",
 		Metadata:       metadata,
 	}
-	now := time.Now()
-	a.FirstSeenAt = now
-	a.LastSeenAt = now
-	return q.store.Reconcile(ctx, []Alert{a}, now)
+	return q.store.UpsertActive(ctx, a, time.Now())
 }
 
 // ResolveQualityFailures 同模型关键阶段全部通过时恢复质量失败告警。
@@ -82,14 +83,5 @@ func (q *QualityAlertSink) ResolveQualityFailures(ctx context.Context, channelID
 	}
 
 	key := StableKey(AlertInput{Type: TypeQualityCheckFailed, ChannelID: channelID, Model: model})
-	now := time.Now()
-	_, err := q.store.Pool.Exec(ctx, `
-		UPDATE alert_events
-		SET status = 'recovered', recovered_at = $2
-		WHERE alert_key = $1 AND status = 'active'
-	`, key, now)
-	if err != nil {
-		return fmt.Errorf("resolve quality failure: %w", err)
-	}
-	return nil
+	return q.store.ResolveKey(ctx, key, time.Now())
 }

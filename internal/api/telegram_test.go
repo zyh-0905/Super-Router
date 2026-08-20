@@ -67,20 +67,22 @@ func TestTelegramNonAdminForbidden(t *testing.T) {
 
 // TestTelegramConfigValidation 配置校验纯函数（无需 DB）。
 func TestTelegramConfigValidation(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+	strPtr := func(v string) *string { return &v }
 	cases := []struct {
 		name    string
-		payload map[string]interface{}
+		req     telegramConfigPatch
 		wantErr string
 	}{
-		{"interval must be positive", map[string]interface{}{"report_interval_minutes": float64(0)}, "report_interval_minutes"},
-		{"interval negative", map[string]interface{}{"report_interval_minutes": float64(-5)}, "report_interval_minutes"},
-		{"minute out of range", map[string]interface{}{"report_minute": float64(60)}, "report_minute"},
-		{"minute negative", map[string]interface{}{"report_minute": float64(-1)}, "report_minute"},
-		{"bad timezone", map[string]interface{}{"timezone": "Mars/Olympus"}, "timezone"},
-		{"valid payload", map[string]interface{}{"report_interval_minutes": float64(30), "report_minute": float64(15), "timezone": "Asia/Shanghai"}, ""},
+		{"interval must be positive", telegramConfigPatch{ReportIntervalMinutes: intPtr(0)}, "report_interval_minutes"},
+		{"interval negative", telegramConfigPatch{ReportIntervalMinutes: intPtr(-5)}, "report_interval_minutes"},
+		{"minute out of range", telegramConfigPatch{ReportMinute: intPtr(60)}, "report_minute"},
+		{"minute negative", telegramConfigPatch{ReportMinute: intPtr(-1)}, "report_minute"},
+		{"bad timezone", telegramConfigPatch{Timezone: strPtr("Mars/Olympus")}, "timezone"},
+		{"valid payload", telegramConfigPatch{ReportIntervalMinutes: intPtr(30), ReportMinute: intPtr(15), Timezone: strPtr("Asia/Shanghai")}, ""},
 	}
 	for _, c := range cases {
-		err := validateTelegramConfigPatch(c.payload)
+		err := validateTelegramConfigPatch(c.req)
 		if c.wantErr == "" && err != nil {
 			t.Fatalf("%s: unexpected error %v", c.name, err)
 		}

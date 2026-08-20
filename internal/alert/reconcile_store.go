@@ -132,3 +132,70 @@ func (s *SQLStore) Reconcile(ctx context.Context, current []Alert, now time.Time
 	}
 	return nil
 }
+
+// UpsertActive 按 key 幂等写入/更新单条 active 告警，不触碰其它告警。
+// 与 Reconciler 的全量 Reconcile 共享同一 advisory lock，串行化避免
+// 「单条写入」与「全量恢复扫尾」交错导致误恢复。
+func (s *SQLStore) UpsertActive(ctx context.Context, a Alert, now time.Time) error {
+	if a.Key == "" {
+		return fmt.Errorf("alert key required")
+	}
+	return s.WithReconcileLock(ctx, func(ctx context.Context) error {
+		metadata := a.Metadata
+		if metadata == nil {
+			metadata = map[string]interface{}{}
+		}
+		mdJSON, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("marshal metadata: %w", err)
+		}
+		_, err = s.Pool.Exec(ctx, `
+			INSERT INTO alert_events (
+				alert_key, alert_type, severity, status, channel_id, group_id, model,
+				title, message, current_value, threshold_value, unit, impact, recommendation,
+				admin_path, metadata, first_seen_at, last_seen_at, occurrence_count
+			) VALUES (
+				$1, $2, $3, 'active', $4, $5, NULLIF($6, ''), $7, $8, $9, $10, $11,
+				NULLIF($12, ''), NULLIF($13, ''), NULLIF($14, ''),
+				$15, $16, $17, 1
+			)
+			ON CONFLICT (alert_key) WHERE status = 'active'
+			DO UPDATE SET
+				last_seen_at     = EXCLUDED.last_seen_at,
+				current_value    = EXCLUDED.current_value,
+				threshold_value  = EXCLUDED.threshold_value,
+				occurrence_count = alert_events.occurrence_count + 1,
+				severity = CASE
+					WHEN EXCLUDED.severity = 'critical' AND alert_events.severity <> 'critical'
+						THEN 'critical'
+					ELSE alert_events.severity
+				END,
+				metadata = alert_events.metadata
+		`,
+			a.Key, a.Type, string(a.Severity), a.ChannelID, a.GroupID, a.Model,
+			a.Title, a.Message, a.CurrentValue, a.ThresholdValue, a.Unit,
+			a.Impact, a.Recommendation, a.AdminPath, mdJSON, now, now)
+		if err != nil {
+			return fmt.Errorf("upsert alert %s: %w", a.Key, err)
+		}
+		return nil
+	})
+}
+
+// ResolveKey 恢复指定 key 的 active 告警（不存在/已恢复为空操作）。
+func (s *SQLStore) ResolveKey(ctx context.Context, key string, now time.Time) error {
+	if key == "" {
+		return fmt.Errorf("alert key required")
+	}
+	return s.WithReconcileLock(ctx, func(ctx context.Context) error {
+		_, err := s.Pool.Exec(ctx, `
+			UPDATE alert_events
+			SET status = 'recovered', recovered_at = $2
+			WHERE alert_key = $1 AND status = 'active'
+		`, key, now)
+		if err != nil {
+			return fmt.Errorf("resolve alert %s: %w", key, err)
+		}
+		return nil
+	})
+}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -74,7 +75,9 @@ func (c *Client) do(ctx context.Context, method string, params url.Values) (*api
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("telegram api unreachable: %w", err)
+		// A4：url.Error 包含完整请求 URL（含 Bot Token 于 path），
+		// 绝不能原样写入日志/last_error/API 响应。转换为不含 URL 的稳定错误。
+		return nil, fmt.Errorf("telegram api unreachable: %s", sanitizeNetErr(err))
 	}
 	defer resp.Body.Close()
 
@@ -171,7 +174,8 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, html string) (in
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
-		return 0, fmt.Errorf("telegram api unreachable: %w", err)
+		// A4：同 do()——错误不得包含带 Token 的 URL
+		return 0, fmt.Errorf("telegram api unreachable: %s", sanitizeNetErr(err))
 	}
 	defer resp.Body.Close()
 
@@ -215,4 +219,33 @@ func truncateStr(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// sanitizeNetErr 把网络错误压平为不含 URL/Token 的稳定描述。
+// url.Error 的 Error() 会包含完整请求 URL（Bot Token 位于 path），
+// 只提取底层错误类别（dns/连接拒绝/超时/TLS/EOF），丢弃 URL 部分。
+func sanitizeNetErr(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		msg := strings.ToLower(ue.Err.Error())
+		switch {
+		case strings.Contains(msg, "no such host"):
+			return "dns lookup failed"
+		case strings.Contains(msg, "connection refused"):
+			return "connection refused"
+		case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"):
+			return "request timed out"
+		case strings.Contains(msg, "tls"), strings.Contains(msg, "certificate"):
+			return "tls handshake failed"
+		case strings.Contains(msg, "eof"), strings.Contains(msg, "reset"):
+			return "connection closed"
+		}
+		return "network error"
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "bot") && strings.Contains(msg, "/") {
+		// 兜底：任何疑似包含 URL 的错误一律压平
+		return "network error"
+	}
+	return err.Error()
 }
