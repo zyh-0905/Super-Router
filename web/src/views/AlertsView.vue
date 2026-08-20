@@ -1,5 +1,5 @@
 <script setup>
-// 告警页：全部活跃告警（低余额 / 倍率超限 / 熔断开闸降级 / 站点禁用）
+// 告警页：全部活跃告警（低余额 / 倍率超限 / 熔断开闸降级 / 站点禁用 / 价格同步 / 接口质量）
 // 数据来自 GET /admin/alerts（与右下角弹窗同一数据源，Checker reconcile 的持久化事件）。
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
@@ -87,7 +87,7 @@ onUnmounted(() => clearInterval(pollTimer))
     <div class="page-head">
       <div>
         <div class="page-title">告警</div>
-        <div class="page-sub">全部活跃告警 · 实时计算{{ lastRefresh ? ' · ' + lastRefresh + ' 更新' : '' }}</div>
+        <div class="page-sub">全部活跃告警 · Checker 周期性评估{{ lastRefresh ? ' · ' + lastRefresh + ' 更新' : '' }}</div>
       </div>
       <div class="row gap-3" style="flex-wrap:wrap">
         <GroupSwitcher @change="onGroupChange" />

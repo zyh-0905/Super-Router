@@ -1,5 +1,8 @@
 # 编译产物
 bin/
+checker
+gateway
+replay
 
 # 前端依赖与构建产物
 web/node_modules/

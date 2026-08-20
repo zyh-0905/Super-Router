@@ -499,7 +499,7 @@ onMounted(load)
             <Icon :name="a.sev === 'critical' ? 'zap_off' : 'alert'" :size="16" :style="{ color: a.sev === 'critical' ? 'var(--red)' : 'var(--orange)' }" />
             <div class="grow">
               <div style="font-size:13.5px;font-weight:500">{{ a.name }}</div>
-              <div class="text-3" style="font-size:12px">{{ a.channel }} · {{ fmtAgo(a.ago === '—' ? null : a.ago) }}</div>
+              <div class="text-3" style="font-size:12px">{{ a.channel }} · {{ fmtAgo(a.first_seen_at) }}</div>
             </div>
             <router-link v-if="a.name.includes('熔断')" to="/circuit" class="btn btn-ghost btn-sm">查看</router-link>
             <router-link v-else to="/channels" class="btn btn-ghost btn-sm">查看</router-link>
