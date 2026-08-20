@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -134,6 +136,26 @@ func main() {
 
 	logger.Info("Scheduler started (tick 5s), alert reconciler started (30s)")
 
+	// 存活检查端点（D2）：checker 无业务端口，暴露最小 HTTP 端点供
+	// Compose healthcheck 探活；进程崩溃即不可达，Compose 可据此重启。
+	// 仅监听容器内 8081，不映射宿主机端口。
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		})
+		srv := &http.Server{
+			Addr:              ":8081",
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("checker health server failed", zap.Error(err))
+		}
+	}()
+
 	// 等待中断信号
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -198,7 +220,8 @@ type scheduler struct {
 
 	// 每个渠道每个任务的上次执行时间
 	lastRun map[int]map[string]time.Time
-	epoch   int64
+	// pendingEpoch 本轮的工作 epoch（H11：先写结果、轮末发布）
+	pendingEpoch int64
 
 	lastCleanup time.Time // 保留策略清理（每日一次）
 }
@@ -323,7 +346,14 @@ func (s *scheduler) runAliveForAll(ctx context.Context) {
 		return
 	}
 
-	s.epoch, _ = s.db.IncrementEpoch(ctx)
+	// H11：工作 epoch 先写后发布——探测结果以 pendingEpoch 写入，
+	// 全部写完后才把 epoch 发布到 epoch_counter，快照读取端永远
+	// 不会看到「半轮」的混合状态。
+	pendingEpoch, err := s.db.PeekNextEpoch(ctx)
+	if err != nil {
+		s.logger.Error("Peek working epoch failed, initial checks skipped", zap.Error(err))
+		return
+	}
 	now := time.Now()
 	for _, sch := range schedules {
 		s.lastRun[sch.ID] = map[string]time.Time{
@@ -332,10 +362,13 @@ func (s *scheduler) runAliveForAll(ctx context.Context) {
 			"probe":   now,
 			"balance": {}, // 零值：第一个 tick 立即执行余额检测
 		}
-		if err := s.alive.CheckChannel(ctx, sch.Upstream, s.epoch); err != nil {
+		if err := s.alive.CheckChannel(ctx, sch.Upstream, pendingEpoch); err != nil {
 			s.logger.Debug("Initial alive check failed",
 				zap.String("channel", sch.Name), zap.Error(err))
 		}
+	}
+	if _, err := s.db.PublishEpoch(ctx, pendingEpoch); err != nil {
+		s.logger.Error("Publish epoch failed (initial checks)", zap.Int64("epoch", pendingEpoch), zap.Error(err))
 	}
 	s.logger.Info("Initial alive check completed", zap.Int("channels", len(schedules)))
 }
@@ -356,6 +389,15 @@ func (s *scheduler) tick(ctx context.Context) {
 	now := time.Now()
 	s.runCleanup(ctx) // 自守卫：每日一次
 
+	// H11：整轮工作 epoch 先写后发布。读取失败则跳过本轮写入
+	// （fail-closed，不复用旧 epoch 写入混合数据）。
+	pendingEpoch, err := s.db.PeekNextEpoch(ctx)
+	if err != nil {
+		s.logger.Error("Peek working epoch failed, tick skipped", zap.Error(err))
+		return
+	}
+	s.pendingEpoch = pendingEpoch // 供 runProbe 使用
+
 	// 全局探针预算检查（DB 汇总，粗粒度闸门）
 	globalSpent, err := s.probe.TodaySpent(ctx)
 	globalBudgetLeft, globalBudgetAvailable := probeBudgetLeft(s.cfg.Checker.DailyProbeBudget, globalSpent, err)
@@ -370,6 +412,20 @@ func (s *scheduler) tick(ctx context.Context) {
 		}
 	}
 
+	// E4：回收已删除站点的 lastRun（长期增删站点会累积进程内状态）
+	for id := range s.lastRun {
+		found := false
+		for _, sch := range schedules {
+			if sch.ID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(s.lastRun, id)
+		}
+	}
+
 	// 存活探测：收集到期渠道并并发执行（单个黑洞上游不再拖慢整轮）
 	var dueAlive []checker.ChannelSchedule
 	for _, sch := range schedules {
@@ -378,11 +434,6 @@ func (s *scheduler) tick(ctx context.Context) {
 		}
 	}
 	if len(dueAlive) > 0 {
-		if ep, err := s.db.IncrementEpoch(ctx); err == nil {
-			s.epoch = ep
-		} else {
-			s.logger.Error("Failed to increment epoch", zap.Error(err))
-		}
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, 8) // 并发上限
 		for _, sch := range dueAlive {
@@ -391,7 +442,7 @@ func (s *scheduler) tick(ctx context.Context) {
 			go func(u checker.Upstream, name string) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if err := s.alive.CheckChannel(ctx, u, s.epoch); err != nil {
+				if err := s.alive.CheckChannel(ctx, u, pendingEpoch); err != nil {
 					s.logger.Debug("Alive check failed", zap.String("channel", name), zap.Error(err))
 				}
 			}(sch.Upstream, sch.Name)
@@ -408,7 +459,7 @@ func (s *scheduler) tick(ctx context.Context) {
 
 		// 价格同步
 		if now.Sub(last["pricing"]) >= sch.PricingInterval {
-			if err := s.pricing.SyncChannel(ctx, sch.Upstream, s.epoch); err != nil {
+			if err := s.pricing.SyncChannel(ctx, sch.Upstream, pendingEpoch); err != nil {
 				s.logger.Debug("Pricing sync failed", zap.String("channel", sch.Name), zap.Error(err))
 			}
 			last["pricing"] = now
@@ -426,6 +477,12 @@ func (s *scheduler) tick(ctx context.Context) {
 			}
 			last["balance"] = now
 		}
+	}
+
+	// H11：整轮写入完成后发布 epoch——发布之前，快照读取端
+	// （WHERE epoch <= current）看不到任何本轮数据；发布之后整轮原子可见。
+	if _, err := s.db.PublishEpoch(ctx, pendingEpoch); err != nil {
+		s.logger.Error("Publish epoch failed", zap.Int64("epoch", pendingEpoch), zap.Error(err))
 	}
 }
 
@@ -447,7 +504,16 @@ func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, g
 		return
 	}
 
-	// 估算单次探测成本并做原子预留（Redis 可用时；模型与 ProbeChannel 的选择一致）
+	// H7：Redis 不可用时失败关闭付费探针——DB check-then-act 无原子性，
+	// 多实例/并发手动探测会突破预算，宁可跳过也不超支。
+	if s.budget == nil || !s.budget.Available() {
+		s.logger.Warn("Budget tracker unavailable, paid probe skipped (fail-closed)",
+			zap.String("channel", sch.Name))
+		last["probe"] = now
+		return
+	}
+
+	// 估算单次探测成本并做原子预留（模型与 ProbeChannel 的选择一致）
 	probeModel := s.probe.ScheduledProbeModel(sch.Upstream)
 	estCost, err := s.probe.EstimateProbeCost(ctx, probeModel, 16, 16)
 	if err != nil {
@@ -456,35 +522,54 @@ func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, g
 		return
 	}
 	estimateCents := checker.ToCentsForBudget(estCost)
-	reserved := false
-	if s.budget != nil && s.budget.Available() {
-		ok, rerr := s.budget.Reserve(ctx, sch.ID, estimateCents,
-			checker.ToCentsForBudget(sch.EffectiveBudget),
-			checker.ToCentsForBudget(s.cfg.Checker.DailyProbeBudget))
-		if rerr != nil {
-			s.logger.Warn("Budget reservation failed, probe skipped", zap.String("channel", sch.Name), zap.Error(rerr))
-			last["probe"] = now
-			return
-		}
-		if !ok {
-			s.logger.Info("Probe budget exhausted (concurrent reservations), skipped",
-				zap.String("channel", sch.Name),
-				zap.Float64("effective_budget", sch.EffectiveBudget))
-			last["probe"] = now
-			return
-		}
-		reserved = true
+	// C3：DB 当日已消费金额作为 Redis 键缺失时的播种基线
+	globalSpent, gerr := s.probe.TodaySpent(ctx)
+	if gerr != nil {
+		s.logger.Warn("Failed to read global probe spending; probe skipped", zap.Error(gerr))
+		last["probe"] = now
+		return
 	}
+	globalSpentCents := checker.ToCentsForBudget(globalSpent)
+	channelSpentCents := checker.ToCentsForBudget(upstreamSpent)
+	reserved := false
+	ok, rerr := s.budget.Reserve(ctx, sch.ID, estimateCents,
+		checker.ToCentsForBudget(sch.EffectiveBudget),
+		checker.ToCentsForBudget(s.cfg.Checker.DailyProbeBudget),
+		channelSpentCents, globalSpentCents)
+	if rerr != nil {
+		s.logger.Warn("Budget reservation failed, probe skipped", zap.String("channel", sch.Name), zap.Error(rerr))
+		last["probe"] = now
+		return
+	}
+	if !ok {
+		s.logger.Info("Probe budget exhausted (concurrent reservations), skipped",
+			zap.String("channel", sch.Name),
+			zap.Float64("effective_budget", sch.EffectiveBudget))
+		last["probe"] = now
+		return
+	}
+	reserved = true
 
 	// 执行探测
-	res, err := s.probe.ProbeChannel(ctx, sch.Upstream, s.epoch)
+	res, err := s.probe.ProbeChannel(ctx, sch.Upstream, s.pendingEpoch)
 	if reserved {
-		// 结算：实际成本 - 预留估算（失败全额退款）
+		// 结算：实际成本 - 预留估算（失败全额退款）。
+		// C5：余额后读取失败（CostPending）时保留预留不退款——
+		// 聊天已成功、上游可能已扣费，退款会让账目凭空少记一笔。
 		actualCents := int64(0)
 		if res != nil && res.Cost > 0 {
 			actualCents = checker.ToCentsForBudget(res.Cost)
 		}
-		s.budget.Adjust(ctx, sch.ID, actualCents-estimateCents)
+		if res != nil && res.CostPending {
+			actualCents = estimateCents // 保留预留
+		}
+		// H8：结算失败必须告警并保守处置——补扣失败意味着 Redis 少记消费，
+		// 立即失败关闭本 tick 剩余探测（globalBudgetLeft 清零），防预算继续超支。
+		if aerr := s.budget.Adjust(ctx, sch.ID, actualCents-estimateCents); aerr != nil {
+			s.logger.Error("Budget adjustment failed; paid probes disabled for this tick",
+				zap.Int64("channel_id", int64(sch.ID)), zap.Error(aerr))
+			*globalBudgetLeft = 0
+		}
 	}
 	if err != nil {
 		last["probe_failed"] = now

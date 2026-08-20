@@ -92,6 +92,9 @@ type ProbeResult struct {
 	CompletionTokens   int     `json:"completion_tokens"`
 	Stage              string  `json:"stage,omitempty"` // balance_before | chat | balance_after | ok（失败阶段）
 	Error              string  `json:"error,omitempty"`
+	// CostPending 聊天已成功但余额后读取失败、无法结算真实费用。
+	// 调用方（预算记账）必须保留预留金额而非全额退款（C5）。
+	CostPending bool `json:"cost_pending,omitempty"`
 }
 
 // 计价基准常量（probe_results.basis）
@@ -346,6 +349,17 @@ func (p *ProbeChecker) probeOne(ctx context.Context, upstream Upstream, epoch in
 	start := time.Now()
 	res := &ProbeResult{Model: model}
 
+	// H9：余额差值法依赖「余额前 → 聊天 → 余额后」期间该站点没有
+	// 其它扣费发生。用按站点粒度的 PostgreSQL advisory lock 串行化
+	// 跨进程探测（定时 + 手动 + 多实例），防止并发探测互相污染
+	// 成本/倍率。锁键段 9000000000+，与迁移/Telegram 锁键段区分。
+	unlock, err := p.acquireProbeLock(ctx, upstream.ID)
+	if err != nil {
+		res.Error = "获取探测锁失败"
+		return res, fmt.Errorf("acquire probe lock: %w", err)
+	}
+	defer unlock()
+
 	// 1. 读取余额前
 	res.Stage = "balance_before"
 	balanceBefore, err := p.getBalance(ctx, upstream)
@@ -371,11 +385,21 @@ func (p *ProbeChecker) probeOne(ctx context.Context, upstream Upstream, epoch in
 	}
 
 	// 3. 读取余额后
+	// C5：聊天已成功（上游可能已扣费）但余额后读取失败时，绝不能
+	// 把 Cost 记为 0 全额退款——否则下一次重试会重复扣费且账目为零。
+	// 标记 CostPending，调用方保留预留金额；同时落失败记录（不携带
+	// cost 数值，DB 汇总闸门不计入，Redis 账上保留预留即保守正确）。
 	res.Stage = "balance_after"
 	balanceAfter, err := p.getBalance(ctx, upstream)
 	if err != nil {
 		res.Error = fmt.Sprintf("读取余额失败: %v", err)
-		return res, fmt.Errorf("get balance after: %w", err)
+		res.CostPending = true
+		_, _ = p.db.Pool.Exec(ctx, `
+			INSERT INTO probe_results (
+				upstream_id, epoch, model, success, source, checked_at
+			) VALUES ($1, $2, $3, false, $4, NOW())
+		`, upstream.ID, epoch, model, source)
+		return res, fmt.Errorf("get balance after (cost pending): %w", err)
 	}
 	res.BalanceAfter = balanceAfter
 
@@ -429,6 +453,33 @@ func (p *ProbeChecker) probeOne(ctx context.Context, upstream Upstream, epoch in
 	)
 
 	return res, nil
+}
+
+// probeLockBase 按站点探测互斥锁的键段基址（H9）：
+// 与迁移 746213081、Telegram 746213082/83、告警 746213084 区分。
+const probeLockBase = int64(9000000000)
+
+// acquireProbeLock 获取站点级探测 advisory lock（会话级，连接断开自动释放）。
+// 持锁连接在探测序列（余额前→聊天→余额后）期间独占，防并发扣费串扰。
+func (p *ProbeChecker) acquireProbeLock(ctx context.Context, upstreamID int) (func(), error) {
+	if p.db == nil || p.db.Pool == nil {
+		return func() {}, nil // 无 DB（测试环境）：退化为无锁
+	}
+	conn, err := p.db.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, probeLockBase+int64(upstreamID)); err != nil {
+		conn.Release()
+		return nil, err
+	}
+	return func() {
+		// 解锁用独立超时上下文，避免探测 ctx 已取消时锁泄漏到连接归还
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(unlockCtx, `SELECT pg_advisory_unlock($1)`, probeLockBase+int64(upstreamID))
+		conn.Release()
+	}, nil
 }
 
 // getBalance 读取站点余额（复用 BalanceChecker 的多协议探测：

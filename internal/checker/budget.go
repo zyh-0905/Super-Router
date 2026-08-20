@@ -14,7 +14,7 @@ import (
 // BudgetTracker 每日探针预算的 Redis 原子记账（P1-06）。
 // 按 UTC 日期分桶，定时探针（checker）与手动探测（ratio 接口）共享同一组密钥，
 // 通过 Lua 原子预留/结算，防止并发探测 check-then-act 导致预算超支。
-// Redis 不可用时调用方应回退到数据库汇总检查（无原子性保证）。
+// Redis 不可用时调用方必须失败关闭付费探针（不再退化为无原子性的 DB 检查）。
 type BudgetTracker struct {
 	redis *store.RedisClient
 }
@@ -31,10 +31,19 @@ func (b *BudgetTracker) Available() bool {
 const budgetKeyTTLSeconds = 172800 // 48h：跨时区自然日边界安全
 
 // budgetReserveScript 原子预留：渠道与全局两个计数器同时不超过预算才成功。
+// 键不存在时以数据库当日已消费金额播种（C3）：Redis 重启/清空后
+// 计数不会从 0 起算，与 DB 对账保持一致，防止预算被绕过。
 var budgetReserveScript = redis.NewScript(`
 local ch = tonumber(redis.call('get', KEYS[1]) or '0')
 local gl = tonumber(redis.call('get', KEYS[2]) or '0')
 local r = tonumber(ARGV[1])
+-- 键不存在：用 DB 已消费值播种（ARGV[4]/ARGV[5] 为分单位）
+if not redis.call('exists', KEYS[1]) then
+	ch = tonumber(ARGV[4])
+end
+if not redis.call('exists', KEYS[2]) then
+	gl = tonumber(ARGV[5])
+end
 if ch + r > tonumber(ARGV[2]) or gl + r > tonumber(ARGV[3]) then
 	return 0
 end
@@ -76,14 +85,16 @@ func ToCentsForBudget(usd float64) int64 {
 
 // Reserve 按估算成本预留预算（单位：美元金额由调用方转为分）。
 // estimateCents/channelBudgetCents/globalBudgetCents 均为“分”。
+// channelSpentCents/globalSpentCents 为 DB 汇总的当日已消费金额（分），
+// 用于 Redis 键缺失时播种对账（C3）。
 // 返回 true 表示预留成功；false 表示预算不足或并发占用。
-func (b *BudgetTracker) Reserve(ctx context.Context, channelID int, estimateCents, channelBudgetCents, globalBudgetCents int64) (bool, error) {
+func (b *BudgetTracker) Reserve(ctx context.Context, channelID int, estimateCents, channelBudgetCents, globalBudgetCents, channelSpentCents, globalSpentCents int64) (bool, error) {
 	if !b.Available() {
 		return false, fmt.Errorf("redis unavailable")
 	}
 	chKey, glKey := budgetKeys(channelID)
 	n, err := budgetReserveScript.Run(ctx, b.redis.Client, []string{chKey, glKey},
-		estimateCents, channelBudgetCents, globalBudgetCents).Int()
+		estimateCents, channelBudgetCents, globalBudgetCents, channelSpentCents, globalSpentCents).Int()
 	if err != nil {
 		return false, err
 	}
@@ -91,10 +102,13 @@ func (b *BudgetTracker) Reserve(ctx context.Context, channelID int, estimateCent
 }
 
 // Adjust 结算实际成本差值（actualCents - reservedCents），可为负（退款）。
-func (b *BudgetTracker) Adjust(ctx context.Context, channelID int, deltaCents int64) {
+// 返回错误供调用方处理（H8）：补扣失败时调用方必须保守处置后续探针，
+// 不允许静默吞掉导致 Redis 永久少记消费。
+func (b *BudgetTracker) Adjust(ctx context.Context, channelID int, deltaCents int64) error {
 	if !b.Available() {
-		return
+		return fmt.Errorf("redis unavailable")
 	}
 	chKey, glKey := budgetKeys(channelID)
-	_, _ = budgetAdjustScript.Run(ctx, b.redis.Client, []string{chKey, glKey}, deltaCents).Result()
+	_, err := budgetAdjustScript.Run(ctx, b.redis.Client, []string{chKey, glKey}, deltaCents).Result()
+	return err
 }

@@ -468,29 +468,42 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		return gin.H{"error": "今日探测预算已用完", "remaining_budget": round2(math.Min(remainingGlobal, remainingChannel))}, 429
 	}
 	tracker := checker.NewBudgetTracker(h.redis)
+	// H7：Redis 不可用时失败关闭付费探测（DB 检查无原子性，会突破预算）
+	if !tracker.Available() {
+		return gin.H{"error": "预算服务不可用，探测已取消"}, 500
+	}
 	reserved := false
 	var res *checker.ProbeResult
-	if tracker.Available() {
-		ok, rerr := tracker.Reserve(ctx, channelID,
-			checker.ToCentsForBudget(reserve),
-			checker.ToCentsForBudget(effectiveBudget),
-			checker.ToCentsForBudget(globalBudget))
-		if rerr != nil {
-			return gin.H{"error": "预算预留失败，探测已取消"}, 500
-		}
-		if !ok {
-			return gin.H{"error": "今日探测预算已用完（并发探测占用中）", "remaining_budget": round2(math.Min(remainingGlobal, remainingChannel))}, 429
-		}
-		reserved = true
+	ok, rerr := tracker.Reserve(ctx, channelID,
+		checker.ToCentsForBudget(reserve),
+		checker.ToCentsForBudget(effectiveBudget),
+		checker.ToCentsForBudget(globalBudget),
+		checker.ToCentsForBudget(upstreamSpent), // C3：DB 已消费播种
+		checker.ToCentsForBudget(globalSpent))
+	if rerr != nil {
+		return gin.H{"error": "预算预留失败，探测已取消"}, 500
 	}
-	// 探测结束后按实际成本结算（失败全额退款；成功分支结算实际成本）
+	if !ok {
+		return gin.H{"error": "今日探测预算已用完（并发探测占用中）", "remaining_budget": round2(math.Min(remainingGlobal, remainingChannel))}, 429
+	}
+	reserved = true
+	// 探测结束后按实际成本结算（失败全额退款；成功分支结算实际成本）。
+	// C5：余额后读取失败（CostPending）时保留预留不退款——
+	// 聊天已成功、上游可能已扣费，退款会让账目凭空少记一笔。
+	// H8：结算失败记日志（补扣失败会少记消费，需人工核查账目）。
 	defer func() {
 		if reserved {
 			actualCents := int64(0)
 			if res != nil && res.Cost > 0 {
 				actualCents = checker.ToCentsForBudget(res.Cost)
 			}
-			tracker.Adjust(ctx, channelID, actualCents-checker.ToCentsForBudget(reserve))
+			if res != nil && res.CostPending {
+				actualCents = checker.ToCentsForBudget(reserve)
+			}
+			if aerr := tracker.Adjust(ctx, channelID, actualCents-checker.ToCentsForBudget(reserve)); aerr != nil {
+				h.logger.Error("Manual probe budget adjustment failed; spending ledger may be under-counted",
+					zap.Int("channel_id", channelID), zap.Error(aerr))
+			}
 		}
 	}()
 

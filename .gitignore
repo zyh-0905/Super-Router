@@ -1,8 +1,9 @@
-# 编译产物
+# 编译产物（根目录锚定：不能裸写 checker/gateway/replay，
+# 否则会连带忽略 cmd/checker、internal/checker 等源码目录）
 bin/
-checker
-gateway
-replay
+/checker
+/gateway
+/replay
 
 # 前端依赖与构建产物
 web/node_modules/

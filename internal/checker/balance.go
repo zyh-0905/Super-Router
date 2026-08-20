@@ -198,6 +198,17 @@ func (b *BalanceChecker) fetchGeneric(ctx context.Context, url, credential strin
 		return 0, "", fmt.Errorf("非 JSON 响应")
 	}
 
+	// 0. Sub2API 等站点在令牌失效时返回 HTTP 200 + 业务错误码
+	//    （如 {"code":"INVALID_TOKEN"}）而非 401——识别为认证失败，
+	//    使 fetchWithAutoRetry 的重登逻辑能够触发（否则会话 JWT 过期后
+	//    会卡到 Redis TTL 自然过期才恢复）。
+	if code, ok := raw["code"].(string); ok {
+		switch strings.ToUpper(code) {
+		case "INVALID_TOKEN", "UNAUTHORIZED", "TOKEN_EXPIRED", "AUTH_FAILED":
+			return 0, "", fmt.Errorf("HTTP 401（业务错误码 %s，令牌已过期或无权限，请更新站点「余额接口令牌」，建议使用控制台生成的长期有效系统访问令牌）", code)
+		}
+	}
+
 	// 1. one-api 格式：data.quota / data.remain_quota（quota 单位）/ data.balance（美元）
 	if data, ok := raw["data"].(map[string]interface{}); ok {
 		for _, k := range []string{"quota", "remain_quota"} {
@@ -249,10 +260,13 @@ func (b *BalanceChecker) fetchGeneric(ctx context.Context, url, credential strin
 	return 0, "", fmt.Errorf("响应中未找到余额字段")
 }
 
-// 单位换算：new-api 口径 1 美元 = 500,000 quota。
-// 部分部署直接返回美元数值，接口无法区分单位，因此采用启发式：
-// 数值高于阈值视为 quota 单位 → ÷500,000；低于阈值视为已是美元。
-// （个人中转账户的美元余额通常在 $0.1~$100，quota 数值通常在 25 万以上，阈值落在两者之间。）
+// 单位换算：new-api 标准口径 1 美元 = 500,000 quota。
+// 但部分中转站（Sub2API 等）在自己的 auth/me 里直接用「美元数值」
+// 填充 quota 字段，接口无法从字段名区分单位，只能启发式：
+// 高于阈值的视为 quota → ÷500,000；低于阈值的视为已是美元。
+// 站点实测值可同时覆盖两个区间（如 24.65 与 0.67 均为真实美元），
+// 阈值取在两区间之间；个别站点若偏离该启发式，可在站点「余额接口」
+// 配置中换用返回明确 balance 字段的接口。
 const (
 	quotaPerUSD         = 500000.0
 	quotaToUSDThreshold = 100000.0

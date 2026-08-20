@@ -2,11 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"smart-router/internal/config"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -65,6 +67,33 @@ func (db *DB) IncrementEpoch(ctx context.Context) (int64, error) {
 		RETURNING current_epoch
 	`).Scan(&epoch)
 	return epoch, err
+}
+
+// PeekNextEpoch 读取下一个工作 epoch（不发布）。
+// H11：探测结果以工作 epoch 写入，整轮完成后由 PublishEpoch 发布；
+// 发布前快照读取端（WHERE epoch <= current）看不到任何本轮数据。
+func (db *DB) PeekNextEpoch(ctx context.Context) (int64, error) {
+	var epoch int64
+	err := db.Pool.QueryRow(ctx, `
+		SELECT current_epoch + 1 FROM epoch_counter WHERE id = 1
+	`).Scan(&epoch)
+	return epoch, err
+}
+
+// PublishEpoch 条件发布工作 epoch：只向前推进（幂等）。
+// 返回 (是否发布, error)。多实例并发发布同一值只有一个生效。
+func (db *DB) PublishEpoch(ctx context.Context, epoch int64) (bool, error) {
+	var published int64
+	err := db.Pool.QueryRow(ctx, `
+		UPDATE epoch_counter
+		SET current_epoch = $1, updated_at = NOW()
+		WHERE id = 1 AND current_epoch < $1
+		RETURNING current_epoch
+	`, epoch).Scan(&published)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil // 已有其它实例发布过 ≥ epoch
+	}
+	return err == nil, err
 }
 
 // GetCurrentEpoch 获取当前 epoch
