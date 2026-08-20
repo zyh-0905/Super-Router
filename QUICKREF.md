@@ -19,7 +19,7 @@ docker compose -p smart-router ps
 docker compose -p smart-router logs -f gateway checker
 ```
 
-打开 <http://localhost:8080/>。Checker 没有宿主机端口，启动后会按配置自动执行存活、价格、推理探针和余额检测；失败的推理探针默认退避 6 小时后重试。
+打开 <http://localhost:8080/>。Checker 没有宿主机端口（容器内有 8081 存活端点供 healthcheck 探活），启动后会按配置自动执行存活、价格、推理探针和余额检测；失败的推理探针默认退避 6 小时后重试。
 
 本地源码开发（可选）：安装 Go 1.26+ 和 Node.js 24+ 后，使用 `npm ci && npm run build`、`go build`，再按 README 的本地开发命令启动。
 
