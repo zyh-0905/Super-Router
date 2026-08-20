@@ -7,6 +7,7 @@ import ConfirmDialog from '../components/ConfirmDialog.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Icon from '../components/Icon.vue'
 import { fmtDate } from '../utils'
+import { telegramTokenUpdatePayload, normalizeTelegramSubscriberChat } from '../telegram'
 
 // 开发环境标识（模板中 import.meta 表达式不可用，统一在此取值）
 const isDev = import.meta.env.DEV
@@ -254,14 +255,21 @@ const tgConfig = ref(null)         // 服务端脱敏配置（无完整 Token）
 const tgTokenDraft = ref('')       // 密码输入框草稿（仅 PATCH 时发送，不存 store）
 const tgSaving = ref(false)
 const tgTesting = ref(false)
+const tgTestSendingIds = ref(new Set())
 const tgSubscribers = ref([])
 const tgSubsLoading = ref(false)
 const showSubModal = ref(false)
 const editingSub = ref(null)       // null = 新建
-const subForm = ref({ chat_id: '', display_name: '', enabled: true, alert_enabled: true, query_enabled: true, group_ids: [] })
+const subForm = ref({ chat_id: '', chat_type: 'auto', display_name: '', enabled: true, alert_enabled: true, query_enabled: true, group_ids: [] })
 const savingSub = ref(false)
 const confirmDeleteSub = ref(null)
 const tgDeliveryLogs = ref([])
+const telegramChatTypeLabels = {
+  private: '私人会话',
+  group: '群组',
+  supergroup: '超级群组',
+  channel: '频道',
+}
 
 async function loadTelegram() {
   try {
@@ -289,7 +297,8 @@ async function saveTelegram() {
       include_ongoing: tgConfig.value.include_ongoing,
       web_base_url: (tgConfig.value.web_base_url || '').trim(),
     }
-    if (tgTokenDraft.value) payload.bot_token = tgTokenDraft.value
+    const tokenPayload = telegramTokenUpdatePayload(tgTokenDraft.value)
+    if (tokenPayload) Object.assign(payload, tokenPayload)
     await api.updateTelegramConfig(payload)
     tgTokenDraft.value = '' // 保存成功后清空草稿，表单不保留完整 Token
     toast('Telegram 配置已保存', 'success')
@@ -302,11 +311,10 @@ async function testTelegram() {
   tgTesting.value = true
   try {
     // 保存草稿 Token（若已填写）后调用 getMe 验证；验证结果即时反馈
-    const payload = {}
-    if (tgTokenDraft.value) payload.bot_token = tgTokenDraft.value
-    await api.updateTelegramConfig(payload)
+    const tokenPayload = telegramTokenUpdatePayload(tgTokenDraft.value)
+    if (tokenPayload) await api.updateTelegramConfig(tokenPayload)
     try {
-      const r = await api.testTelegramConnection(tgTokenDraft.value ? { bot_token: tgTokenDraft.value } : {})
+      const r = await api.testTelegramConnection(tokenPayload || {})
       toast(r.message || 'Bot Token 有效', 'success')
       tgTokenDraft.value = ''
     } catch {
@@ -317,28 +325,57 @@ async function testTelegram() {
   finally { tgTesting.value = false }
 }
 
+
+function markTelegramTestSending(id, sending) {
+  const next = new Set(tgTestSendingIds.value)
+  if (sending) next.add(id)
+  else next.delete(id)
+  tgTestSendingIds.value = next
+}
+
+async function testSubscriber(s) {
+  const id = Number(s && s.id)
+  if (!Number.isInteger(id) || id <= 0 || tgTestSendingIds.value.has(id)) return
+  markTelegramTestSending(id, true)
+  try {
+    const result = await api.sendTelegramSubscriberTest(id)
+    toast((result && result.message) || '测试消息已发送', 'success')
+  } catch {
+    // API client already displays the error toast.
+  } finally {
+    markTelegramTestSending(id, false)
+  }
+}
+
 function openSubModal(s) {
   editingSub.value = s || null
   subForm.value = s
     ? {
         chat_id: String(s.chat_id),
+        chat_type: s.chat_type || 'auto',
         display_name: s.display_name || '',
         enabled: s.enabled,
         alert_enabled: s.alert_enabled,
         query_enabled: s.query_enabled,
         group_ids: [...(s.group_ids || [])],
       }
-    : { chat_id: '', display_name: '', enabled: true, alert_enabled: true, query_enabled: true, group_ids: [] }
+    : { chat_id: '', chat_type: 'auto', display_name: '', enabled: true, alert_enabled: true, query_enabled: true, group_ids: [] }
   showSubModal.value = true
 }
 
 async function saveSubscriber() {
-  const chatID = Number(subForm.value.chat_id)
-  if (!Number.isInteger(chatID) || chatID <= 0) { toast('Chat ID 必须为正整数', 'error'); return }
+  let normalizedChat
+  try {
+    normalizedChat = normalizeTelegramSubscriberChat(subForm.value.chat_id, subForm.value.chat_type)
+  } catch (error) {
+    toast(error.message, 'error')
+    return
+  }
   savingSub.value = true
   try {
     const payload = {
-      chat_id: chatID,
+      chat_id: normalizedChat.chat_id,
+      chat_type: normalizedChat.chat_type,
       display_name: subForm.value.display_name,
       enabled: subForm.value.enabled,
       alert_enabled: subForm.value.alert_enabled,
@@ -638,11 +675,12 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
         <EmptyState v-else-if="!tgSubscribers.length" icon="bell" title="暂无订阅者" desc="添加 Chat ID 后，每小时告警汇总将推送给对应账号" style="padding:26px 0" />
         <div v-else class="table-wrap">
           <table>
-            <thead><tr><th scope="col">名称</th><th scope="col">Chat ID</th><th scope="col">告警推送</th><th scope="col">查询权限</th><th scope="col">分组范围</th><th scope="col">最近发送</th><th scope="col" style="width:130px"><span class="sr-only">操作</span></th></tr></thead>
+            <thead><tr><th scope="col">名称</th><th scope="col">Chat ID</th><th scope="col">类型</th><th scope="col">告警推送</th><th scope="col">查询权限</th><th scope="col">分组范围</th><th scope="col">最近发送</th><th scope="col" style="width:235px"><span class="sr-only">操作</span></th></tr></thead>
             <tbody>
               <tr v-for="s in tgSubscribers" :key="s.id">
                 <td data-label="名称">{{ s.display_name || '—' }}</td>
                 <td class="mono" data-label="Chat ID">{{ s.chat_id }}</td>
+                <td data-label="类型"><span class="badge badge-gray">{{ telegramChatTypeLabels[s.chat_type] || s.chat_type }}</span></td>
                 <td data-label="告警推送"><span class="badge" :class="s.alert_enabled ? 'badge-green' : 'badge-gray'">{{ s.alert_enabled ? '开启' : '关闭' }}</span></td>
                 <td data-label="查询权限"><span class="badge" :class="s.query_enabled ? 'badge-teal' : 'badge-gray'">{{ s.query_enabled ? '允许' : '禁止' }}</span></td>
                 <td data-label="分组范围">
@@ -654,6 +692,15 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
                 <td class="mono text-3" data-label="最近发送">{{ s.last_sent_at ? fmtDate(s.last_sent_at) : '—' }}</td>
                 <td class="row gap-1" style="justify-content:flex-end">
                   <button class="btn btn-ghost btn-sm" @click="toggleSubEnabled(s)">{{ s.enabled ? '停用' : '启用' }}</button>
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    :disabled="tgTestSendingIds.has(s.id)"
+                    :aria-label="'向 ' + s.chat_id + ' 发送测试消息'"
+                    @click="testSubscriber(s)"
+                  >
+                    <Icon name="send" :size="12" />
+                    <span>{{ tgTestSendingIds.has(s.id) ? '发送中' : '测试' }}</span>
+                  </button>
                   <button class="btn btn-ghost btn-sm" @click="openSubModal(s)"><Icon name="pencil" :size="12" /></button>
                   <button class="btn btn-ghost btn-sm" :aria-label="'删除 ' + s.chat_id" @click="askDeleteSub(s)"><Icon name="trash" :size="12" /></button>
                 </td>
@@ -757,8 +804,19 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
     <BaseModal v-if="showSubModal" :title="editingSub ? '编辑订阅者' : '添加订阅者'" width="440px" @close="showSubModal = false">
       <div class="field">
         <label class="field-label">Chat ID *</label>
-        <input v-model="subForm.chat_id" class="input mono" placeholder="如 123456789" :disabled="!!editingSub">
+        <input v-model="subForm.chat_id" class="input mono" placeholder="如 123456789 或 -1001234567890" :disabled="!!editingSub">
         <div class="field-hint">发消息给 Bot（如 /start）后，在 Telegram 中无法直接查看 ID；可先用其他 Bot 工具获取。</div>
+      </div>
+      <div class="field">
+        <label class="field-label">会话类型</label>
+        <select v-model="subForm.chat_type" class="input">
+          <option value="auto">自动判断</option>
+          <option value="private">私人会话</option>
+          <option value="group">群组</option>
+          <option value="supergroup">超级群组</option>
+          <option value="channel">频道</option>
+        </select>
+        <div class="field-hint">正数 ID 自动识别为私聊；负数 ID 自动识别为群组，-100 开头默认为超级群组。频道请手动选择。</div>
       </div>
       <div class="field">
         <label class="field-label">显示名称</label>

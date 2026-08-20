@@ -148,6 +148,10 @@ web/
 - **默认关闭**：升级后不主动访问 Telegram；在「设置 → Telegram 告警」保存 Bot Token 并开启后，checker 进程开始长轮询并按小时整点发送告警汇总
 - **安全边界**：Bot Token 通过应用层加密（enc:v1: 信封）入库，页面只回显「已配置 + 尾号」；Token 不进入前端 store / localStorage / 日志 / Telegram 消息
 - **订阅者管理**：Chat ID 只能由管理员在后台手动录入（不开放 /start 自助绑定）；可分别控制告警推送与查询权限，并可限定分组范围（空 = 全部）
+- **订阅者类型**：支持 private、group、supergroup、channel；正数 ID 自动识别为 private，负数 ID 自动识别为 group 或 supergroup，频道可在表单中显式选择；类型和 Chat ID 符号不匹配时拒绝保存。
+- **群组配置**：将 Bot 加入群组后，在 checker 暂停期间发送 /start@BotUsername，通过 getUpdates 获取 message.chat.id，再在订阅者表单填写负数 ID；保存后重启 checker。
+- **单订阅者测试**：订阅者列表操作列提供「测试」按钮，发送到当前订阅者并显示发送中状态；对应接口为 POST /admin/telegram/subscribers/:id/test。
+
 - **查询命令**：`/alerts` `/alert <key>` `/status` `/relay [id]` `/balance [id]` `/health [id]` `/ratio [id]`——全部只读数据库，不触发上游调用；未授权 Chat ID 统一拒绝
 - **发送状态**：设置页显示最近轮询/汇总/错误；「告警」页显示 Telegram 状态并可立即发送当前汇总（只触发一次，不改变调度）
 - **`/quality <id>`**：查询最近一次接口质量检测摘要（各阶段状态/耗时），只读历史，不启动新检测

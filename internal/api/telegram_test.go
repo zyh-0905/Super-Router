@@ -115,3 +115,39 @@ func TestTelegramConfigResponseMasking(t *testing.T) {
 		t.Fatalf("configured flag missing: %s", s)
 	}
 }
+
+
+func TestNormalizeSubscriberChat(t *testing.T) {
+	tests := []struct {
+		name string
+		id int64
+		requested string
+		want string
+		wantErr bool
+	}{
+		{name: "positive auto private", id: 123456789, want: "private"},
+		{name: "negative auto group", id: -123456789, want: "group"},
+		{name: "negative one hundred auto supergroup", id: -1001234567890, want: "supergroup"},
+		{name: "explicit channel", id: -1001234567890, requested: "channel", want: "channel"},
+		{name: "zero rejected", id: 0, wantErr: true},
+		{name: "positive group mismatch", id: 123, requested: "group", wantErr: true},
+		{name: "negative private mismatch", id: -123, requested: "private", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeSubscriberChat(tt.id, tt.requested)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got type %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("type = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

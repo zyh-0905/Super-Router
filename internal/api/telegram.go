@@ -230,15 +230,33 @@ type subscriberRequest struct {
 	GroupIDs     []int  `json:"group_ids"`
 }
 
-// validateSubscriberRequest 订阅者字段校验（chat_id 非零整数；分组存在性由 DB 校验）。
-func validateSubscriberRequest(req subscriberRequest) error {
-	if req.ChatID <= 0 {
-		return fmt.Errorf("chat_id must be a positive integer")
+func normalizeSubscriberChat(chatID int64, requestedType string) (string, error) {
+	requestedType = strings.ToLower(strings.TrimSpace(requestedType))
+	if chatID == 0 {
+		return "", fmt.Errorf("chat_id must be non-zero")
 	}
-	if req.ChatType != "" && req.ChatType != "private" && req.ChatType != "group" && req.ChatType != "channel" {
-		return fmt.Errorf("chat_type must be private, group or channel")
+	if requestedType == "" || requestedType == "auto" {
+		if chatID > 0 {
+			return "private", nil
+		}
+		if strings.HasPrefix(strconv.FormatInt(chatID, 10), "-100") {
+			return "supergroup", nil
+		}
+		return "group", nil
 	}
-	return nil
+
+	switch requestedType {
+	case "private", "group", "supergroup", "channel":
+	default:
+		return "", fmt.Errorf("chat_type must be auto, private, group, supergroup or channel")
+	}
+	if requestedType == "private" && chatID < 0 {
+		return "", fmt.Errorf("private chat_id must be positive")
+	}
+	if requestedType != "private" && chatID > 0 {
+		return "", fmt.Errorf("%s chat_id must be negative", requestedType)
+	}
+	return requestedType, nil
 }
 
 // ListSubscribers GET /admin/telegram/subscribers。
@@ -304,13 +322,12 @@ func (h *TelegramHandler) CreateSubscriber(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if err := validateSubscriberRequest(req); err != nil {
+	normalizedType, err := normalizeSubscriberChat(req.ChatID, req.ChatType)
+	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if req.ChatType == "" {
-		req.ChatType = "private"
-	}
+	req.ChatType = normalizedType
 	// 校验分组存在且启用（group_ids 允许为空 = 全部）
 	if err := h.validateGroupIDs(c, req.GroupIDs); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -320,7 +337,7 @@ func (h *TelegramHandler) CreateSubscriber(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	var id int64
-	err := h.DB.Pool.QueryRow(ctx, `
+	err = h.DB.Pool.QueryRow(ctx, `
 		INSERT INTO telegram_subscribers (chat_id, chat_type, display_name, enabled, alert_enabled, query_enabled, group_ids)
 		VALUES ($1, $2, $3, COALESCE($4, true), COALESCE($5, true), COALESCE($6, true), $7)
 		RETURNING id
@@ -349,9 +366,21 @@ func (h *TelegramHandler) UpdateSubscriber(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if req.ChatID != 0 && req.ChatID < 0 {
-		c.JSON(400, gin.H{"error": "chat_id must be a positive integer"})
-		return
+	var normalizedType string
+	if req.ChatID != 0 || req.ChatType != "" {
+		effectiveChatID := req.ChatID
+		if effectiveChatID == 0 {
+			if err := h.DB.Pool.QueryRow(c.Request.Context(), `SELECT chat_id FROM telegram_subscribers WHERE id = $1`, id).Scan(&effectiveChatID); err != nil {
+				c.JSON(404, gin.H{"error": "subscriber not found"})
+				return
+			}
+		}
+		var normalizeErr error
+		normalizedType, normalizeErr = normalizeSubscriberChat(effectiveChatID, req.ChatType)
+		if normalizeErr != nil {
+			c.JSON(400, gin.H{"error": normalizeErr.Error()})
+			return
+		}
 	}
 	if req.GroupIDs != nil {
 		if err := h.validateGroupIDs(c, req.GroupIDs); err != nil {
@@ -369,9 +398,9 @@ func (h *TelegramHandler) UpdateSubscriber(c *gin.Context) {
 	}
 	if req.ChatID != 0 {
 		add("chat_id", req.ChatID)
-	}
-	if req.ChatType != "" {
-		add("chat_type", req.ChatType)
+		add("chat_type", normalizedType)
+	} else if req.ChatType != "" {
+		add("chat_type", normalizedType)
 	}
 	if req.DisplayName != "" {
 		add("display_name", req.DisplayName)

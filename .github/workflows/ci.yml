@@ -42,7 +42,7 @@ jobs:
       - name: eslint
         run: npm run lint
       - name: unit tests
-        run: npm run test:quality
+        run: npm test
       - name: build
         run: npm run build
       - name: npm audit (high+)

@@ -151,6 +151,25 @@ docker compose -p smart-router down
 | 分组过滤 | 订阅者 `group_ids=[]` 可查全部；非空时告警与查询只返回绑定分组内的站点 |
 | 安全 | 查询只读数据库不触发上游；Base URL 只显示域名；凭据不入消息/日志 |
 
+### 群组订阅者
+
+| 项 | 值 |
+|-----|-----|
+| Chat ID 类型 | 正数 = 私人会话；负数 = 群组/超级群组；-100 开头默认识别为超级群组；频道在 Web 中手动选择 |
+| 获取群组 ID | 暂停 checker → 群里发送 /start@BotUsername → 用 Bot API getUpdates 查看 message.chat.id → 重启 checker |
+| Web 配置 | 设置 → Telegram 告警 → 添加订阅者；填写负数 Chat ID，选择「自动判断」或对应类型 |
+| 单订阅者测试 | 订阅者列表中的「测试」按钮，调用 POST /admin/telegram/subscribers/:id/test |
+
+PowerShell 获取群组 ID（不要把 Bot Token 发到聊天或提交到仓库）：
+
+    docker compose -p smart-router stop checker
+    $token = Read-Host "请输入 Bot Token"
+    $updates = Invoke-RestMethod ("https://api.telegram.org/bot{0}/getUpdates" -f $token)
+    $updates | ConvertTo-Json -Depth 12
+    Remove-Variable token
+    docker compose -p smart-router start checker
+
+
 ## 🧪 接口质量检测速查
 
 | 项 | 值 |

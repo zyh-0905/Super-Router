@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint": "eslint src",
-    "test:quality": "node --test tests/quality.test.js"
+    "test:quality": "node --test tests/quality.test.js",
+    "test": "node --test tests/*.test.js"
   },
   "dependencies": {
     "echarts": "^6.1.0",

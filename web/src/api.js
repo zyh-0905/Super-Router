@@ -2,6 +2,7 @@
 // API 客户端 — 统一认证头、错误处理、连接状态维护
 // ============================================================
 import { store, toast } from './store'
+import { telegramSubscriberTestPath } from './telegram'
 
 function base() {
   return store.baseURL || '' // 空 = 同源（开发经 Vite 代理 / 生产由 Gateway 托管）
@@ -151,7 +152,7 @@ export const api = {
   createTelegramSubscriber: (p) => api.post('/admin/telegram/subscribers', p),
   updateTelegramSubscriber: (id, p) => api.patch(`/admin/telegram/subscribers/${id}`, p),
   deleteTelegramSubscriber: (id) => api.del(`/admin/telegram/subscribers/${id}`),
-  sendTelegramSubscriberTest: (id) => api.post(`/admin/telegram/subscribers/${id}/test`, {}),
+  sendTelegramSubscriberTest: (id) => api.post(telegramSubscriberTestPath(id), {}),
   getTelegramDeliveryLogs: () => api.get('/admin/telegram/delivery-logs'),
 
   // ===== API 接口质量检测 =====

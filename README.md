@@ -76,6 +76,10 @@
 - **主动查询命令**：`/alerts` `/alert <key>` `/status` `/relay [id]` `/balance [id]` `/health [id]` `/ratio [id]`——只读数据库，不触发上游调用；多实例部署由 PostgreSQL advisory lock 保证只有一个 poller/report owner
 - **订阅者与分组过滤**：Chat ID 由管理员在「设置 → Telegram 告警」手动录入，可分别控制告警推送/查询权限并限定分组范围；一个订阅者发送失败不影响其他订阅者，投递审计幂等重试
 - **安全边界**：Bot Token 加密存储（enc:v1: 信封），API 只回显「已配置 + 尾号」；Token 与上游凭据不进入前端 localStorage、Telegram 消息、质量结果 details 或日志
+- **订阅者类型**：支持私人会话、群组、超级群组和频道。正数 Chat ID 自动识别为私人会话；负数 ID 自动识别为群组，-100 开头默认识别为超级群组；频道可在 Web 中手动选择类型。
+- **单订阅者测试**：设置页的订阅者列表提供「测试」按钮，调用 POST /admin/telegram/subscribers/:id/test 向指定 Chat ID 发送测试消息；请求期间只锁定当前订阅者行。
+- **群组配置流程**：先将 Bot 加入群组，在 Checker 暂停时向群里发送 /start@BotUsername，再通过 Telegram Bot API 的 getUpdates 读取 message.chat.id；将负数 ID 填入设置页，选择「自动判断」或对应会话类型。保存后重启 checker，使命令轮询和定时汇总生效。
+
 
 ### 🖥 Web 控制台（Vue 3 + Vite）
 苹果风格、明暗双主题（跟随系统）、全真实数据：
