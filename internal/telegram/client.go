@@ -143,10 +143,11 @@ func (c *Client) GetMe(ctx context.Context) error {
 }
 
 // GetUpdates 长轮询（timeout 秒；响应立即返回时也可为 0）。
+// 同时接收消息与内联键盘回调（callback_query）。
 func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Duration) ([]Update, error) {
 	params := url.Values{}
 	params.Set("timeout", strconv.Itoa(int(timeout.Seconds())))
-	params.Set("allowed_updates", `["message"]`)
+	params.Set("allowed_updates", `["message","callback_query"]`)
 	if offset > 0 {
 		params.Set("offset", strconv.FormatInt(offset, 10))
 	}
@@ -163,75 +164,57 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 			} `json:"chat"`
 			Text string `json:"text"`
 		} `json:"message"`
+		CallbackQuery *struct {
+			ID      string `json:"id"`
+			Data    string `json:"data"`
+			Message *struct {
+				MessageID int64 `json:"message_id"`
+				Chat      struct {
+					ID int64 `json:"id"`
+				} `json:"chat"`
+			} `json:"message"`
+		} `json:"callback_query"`
 	}
 	if err := json.Unmarshal(ar.Result, &raws); err != nil {
 		return nil, fmt.Errorf("decode telegram updates: %w", err)
 	}
 	updates := make([]Update, 0, len(raws))
 	for _, r := range raws {
-		if r.Message == nil {
-			continue // 跳过非消息更新（allowed_updates 已过滤，双保险）
+		switch {
+		case r.CallbackQuery != nil:
+			cb := r.CallbackQuery
+			updates = append(updates, Update{
+				UpdateID:          r.UpdateID,
+				HasCallback:       true,
+				CallbackID:        cb.ID,
+				CallbackData:      cb.Data,
+				CallbackMessageID: cb.Message.MessageID,
+				CallbackChatID:    cb.Message.Chat.ID,
+			})
+		case r.Message != nil:
+			updates = append(updates, Update{
+				UpdateID: r.UpdateID,
+				ChatID:   r.Message.Chat.ID,
+				Text:     r.Message.Text,
+			})
 		}
-		updates = append(updates, Update{
-			UpdateID: r.UpdateID,
-			ChatID:   r.Message.Chat.ID,
-			Text:     r.Message.Text,
-		})
+		// 其余更新类型忽略（allowed_updates 已过滤，双保险）
 	}
 	return updates, nil
 }
 
-// SendMessage 发送 HTML 消息，返回 Telegram message_id。
-func (c *Client) SendMessage(ctx context.Context, chatID int64, html string) (int64, error) {
+// SendMessage 发送 HTML 消息（可携带内联键盘），返回 Telegram message_id。
+func (c *Client) SendMessage(ctx context.Context, chatID int64, html string, kb *InlineKeyboard) (int64, error) {
 	params := url.Values{}
 	params.Set("chat_id", strconv.FormatInt(chatID, 10))
 	params.Set("text", html)
 	params.Set("parse_mode", "HTML")
 	params.Set("disable_web_page_preview", "true")
+	applyInlineKeyboard(params, kb)
 
-	// sendMessage 需要 POST（文本经表单编码，与 GET 一致走 query 语义）
-	u := fmt.Sprintf("%s/bot%s/sendMessage", apiBaseURL, c.token)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewBufferString(params.Encode()))
+	ar, err := c.postForm(ctx, "sendMessage", params)
 	if err != nil {
-		return 0, fmt.Errorf("create sendMessage: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		// A4：同 do()——错误不得包含带 Token 的 URL
-		return 0, fmt.Errorf("telegram api unreachable: %s", sanitizeNetErr(err))
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, fmt.Errorf("read telegram response: %w", err)
-	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		secs := 30
-		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			if n, err := strconv.Atoi(ra); err == nil && n > 0 {
-				secs = n
-			}
-		}
-		return 0, &ErrRetryAfter{Seconds: secs, Err: fmt.Errorf("telegram 429")}
-	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, wrapTelegramAPIError(resp.StatusCode,
-			fmt.Errorf("telegram http %d: %s", resp.StatusCode, truncateStr(string(body), 300)))
-	}
-
-	var ar apiResponse
-	if err := json.Unmarshal(body, &ar); err != nil {
-		return 0, fmt.Errorf("decode telegram response: %w", err)
-	}
-	if !ar.OK {
-		return 0, wrapTelegramAPIError(ar.ErrorCode,
-			fmt.Errorf("telegram error %d: %s", ar.ErrorCode, truncateStr(ar.Description, 300)))
+		return 0, err
 	}
 	var result struct {
 		MessageID int64 `json:"message_id"`
@@ -240,6 +223,125 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, html string) (in
 		return 0, fmt.Errorf("decode telegram sendMessage result: %w", err)
 	}
 	return result.MessageID, nil
+}
+
+// EditMessageText 原位编辑消息文本与键盘（内联进度/回调响应用）。
+func (c *Client) EditMessageText(ctx context.Context, chatID int64, messageID int64, html string, kb *InlineKeyboard) error {
+	params := url.Values{}
+	params.Set("chat_id", strconv.FormatInt(chatID, 10))
+	params.Set("message_id", strconv.FormatInt(messageID, 10))
+	params.Set("text", html)
+	params.Set("parse_mode", "HTML")
+	params.Set("disable_web_page_preview", "true")
+	applyInlineKeyboard(params, kb)
+
+	_, err := c.postForm(ctx, "editMessageText", params)
+	return err
+}
+
+// SendChatAction 发送聊天状态（typing：命令处理期间显示「正在输入…」）。
+func (c *Client) SendChatAction(ctx context.Context, chatID int64, action string) error {
+	params := url.Values{}
+	params.Set("chat_id", strconv.FormatInt(chatID, 10))
+	params.Set("action", action)
+	_, err := c.postForm(ctx, "sendChatAction", params)
+	return err
+}
+
+// AnswerCallbackQuery 应答回调（关闭按钮上的 loading 动画）。
+func (c *Client) AnswerCallbackQuery(ctx context.Context, callbackID string) error {
+	params := url.Values{}
+	params.Set("callback_query_id", callbackID)
+	_, err := c.postForm(ctx, "answerCallbackQuery", params)
+	return err
+}
+
+// SetMyCommands 设置私聊命令菜单（编辑框的「/」菜单）。
+func (c *Client) SetMyCommands(ctx context.Context, commands []BotCommand) error {
+	payload, err := json.Marshal(commands)
+	if err != nil {
+		return fmt.Errorf("marshal bot commands: %w", err)
+	}
+	params := url.Values{}
+	params.Set("commands", string(payload))
+	_, err = c.postForm(ctx, "setMyCommands", params)
+	return err
+}
+
+// applyInlineKeyboard 把内联键盘序列化为 reply_markup.inline_keyboard 参数。
+func applyInlineKeyboard(params url.Values, kb *InlineKeyboard) {
+	if kb == nil || len(kb.Rows) == 0 {
+		return
+	}
+	rows := make([][]map[string]string, 0, len(kb.Rows))
+	for _, row := range kb.Rows {
+		if len(row) == 0 {
+			continue
+		}
+		buttons := make([]map[string]string, 0, len(row))
+		for _, b := range row {
+			if b.URL != "" {
+				buttons = append(buttons, map[string]string{"text": b.Text, "url": b.URL})
+			} else {
+				buttons = append(buttons, map[string]string{"text": b.Text, "callback_data": b.Data})
+			}
+		}
+		rows = append(rows, buttons)
+	}
+	if len(rows) == 0 {
+		return
+	}
+	markup, _ := json.Marshal(map[string]interface{}{"inline_keyboard": rows})
+	params.Set("reply_markup", string(markup))
+}
+
+// postForm POST 表单编码调用 Bot API，返回成功响应（ok=true 校验在内）。
+// 错误路径与 do() 同口径：429 → ErrRetryAfter；4xx → permanentError；不泄露 Token。
+func (c *Client) postForm(ctx context.Context, method string, params url.Values) (*apiResponse, error) {
+	u := fmt.Sprintf("%s/bot%s/%s", apiBaseURL, c.token, method)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewBufferString(params.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("create %s: %w", method, err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// A4：同 do()——错误不得包含带 Token 的 URL
+		return nil, fmt.Errorf("telegram api unreachable: %s", sanitizeNetErr(err))
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read telegram response: %w", err)
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		secs := 30
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			if n, err := strconv.Atoi(ra); err == nil && n > 0 {
+				secs = n
+			}
+		}
+		return nil, &ErrRetryAfter{Seconds: secs, Err: fmt.Errorf("telegram 429")}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, wrapTelegramAPIError(resp.StatusCode,
+			fmt.Errorf("telegram http %d: %s", resp.StatusCode, truncateStr(string(body), 300)))
+	}
+
+	var ar apiResponse
+	if err := json.Unmarshal(body, &ar); err != nil {
+		return nil, fmt.Errorf("decode telegram response: %w", err)
+	}
+	if !ar.OK {
+		return nil, wrapTelegramAPIError(ar.ErrorCode,
+			fmt.Errorf("telegram error %d: %s", ar.ErrorCode, truncateStr(ar.Description, 300)))
+	}
+	return &ar, nil
 }
 
 // truncateStr 截断错误文本，避免超长上游错误撑爆日志。

@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,15 @@ type fakeBotClient struct {
 	sendErr  error
 	lastMsg  string
 	meCalled bool
+
+	// 扩展协议调用记录
+	edited       map[int64][]string // messageID → 每次编辑的文本
+	editErr      error
+	actions      []string
+	callbacks    []string
+	menuCmds     []BotCommand
+	menuErr      error
+	lastKeyboard *InlineKeyboard // 最后一次发送携带的键盘
 }
 
 func (f *fakeBotClient) GetMe(ctx context.Context) error {
@@ -35,7 +45,7 @@ func (f *fakeBotClient) GetUpdates(ctx context.Context, offset int64, timeout ti
 	f.updates = nil // 已消费，避免无限循环
 	return out, nil
 }
-func (f *fakeBotClient) SendMessage(ctx context.Context, chatID int64, html string) (int64, error) {
+func (f *fakeBotClient) SendMessage(ctx context.Context, chatID int64, html string, kb *InlineKeyboard) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.sendErr != nil {
@@ -46,7 +56,41 @@ func (f *fakeBotClient) SendMessage(ctx context.Context, chatID int64, html stri
 	}
 	f.sent[chatID] = append(f.sent[chatID], html)
 	f.lastMsg = html
+	f.lastKeyboard = kb
 	return int64(len(f.sent[chatID])), nil
+}
+func (f *fakeBotClient) EditMessageText(ctx context.Context, chatID int64, messageID int64, html string, kb *InlineKeyboard) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.editErr != nil {
+		return f.editErr
+	}
+	if f.edited == nil {
+		f.edited = map[int64][]string{}
+	}
+	f.edited[messageID] = append(f.edited[messageID], html)
+	return nil
+}
+func (f *fakeBotClient) SendChatAction(ctx context.Context, chatID int64, action string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.actions = append(f.actions, action)
+	return nil
+}
+func (f *fakeBotClient) AnswerCallbackQuery(ctx context.Context, callbackID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callbacks = append(f.callbacks, callbackID)
+	return nil
+}
+func (f *fakeBotClient) SetMyCommands(ctx context.Context, commands []BotCommand) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.menuErr != nil {
+		return f.menuErr
+	}
+	f.menuCmds = append([]BotCommand(nil), commands...)
+	return nil
 }
 
 // fakeConfigStore 配置/订阅者/投递日志的内存实现。
@@ -97,8 +141,10 @@ func (f *fakeConfigStore) LogDelivery(ctx context.Context, l DeliveryLog) error 
 	f.logs = append(f.logs, l)
 	return nil
 }
-func (f *fakeConfigStore) MarkSubscriberFailure(ctx context.Context, subID int64, errMsg string) error { return nil }
-func (f *fakeConfigStore) MarkSubscriberSuccess(ctx context.Context, subID int64) error               { return nil }
+func (f *fakeConfigStore) MarkSubscriberFailure(ctx context.Context, subID int64, errMsg string) error {
+	return nil
+}
+func (f *fakeConfigStore) MarkSubscriberSuccess(ctx context.Context, subID int64) error { return nil }
 
 func TestShouldSendReport(t *testing.T) {
 	loc, _ := time.LoadLocation("Asia/Shanghai")
@@ -161,7 +207,7 @@ func TestWorkerReplyUnauthorized(t *testing.T) {
 	store := &fakeConfigStore{
 		cfg: Config{Enabled: true},
 		subscribers: []Subscriber{
-			{ID: 1, ChatID: 7, Enabled: true, AlertEnabled: true, QueryEnabled: true},
+			{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true},
 		},
 	}
 	bot := &fakeBotClient{}
@@ -189,7 +235,7 @@ func TestWorkerFailureDoesNotStopOthers(t *testing.T) {
 	store := &fakeConfigStore{
 		cfg: Config{Enabled: true},
 		subscribers: []Subscriber{
-			{ID: 1, ChatID: 7, Enabled: true, AlertEnabled: true, QueryEnabled: true},
+			{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true},
 		},
 	}
 	bot := &fakeBotClient{}
@@ -199,12 +245,11 @@ func TestWorkerFailureDoesNotStopOthers(t *testing.T) {
 
 	// 首次失败（连接错误），继续处理下一条
 	bot.sendErr = errors.New("network down")
-	err := w.sendToSubscriber(ctx, 7, "first")
-	if err == nil {
+	if _, err := w.sendToSubscriber(ctx, 7, "first", nil); err == nil {
 		t.Fatal("expected send error")
 	}
 	bot.sendErr = nil
-	if err := w.sendToSubscriber(ctx, 7, "second"); err != nil {
+	if _, err := w.sendToSubscriber(ctx, 7, "second", nil); err != nil {
 		t.Fatalf("second send after failure: %v", err)
 	}
 	if len(bot.sent[7]) != 1 {
@@ -216,7 +261,7 @@ func TestWorkerReportIdempotentPerWindow(t *testing.T) {
 	store := &fakeConfigStore{
 		cfg: Config{Enabled: true, ReportEnabled: true, ReportMinute: 0},
 		subscribers: []Subscriber{
-			{ID: 1, ChatID: 7, Enabled: true, AlertEnabled: true, QueryEnabled: true},
+			{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true},
 		},
 	}
 	bot := &fakeBotClient{}
@@ -236,4 +281,149 @@ func TestWorkerReportIdempotentPerWindow(t *testing.T) {
 	if len(bot.sent[7]) != 1 {
 		t.Fatalf("duplicate window send detected: %v", bot.sent[7])
 	}
+}
+
+// ===== 回调 / 打字状态 / 测试进度流 =====
+
+func TestWorkerTypingActionOnQueryCommands(t *testing.T) {
+	store := &fakeConfigStore{
+		cfg: Config{Enabled: true},
+		subscribers: []Subscriber{
+			{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true},
+		},
+	}
+	bot := &fakeBotClient{}
+	q := &fakeQueryService{results: map[string]string{"relay_list": "RELAYS"}}
+	cmds := NewCommandService(q)
+	cmds.SetSubscribers(store.subscribers)
+	w := NewWorker(store, bot, cmds, zapNop())
+
+	_ = w.handleUpdate(context.Background(), Update{UpdateID: 1, ChatID: 7, Text: "/relay"})
+	if len(bot.actions) != 1 || bot.actions[0] != ChatActionTyping {
+		t.Fatalf("actions = %v, want [typing]", bot.actions)
+	}
+	// 帮助命令不触发打字状态
+	_ = w.handleUpdate(context.Background(), Update{UpdateID: 2, ChatID: 7, Text: "/help"})
+	if len(bot.actions) != 1 {
+		t.Fatalf("actions = %v, want no extra typing for /help", bot.actions)
+	}
+}
+
+func TestWorkerCallbackAnswersAndEdits(t *testing.T) {
+	store := &fakeConfigStore{
+		cfg: Config{Enabled: true},
+		subscribers: []Subscriber{
+			{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true},
+		},
+	}
+	bot := &fakeBotClient{}
+	q := &fakeQueryService{results: map[string]string{"relay_detail": "DETAIL"}}
+	cmds := NewCommandService(q)
+	cmds.SetSubscribers(store.subscribers)
+	cmds.SetCallbackResponder(nil) // 让 Worker 提供实现
+	cmds.SetSubscribers(store.subscribers)
+	w := NewWorker(store, bot, cmds, zapNop())
+	cmds.SetCallbackResponder(w) // Worker 实现 EditCallbackMessage
+
+	err := w.handleUpdate(context.Background(), Update{
+		UpdateID: 10, HasCallback: true, CallbackID: "cb-1",
+		CallbackData: "cmd:/relay:19", CallbackChatID: 7, CallbackMessageID: 42,
+	})
+	if err != nil {
+		t.Fatalf("handleUpdate: %v", err)
+	}
+	if len(bot.callbacks) != 1 || bot.callbacks[0] != "cb-1" {
+		t.Fatalf("callbacks = %v, want [cb-1]", bot.callbacks)
+	}
+	if len(bot.edited[42]) != 1 || bot.edited[42][0] != "DETAIL" {
+		t.Fatalf("edited = %v, want message 42 edited to DETAIL", bot.edited)
+	}
+}
+
+func TestWorkerCallbackFallsBackToNewMessage(t *testing.T) {
+	store := &fakeConfigStore{
+		cfg: Config{Enabled: true},
+		subscribers: []Subscriber{
+			{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true},
+		},
+	}
+	bot := &fakeBotClient{}
+	q := &fakeQueryService{results: map[string]string{"relay_detail": "DETAIL"}}
+	cmds := NewCommandService(q)
+	cmds.SetSubscribers(store.subscribers)
+	w := NewWorker(store, bot, cmds, zapNop())
+	cmds.SetCallbackResponder(w)
+	bot.editErr = errors.New("edit failed")
+
+	err := w.handleUpdate(context.Background(), Update{
+		UpdateID: 10, HasCallback: true, CallbackID: "cb-1",
+		CallbackData: "cmd:/relay:19", CallbackChatID: 7, CallbackMessageID: 42,
+	})
+	if err != nil {
+		t.Fatalf("handleUpdate: %v", err)
+	}
+	if len(bot.sent[7]) != 1 || bot.sent[7][0] != "DETAIL" {
+		t.Fatalf("fallback message = %v", bot.sent[7])
+	}
+}
+
+func TestWorkerStartTestEditsInPlace(t *testing.T) {
+	store := &fakeConfigStore{
+		cfg: Config{Enabled: true},
+		subscribers: []Subscriber{
+			{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true},
+		},
+	}
+	bot := &fakeBotClient{}
+	runner := &fakeSiteTestRunner{runMsg: "FINAL-RESULT"}
+	cmds := NewCommandService(&fakeQueryService{results: map[string]string{}})
+	cmds.SetSiteTestRunner(runner)
+	cmds.SetAsyncSender(nil)
+	w := NewWorker(store, bot, cmds, zapNop())
+	cmds.SetAsyncSender(w)
+	cmds.SetSubscribers(store.subscribers)
+
+	tc := &StartTestContext{
+		ChatID: 7, ChannelID: 19, ChannelName: "247-claudemax",
+		Model: "claude-opus-4-8", UpstreamModel: "claude-opus-4-8",
+		MaxTokens: 64,
+		Sub:       Subscriber{ID: 1, ChatID: "7", Enabled: true, QueryEnabled: true},
+		Runner:    runner,
+	}
+	if err := w.StartTest(context.Background(), tc); err != nil {
+		t.Fatalf("StartTest: %v", err)
+	}
+	if len(bot.sent[7]) != 1 || !strings.Contains(bot.sent[7][0], "进行中") {
+		t.Fatalf("progress message = %v", bot.sent[7])
+	}
+	// 结果原位编辑：进度消息 ID = 第一条发送的消息 ID（异步 goroutine，轮询等待）
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if contains(bot.edited[1], "FINAL-RESULT") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("edited = %v, want final result in message 1", bot.edited)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestWorkerStartTestSendFailurePropagates(t *testing.T) {
+	store := &fakeConfigStore{cfg: Config{Enabled: true}}
+	bot := &fakeBotClient{sendErr: errors.New("network")}
+	w := NewWorker(store, bot, nil, zapNop())
+	tc := &StartTestContext{ChatID: 7, ChannelID: 19, ChannelName: "x", Model: "m", Runner: &fakeSiteTestRunner{runMsg: "R"}}
+	if err := w.StartTest(context.Background(), tc); err == nil {
+		t.Fatal("StartTest 发送失败必须返回错误")
+	}
+}
+
+func contains(list []string, substr string) bool {
+	for _, s := range list {
+		if strings.Contains(s, substr) {
+			return true
+		}
+	}
+	return false
 }

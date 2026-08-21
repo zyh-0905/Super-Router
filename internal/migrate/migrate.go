@@ -47,6 +47,7 @@ var canary = map[string]string{
 	"020_alert_telegram":         "SELECT to_regclass('public.alert_events') IS NOT NULL AND to_regclass('public.telegram_config') IS NOT NULL",
 	"021_quality_checks":         "SELECT to_regclass('public.quality_check_runs') IS NOT NULL AND to_regclass('public.quality_check_results') IS NOT NULL",
 	"022_retention_group_indexes": "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_request_history_group_time')",
+	"025_telegram_chat_id_text":  "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='telegram_subscribers' AND column_name='chat_id_num')",
 }
 
 // Up 执行所有未应用的 up 迁移（幂等、带锁、逐版本事务）。

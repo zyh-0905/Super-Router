@@ -83,7 +83,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 |-----|------|------|
 | 中转站类型 | `newapi` / `sub2api` / `custom` | 自动按「Base URL + 类型默认路径」补全余额接口：new-api → `/api/user/self`，sub2api → `/api/v1/auth/me?timezone=Asia%2FShanghai`；改 Base URL 时未手动改过的余额接口跟随更新 |
 | 接口协议 | `openai` / `anthropic` | anthropic 站点自动 OpenAI↔Anthropic 转换 + `x-api-key` 认证，对外仍是 OpenAI 接口；覆盖文本、多模态内容块与工具调用（双向） |
-| 默认测试模型 | 每站点独立 | 测试台选择站点后自动预填该模型；**定时推理探针也用它**（未配置回退全局 `probe_model`） |
+| 默认测试模型 | 每站点独立 | 测试台（分组/站点测试）选择站点后自动预填该模型；**定时推理探针也用它**（未配置回退全局 `probe_model`） |
 | 余额自动登录 | 仅 sub2api 显示 | 填邮箱+密码后 checker 自动登录换会话令牌查余额，免手动抓包；令牌 Redis 缓存、401 自动重登 |
 
 ## 📐 路由数据口径
@@ -143,7 +143,9 @@ docker compose -p smart-router down
 |-----|-----|
 | 默认状态 | **关闭**（`telegram_config.enabled=false`），开启后由 checker 长轮询 + 每小时整点汇总 |
 | 配置入口 | Web「设置 → Telegram 告警」（Bot Token 加密保存，页面只显示尾号）；订阅者只能后台手动录入 |
-| 查询命令 | `/start` `/help` `/alerts [critical]` `/alert <alert_key>` `/status` `/relay [id]` `/balance [id]` `/health [id]` `/ratio [id]` |
+| 查询命令 | `/start` `/help` `/alerts [critical]` `/alert <alert_key>` `/status` `/relay [id]` `/balance [id]` `/health [id]` `/ratio [id]` `/quality <id>` `/sitetest <id> [模型] [max_tokens]` |
+| 站点直达测试 | `/sitetest` = 测试台「站点测试」同款（非流式+流式各一次真实推理，TTFT/延迟/余额差/实测倍率）；模型默认站点 test_model，max_tokens 默认 128（上限 512）；结果异步推送，可能产生少量上游费用，受订阅者分组授权约束 |
+| 交互体验 | 私聊「/」命令菜单自动维护；查询显示「正在输入…」；内联键盘（站点列表直达详情 / 告警严重过滤 / 详情页一键测试）；/sitetest 进度消息原位更新为结果 + 「🔁 再测一次」按钮 |
 | 未授权 Chat ID | 统一回复「⛔ 当前 Chat ID 未授权，请联系管理员。」 |
 | 发送间隔 | 默认 60 分钟整点（`report_interval_minutes` / `report_minute` / `timezone` 可配置） |
 | 幂等保证 | 投递日志按「订阅者×窗口」记录成功，崩溃后新 owner 只补发未成功的订阅者 |
@@ -155,7 +157,7 @@ docker compose -p smart-router down
 
 | 项 | 值 |
 |-----|-----|
-| Chat ID 类型 | 正数 = 私人会话；负数 = 群组/超级群组；-100 开头默认识别为超级群组；频道在 Web 中手动选择 |
+| Chat ID 类型 | 正数 = 私人会话；负数 = 群组/超级群组；-100 开头默认识别为超级群组；频道在 Web 中手动选择。Chat ID 按原样保存（前导零不丢，如 `00123456789`），会话匹配与发送按数值处理 |
 | 获取群组 ID | 暂停 checker → 群里发送 /start@BotUsername → 用 Bot API getUpdates 查看 message.chat.id → 重启 checker |
 | Web 配置 | 设置 → Telegram 告警 → 添加订阅者；填写负数 Chat ID，选择「自动判断」或对应类型 |
 | 单订阅者测试 | 订阅者列表中的「测试」按钮，调用 POST /admin/telegram/subscribers/:id/test |

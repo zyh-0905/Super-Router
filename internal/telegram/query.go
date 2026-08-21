@@ -49,6 +49,15 @@ func hostOf(baseURL string) string {
 
 // RelayList /relay 站点总览。
 func (q *SQLQueryService) RelayList(ctx context.Context, groupIDs []int) (string, error) {
+	items, err := q.RelaySummaries(ctx, groupIDs)
+	if err != nil {
+		return "", err
+	}
+	return FormatRelayList(items), nil
+}
+
+// RelaySummaries 站点总览的结构化数据（供 /relay 文本与内联键盘共用，一次查询）。
+func (q *SQLQueryService) RelaySummaries(ctx context.Context, groupIDs []int) ([]RelaySummary, error) {
 	rows, err := q.DB.Pool.Query(ctx, `
 		SELECT u.id, u.name, u.base_url, u.enabled,
 		       COALESCE(b.balance, NULL), COALESCE(r.real_ratio, NULL),
@@ -73,7 +82,7 @@ func (q *SQLQueryService) RelayList(ctx context.Context, groupIDs []int) (string
 		ORDER BY u.id
 	`, grouped(groupIDs))
 	if err != nil {
-		return "", fmt.Errorf("query relays: %w", err)
+		return nil, fmt.Errorf("query relays: %w", err)
 	}
 	defer rows.Close()
 
@@ -86,7 +95,7 @@ func (q *SQLQueryService) RelayList(ctx context.Context, groupIDs []int) (string
 		it.Host = hostOf(it.Host)
 		items = append(items, it)
 	}
-	return FormatRelayList(items), rows.Err()
+	return items, rows.Err()
 }
 
 // RelayDetail /relay <id> 详情。

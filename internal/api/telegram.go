@@ -220,8 +220,10 @@ func (h *TelegramHandler) UpdateConfig(c *gin.Context) {
 }
 
 // subscriberRequest 订阅者创建/更新请求。
+// ChatID 为字符串：保留用户输入的前导零（如 00123456789），入库 TEXT。
+// 会话身份与发送仍按数值处理（normalizeSubscriberChat 内校验整数格式）。
 type subscriberRequest struct {
-	ChatID       int64  `json:"chat_id"`
+	ChatID       string `json:"chat_id"`
 	ChatType     string `json:"chat_type"`
 	DisplayName  string `json:"display_name"`
 	Enabled      *bool  `json:"enabled"`
@@ -230,33 +232,39 @@ type subscriberRequest struct {
 	GroupIDs     []int  `json:"group_ids"`
 }
 
-func normalizeSubscriberChat(chatID int64, requestedType string) (string, error) {
+// normalizeSubscriberChat 校验 chat_id 格式并归一化会话类型，返回 (数值, 类型, error)。
+// chatIDRaw 原样保留前导零（如 00123456789），num 为数值形式用于发送与比较。
+func normalizeSubscriberChat(chatIDRaw, requestedType string) (int64, string, error) {
 	requestedType = strings.ToLower(strings.TrimSpace(requestedType))
-	if chatID == 0 {
-		return "", fmt.Errorf("chat_id must be non-zero")
+	num, err := strconv.ParseInt(strings.TrimSpace(chatIDRaw), 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("chat_id must be an integer")
+	}
+	if num == 0 {
+		return 0, "", fmt.Errorf("chat_id must be non-zero")
 	}
 	if requestedType == "" || requestedType == "auto" {
-		if chatID > 0 {
-			return "private", nil
+		if num > 0 {
+			return num, "private", nil
 		}
-		if strings.HasPrefix(strconv.FormatInt(chatID, 10), "-100") {
-			return "supergroup", nil
+		if strings.HasPrefix(strconv.FormatInt(num, 10), "-100") {
+			return num, "supergroup", nil
 		}
-		return "group", nil
+		return num, "group", nil
 	}
 
 	switch requestedType {
 	case "private", "group", "supergroup", "channel":
 	default:
-		return "", fmt.Errorf("chat_type must be auto, private, group, supergroup or channel")
+		return 0, "", fmt.Errorf("chat_type must be auto, private, group, supergroup or channel")
 	}
-	if requestedType == "private" && chatID < 0 {
-		return "", fmt.Errorf("private chat_id must be positive")
+	if requestedType == "private" && num < 0 {
+		return 0, "", fmt.Errorf("private chat_id must be positive")
 	}
-	if requestedType != "private" && chatID > 0 {
-		return "", fmt.Errorf("%s chat_id must be negative", requestedType)
+	if requestedType != "private" && num > 0 {
+		return 0, "", fmt.Errorf("%s chat_id must be negative", requestedType)
 	}
-	return requestedType, nil
+	return num, requestedType, nil
 }
 
 // ListSubscribers GET /admin/telegram/subscribers。
@@ -278,14 +286,14 @@ func (h *TelegramHandler) ListSubscribers(c *gin.Context) {
 	subs := []gin.H{}
 	for rows.Next() {
 		var (
-			id                                             int64
-			chatID                                         int64
-			chatType, displayName, groupIDsJSON            string
-			enabled, alertEnabled, queryEnabled            bool
-			lastSentAt                                     *time.Time
-			lastError                                      string
-			failureCount                                   int
-			createdAt, updatedAt                           time.Time
+			id                                  int64
+			chatID                              string
+			chatType, displayName, groupIDsJSON string
+			enabled, alertEnabled, queryEnabled bool
+			lastSentAt                          *time.Time
+			lastError                           string
+			failureCount                        int
+			createdAt, updatedAt                time.Time
 		)
 		if err := rows.Scan(&id, &chatID, &chatType, &displayName, &enabled, &alertEnabled, &queryEnabled,
 			&groupIDsJSON, &lastSentAt, &lastError, &failureCount, &createdAt, &updatedAt); err != nil {
@@ -322,7 +330,7 @@ func (h *TelegramHandler) CreateSubscriber(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	normalizedType, err := normalizeSubscriberChat(req.ChatID, req.ChatType)
+	_, normalizedType, err := normalizeSubscriberChat(req.ChatID, req.ChatType)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -367,16 +375,16 @@ func (h *TelegramHandler) UpdateSubscriber(c *gin.Context) {
 		return
 	}
 	var normalizedType string
-	if req.ChatID != 0 || req.ChatType != "" {
+	if req.ChatID != "" || req.ChatType != "" {
 		effectiveChatID := req.ChatID
-		if effectiveChatID == 0 {
+		if effectiveChatID == "" {
 			if err := h.DB.Pool.QueryRow(c.Request.Context(), `SELECT chat_id FROM telegram_subscribers WHERE id = $1`, id).Scan(&effectiveChatID); err != nil {
 				c.JSON(404, gin.H{"error": "subscriber not found"})
 				return
 			}
 		}
 		var normalizeErr error
-		normalizedType, normalizeErr = normalizeSubscriberChat(effectiveChatID, req.ChatType)
+		_, normalizedType, normalizeErr = normalizeSubscriberChat(effectiveChatID, req.ChatType)
 		if normalizeErr != nil {
 			c.JSON(400, gin.H{"error": normalizeErr.Error()})
 			return
@@ -396,7 +404,7 @@ func (h *TelegramHandler) UpdateSubscriber(c *gin.Context) {
 		updates = append(updates, col+" = $"+strconv.Itoa(len(args)+1))
 		args = append(args, val)
 	}
-	if req.ChatID != 0 {
+	if req.ChatID != "" {
 		add("chat_id", req.ChatID)
 		add("chat_type", normalizedType)
 	} else if req.ChatType != "" {
@@ -477,13 +485,13 @@ func (h *TelegramHandler) GetDeliveryLogs(c *gin.Context) {
 	logs := []gin.H{}
 	for rows.Next() {
 		var (
-			id, subscriberID     int64
-			kind                 string
-			ws, we               *time.Time
-			success              bool
-			msgID                *int64
-			errMsg               string
-			sentAt               time.Time
+			id, subscriberID int64
+			kind             string
+			ws, we           *time.Time
+			success          bool
+			msgID            *int64
+			errMsg           string
+			sentAt           time.Time
 		)
 		if err := rows.Scan(&id, &subscriberID, &kind, &ws, &we, &success, &msgID, &errMsg, &sentAt); err != nil {
 			continue
@@ -607,8 +615,13 @@ func (h *TelegramHandler) SendReport(c *gin.Context) {
 		if !s.Enabled || !s.AlertEnabled {
 			continue
 		}
+		chatID, perr := telegram.ParseChatID(s.ChatID)
+		if perr != nil {
+			failed++
+			continue
+		}
 		for _, part := range telegram.SplitMessage(msg, telegram.MaxTelegramMessageLen) {
-			if _, err := client.SendMessage(ctx, s.ChatID, part); err != nil {
+			if _, err := client.SendMessage(ctx, chatID, part, nil); err != nil {
 				failed++
 				break
 			}
@@ -639,17 +652,22 @@ func (h *TelegramHandler) SendSubscriberTest(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "bot token not configured"})
 		return
 	}
-	var chatID int64
+	var chatIDStr string
 	if err := h.DB.Pool.QueryRow(c.Request.Context(), `
 		SELECT chat_id FROM telegram_subscribers WHERE id = $1
-	`, id).Scan(&chatID); err != nil {
+	`, id).Scan(&chatIDStr); err != nil {
 		c.JSON(404, gin.H{"error": "subscriber not found"})
+		return
+	}
+	chatID, perr := telegram.ParseChatID(chatIDStr)
+	if perr != nil {
+		c.JSON(500, gin.H{"error": "invalid stored chat_id"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 	client := telegram.NewClient(plain)
-	if _, err := client.SendMessage(ctx, chatID, "✅ Smart Router 测试消息：Telegram 通知链路正常。"); err != nil {
+	if _, err := client.SendMessage(ctx, chatID, "✅ Smart Router 测试消息：Telegram 通知链路正常。", nil); err != nil {
 		c.JSON(502, gin.H{"error": "sendMessage failed", "detail": err.Error()})
 		return
 	}

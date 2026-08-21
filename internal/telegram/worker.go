@@ -148,6 +148,10 @@ func (w *Worker) pollOnce(ctx context.Context) error {
 	// 处理前刷新订阅者授权
 	if subs, err := w.store.LoadSubscribers(ctx); err == nil {
 		w.cmds.SetSubscribers(subs)
+		// 命令菜单（setMyCommands）：按订阅者能力维护，能力未变时零 API 调用
+		if merr := w.cmds.SyncBotMenu(ctx, w.client, subs); merr != nil {
+			w.logger.Debug("Sync bot menu failed", zap.Error(merr))
+		}
 	}
 	for _, u := range updates {
 		// A1：仅在回复全部成功后才推进 offset。
@@ -174,20 +178,30 @@ func (w *Worker) pollOnce(ctx context.Context) error {
 	return nil
 }
 
-// handleUpdate 处理单条消息：授权校验 → 命令分发 → 回复发送。
+// handleUpdate 处理单条消息/回调：授权校验 → 分发 → 回复发送。
 // 返回错误表示该 update 未能完成处理（offset 不得推进）。
 func (w *Worker) handleUpdate(ctx context.Context, u Update) error {
+	if u.HasCallback {
+		return w.handleCallback(ctx, u)
+	}
 	if u.Text == "" {
 		return nil
 	}
-	reply, err := w.cmds.Handle(ctx, u.ChatID, u.Text)
+	// 命令处理期间显示「正在输入…」（仅查询命令；/sitetest 有独立的进度消息）
+	if isTypingCommand(u.Text) {
+		_ = w.client.SendChatAction(ctx, u.ChatID, ChatActionTyping)
+	}
+	out, kb, err := w.cmds.HandleWithKeyboard(ctx, u.ChatID, u.Text)
 	if err != nil {
 		w.logger.Warn("Command handling failed", zap.Int64("chat_id", u.ChatID), zap.Error(err))
 		_ = w.store.UpdateLastError(ctx, truncateStr(err.Error(), 500))
 		return err
 	}
-	for _, part := range SplitMessage(reply, MaxTelegramMessageLen) {
-		if err := w.sendToSubscriber(ctx, u.ChatID, part); err != nil {
+	if out == "" {
+		return nil // /sitetest 进度消息已由异步通道发送
+	}
+	for _, part := range SplitMessage(out, MaxTelegramMessageLen) {
+		if _, err := w.sendToSubscriber(ctx, u.ChatID, part, kb); err != nil {
 			w.logger.Warn("Reply send failed", zap.Int64("chat_id", u.ChatID), zap.Error(err))
 			return err
 		}
@@ -195,14 +209,147 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) error {
 	return nil
 }
 
-// sendToSubscriber 向单个订阅者发送消息（拆分为多段分别记录投递）。
-func (w *Worker) sendToSubscriber(ctx context.Context, chatID int64, html string) error {
-	id, err := w.client.SendMessage(ctx, chatID, html)
+// handleCallback 处理内联键盘回调：先应答（关闭 loading），再执行动作。
+func (w *Worker) handleCallback(ctx context.Context, u Update) error {
+	// 应答失败不阻断后续处理（按钮 loading 残留 10s 会自动消失）
+	if err := w.client.AnswerCallbackQuery(ctx, u.CallbackID); err != nil {
+		w.logger.Debug("Answer callback failed", zap.String("callback_id", u.CallbackID), zap.Error(err))
+	}
+	_ = w.client.SendChatAction(ctx, u.CallbackChatID, ChatActionTyping)
+	out, err := w.cmds.HandleCallback(ctx, u)
+	if err != nil {
+		w.logger.Warn("Callback handling failed", zap.Int64("chat_id", u.CallbackChatID), zap.Error(err))
+		return err
+	}
+	if out == "" {
+		return nil // 已原位编辑或已通过异步通道处理
+	}
+	for _, part := range SplitMessage(out, MaxTelegramMessageLen) {
+		if _, err := w.sendToSubscriber(ctx, u.CallbackChatID, part, nil); err != nil {
+			w.logger.Warn("Callback reply send failed", zap.Int64("chat_id", u.CallbackChatID), zap.Error(err))
+			return err
+		}
+	}
+	return nil
+}
+
+// isTypingCommand 该命令是否值得显示「正在输入…」（带查询/计算的命令；
+// /sitetest 与纯帮助类命令除外）。
+func isTypingCommand(text string) bool {
+	cmd, _ := parseCommand(text)
+	switch cmd {
+	case "/alerts", "/alert", "/status", "/relay", "/balance", "/health", "/ratio", "/quality":
+		return true
+	}
+	return false
+}
+
+// sendToSubscriber 向单个订阅者发送消息（可携带内联键盘），返回 Telegram 消息 ID。
+func (w *Worker) sendToSubscriber(ctx context.Context, chatID int64, html string, kb *InlineKeyboard) (int64, error) {
+	id, err := w.client.SendMessage(ctx, chatID, html, kb)
+	if err != nil {
+		return id, err
+	}
+	return id, nil
+}
+
+// SendToChat 发送 HTML 消息到指定会话（AsyncSender 接口实现，
+// 供 /sitetest 等长任务异步推送结果）。
+func (w *Worker) SendToChat(ctx context.Context, chatID int64, html string) error {
+	_, err := w.sendToSubscriber(ctx, chatID, html, nil)
+	return err
+}
+
+// StartTest 启动一次站点测试的交互流程（AsyncSender 接口实现）：
+// 发送进度消息 → 后台执行 → 原位编辑为最终结果（带「再测一次」键盘）。
+// 心跳编辑失败只降级为「发一条最终结果」，不影响结果送达。
+func (w *Worker) StartTest(ctx context.Context, t *StartTestContext) error {
+	msgID, err := w.sendToSubscriber(ctx, t.ChatID, t.StartText(), nil)
 	if err != nil {
 		return err
 	}
-	_ = id
+	t.ProgressMsg = msgID
+
+	go w.runTestFlow(t)
 	return nil
+}
+
+// runTestFlow 后台执行测试：测试立即启动，与进度心跳并行；完成后原位更新结果。
+func (w *Worker) runTestFlow(t *StartTestContext) {
+	start := time.Now()
+
+	// 执行与心跳并行：测试立即开始（不因心跳延迟而晚启动）
+	type result struct{ msg string }
+	resultCh := make(chan result, 1)
+	go func() {
+		runCtx, cancel := context.WithTimeout(context.Background(), siteTestTotalBudget)
+		defer cancel()
+		msg, err := t.Runner.Run(runCtx, t.ChannelID, t.Model, t.MaxTokens, t.Sub.GroupIDs)
+		if err != nil {
+			msg = "🧪 站点测试失败：" + err.Error()
+		}
+		resultCh <- result{msg: msg}
+	}()
+
+	// 心跳：每 3s 原位编辑一次进度（文本含已运行时长，保证内容不同——
+	// Telegram 编辑接口要求新文本与旧文本不一致）
+	var msg string
+	heartbeat := time.NewTicker(3 * time.Second)
+	defer heartbeat.Stop()
+loop:
+	for {
+		select {
+		case r := <-resultCh:
+			msg = r.msg
+			break loop
+		case <-heartbeat.C:
+			elapsed := time.Since(start)
+			if elapsed >= siteTestTotalBudget-5*time.Second {
+				continue
+			}
+			editCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err := w.client.EditMessageText(editCtx, t.ChatID, t.ProgressMsg, t.ProgressText(elapsed), nil)
+			cancel()
+			if err != nil {
+				heartbeat.Stop() // 编辑失败（消息被删等）：停止心跳，等结果
+			}
+		}
+	}
+
+	sendCtx, sendCancel := context.WithTimeout(context.Background(), siteTestSendBudget)
+	defer sendCancel()
+	// 结果：优先原位编辑进度消息（键盘随最终结果一起更新）
+	if eerr := w.client.EditMessageText(sendCtx, t.ChatID, t.ProgressMsg, msg, t.RetryKeyboard()); eerr == nil {
+		return
+	}
+	// 编辑失败降级：拆分新发（长结果可能超单条上限）
+	for _, part := range SplitMessage(msg, MaxTelegramMessageLen) {
+		if _, serr := w.sendToSubscriber(sendCtx, t.ChatID, part, nil); serr != nil {
+			w.logger.Warn("Site test result delivery failed",
+				zap.Int64("chat_id", t.ChatID), zap.Error(serr))
+			return
+		}
+	}
+}
+
+// EditCallbackMessage 原位编辑回调来源的消息（CallbackResponder 接口实现）。
+func (w *Worker) EditCallbackMessage(ctx context.Context, u Update, html string, kb *InlineKeyboard) error {
+	editCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := w.client.EditMessageText(editCtx, u.CallbackChatID, u.CallbackMessageID, html, kb); err != nil {
+		return err
+	}
+	return nil
+}
+
+// sendSubscriberChatID 把订阅者存储的 chat_id 字符串转成数值发送（前导零不影响会话身份）。
+func (w *Worker) sendSubscriberChatID(ctx context.Context, chatID string, html string) (int64, error) {
+	n, err := ParseChatID(chatID)
+	if err != nil {
+		w.logger.Warn("Invalid stored chat_id, delivery skipped", zap.String("chat_id", chatID), zap.Error(err))
+		return 0, err
+	}
+	return w.sendToSubscriber(ctx, n, html, nil)
 }
 
 // reportLoop 整点报告循环（30s tick 检查）。
@@ -316,8 +463,7 @@ func (w *Worker) deliverReport(ctx context.Context, s Subscriber, report string,
 	var msgID int64
 	var sendErr error
 	for _, part := range SplitMessage(report, MaxTelegramMessageLen) {
-		msgID, sendErr = w.client.SendMessage(ctx, s.ChatID, part)
-		if sendErr != nil {
+		if msgID, sendErr = w.sendSubscriberChatID(ctx, s.ChatID, part); sendErr != nil {
 			break
 		}
 	}

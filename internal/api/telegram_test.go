@@ -119,23 +119,27 @@ func TestTelegramConfigResponseMasking(t *testing.T) {
 
 func TestNormalizeSubscriberChat(t *testing.T) {
 	tests := []struct {
-		name string
-		id int64
+		name      string
+		chatID    string
 		requested string
-		want string
-		wantErr bool
+		wantNum   int64
+		wantType  string
+		wantErr   bool
 	}{
-		{name: "positive auto private", id: 123456789, want: "private"},
-		{name: "negative auto group", id: -123456789, want: "group"},
-		{name: "negative one hundred auto supergroup", id: -1001234567890, want: "supergroup"},
-		{name: "explicit channel", id: -1001234567890, requested: "channel", want: "channel"},
-		{name: "zero rejected", id: 0, wantErr: true},
-		{name: "positive group mismatch", id: 123, requested: "group", wantErr: true},
-		{name: "negative private mismatch", id: -123, requested: "private", wantErr: true},
+		{name: "positive auto private", chatID: "123456789", wantNum: 123456789, wantType: "private"},
+		{name: "negative auto group", chatID: "-123456789", wantNum: -123456789, wantType: "group"},
+		{name: "negative one hundred auto supergroup", chatID: "-1001234567890", wantNum: -1001234567890, wantType: "supergroup"},
+		{name: "explicit channel", chatID: "-1001234567890", requested: "channel", wantNum: -1001234567890, wantType: "channel"},
+		{name: "leading zeros kept as value, numeric used for type", chatID: "-001001234567890", wantNum: -1001234567890, wantType: "supergroup"},
+		{name: "zero rejected", chatID: "0", wantErr: true},
+		{name: "zero with leading zeros rejected", chatID: "000", wantErr: true},
+		{name: "non-integer rejected", chatID: "00123abc", wantErr: true},
+		{name: "positive group mismatch", chatID: "123", requested: "group", wantErr: true},
+		{name: "negative private mismatch", chatID: "-123", requested: "private", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := normalizeSubscriberChat(tt.id, tt.requested)
+			num, got, err := normalizeSubscriberChat(tt.chatID, tt.requested)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got type %q", got)
@@ -145,8 +149,11 @@ func TestNormalizeSubscriberChat(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got != tt.want {
-				t.Fatalf("type = %q, want %q", got, tt.want)
+			if num != tt.wantNum {
+				t.Fatalf("num = %d, want %d", num, tt.wantNum)
+			}
+			if got != tt.wantType {
+				t.Fatalf("type = %q, want %q", got, tt.wantType)
 			}
 		})
 	}

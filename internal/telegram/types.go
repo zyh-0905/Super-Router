@@ -8,6 +8,9 @@ package telegram
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -29,11 +32,21 @@ type Config struct {
 // Subscriber 授权订阅者。
 type Subscriber struct {
 	ID           int64
-	ChatID       int64
+	ChatID       string // 存储时保留用户输入的前导零（如 00123456789）；发送/匹配用 ParseChatID 转数值
 	Enabled      bool
 	AlertEnabled bool
 	QueryEnabled bool
 	GroupIDs     []int
+}
+
+// ParseChatID 把订阅者存储的 chat_id 字符串解析为 int64（Telegram API 交互与数值匹配用）。
+// 字符串形式仅作展示/回显保留，实际会话以数值为准。
+func ParseChatID(chatID string) (int64, error) {
+	n, err := strconv.ParseInt(strings.TrimSpace(chatID), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid chat_id %q: %w", chatID, err)
+	}
+	return n, nil
 }
 
 // Update 长轮询收到的单条消息更新。
@@ -41,6 +54,40 @@ type Update struct {
 	UpdateID int64
 	ChatID   int64
 	Text     string
+
+	// 回调按钮（inline keyboard callback_query）字段：
+	// HasCallback 为 true 时其余字段有效。
+	HasCallback       bool
+	CallbackID        string // answerCallbackQuery 用（关闭按钮 loading 状态）
+	CallbackData      string // 按钮回调数据（cmd:/relay:/st: 前缀协议）
+	CallbackChatID    int64  // 点击者的会话（授权判定）
+	CallbackMessageID int64  // 携带按钮的消息 ID（供原位编辑）
+}
+
+// InlineButton 内联键盘按钮（Data 与 URL 二选一）。
+type InlineButton struct {
+	Text string
+	Data string // 回调数据；URL 非空时忽略
+	URL  string // 外链按钮（如 Web 控制台）
+}
+
+// InlineKeyboard 内联键盘（行 × 按钮，与 Telegram inline_keyboard 对应）。
+type InlineKeyboard struct {
+	Rows [][]InlineButton
+}
+
+// InlineRow 单行按钮快捷构造。
+func InlineRow(buttons ...InlineButton) []InlineButton { return buttons }
+
+// ChatAction 聊天状态动作（sendChatAction）。
+const (
+	ChatActionTyping = "typing"
+)
+
+// BotCommand 命令菜单条目（setMyCommands）。
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
 }
 
 // RelaySummary /relay 列表项。
@@ -102,5 +149,9 @@ type RatioSummary struct {
 type BotClient interface {
 	GetMe(ctx context.Context) error
 	GetUpdates(ctx context.Context, offset int64, timeout time.Duration) ([]Update, error)
-	SendMessage(ctx context.Context, chatID int64, html string) (int64, error)
+	SendMessage(ctx context.Context, chatID int64, html string, kb *InlineKeyboard) (int64, error)
+	EditMessageText(ctx context.Context, chatID int64, messageID int64, html string, kb *InlineKeyboard) error
+	SendChatAction(ctx context.Context, chatID int64, action string) error
+	AnswerCallbackQuery(ctx context.Context, callbackID string) error
+	SetMyCommands(ctx context.Context, commands []BotCommand) error
 }

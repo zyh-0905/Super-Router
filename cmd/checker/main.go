@@ -117,8 +117,15 @@ func main() {
 			logger.Warn("Telegram enabled but bot token unavailable, worker disabled", zap.Error(terr))
 		} else {
 			telegram.RegisterAlertQueries(db)
-			tgWorker := telegram.NewWorker(tgStore, telegram.NewClient(token),
-				telegram.NewCommandService(telegram.NewSQLQueryService(db)), logger.Named("telegram"))
+			cmds := telegram.NewCommandService(telegram.NewSQLQueryService(db))
+			// /sitetest 站点直达测试：复用 ProbeChecker（余额读取 + 站点探测锁），
+			// 与定时/手动探针同源；SSRF 口径与质量检测一致。结果经 Worker 异步推送。
+			cmds.SetSiteTestRunner(telegram.NewSiteTestRunner(db, probeChecker, cfg.Security.EncryptionKey,
+				logger.Named("site-test"),
+				safenet.Options{AllowHTTP: cfg.Server.AllowHTTPUpstream, AllowPrivate: cfg.Server.AllowPrivateUpstream}))
+			cmds.SetLogger(logger.Named("telegram"))
+			tgWorker := telegram.NewWorker(tgStore, telegram.NewClient(token), cmds, logger.Named("telegram"))
+			cmds.SetAsyncSender(tgWorker) // 异步推送结果（/sitetest 长任务）
 			tgWorker.SetReportBuilder(telegram.NewReportBuilder(db))
 			tgWorker.SetLock(pgAdvisoryLock(db))
 			go tgWorker.Run(ctx)

@@ -20,7 +20,7 @@ test('builds the Telegram subscriber test endpoint path', () => {
 
 test('normalizes a negative Telegram group chat id', () => {
   assert.deepEqual(normalizeTelegramSubscriberChat('-1001234567890', 'auto'), {
-    chat_id: -1001234567890,
+    chat_id: '-1001234567890',
     chat_type: 'supergroup',
   })
 })
@@ -32,16 +32,41 @@ test('rejects a private type for a negative Telegram chat id', () => {
 
 test('normalizes a positive Telegram private chat id', () => {
   assert.deepEqual(normalizeTelegramSubscriberChat('123456789', 'auto'), {
-    chat_id: 123456789,
+    chat_id: '123456789',
     chat_type: 'private',
   })
 })
 
 test('accepts an explicit Telegram channel type', () => {
   assert.deepEqual(normalizeTelegramSubscriberChat('-1001234567890', 'channel'), {
-    chat_id: -1001234567890,
+    chat_id: '-1001234567890',
     chat_type: 'channel',
   })
+})
+
+test('preserves leading zeros in a chat id', () => {
+  assert.deepEqual(normalizeTelegramSubscriberChat('00123456789', 'auto'), {
+    chat_id: '00123456789',
+    chat_type: 'private',
+  })
+})
+
+test('trims surrounding whitespace but keeps inner zeros', () => {
+  assert.deepEqual(normalizeTelegramSubscriberChat('  00123  ', 'auto'), {
+    chat_id: '00123',
+    chat_type: 'private',
+  })
+})
+
+test('preserves leading zeros for a supergroup chat id', () => {
+  assert.deepEqual(normalizeTelegramSubscriberChat('-001001234567890', 'auto'), {
+    chat_id: '-001001234567890',
+    chat_type: 'supergroup',
+  })
+})
+
+test('rejects a non-integer chat id', () => {
+  assert.throws(() => normalizeTelegramSubscriberChat('00123abc', 'auto'), TypeError)
 })
 
 test('rejects a zero Telegram chat id', () => {
