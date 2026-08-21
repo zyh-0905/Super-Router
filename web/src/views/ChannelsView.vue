@@ -847,13 +847,15 @@ function openChannelFromStation(channelID) {
       </div>
     </div>
 
-    <!-- 分组筛选 chips -->
+    <!-- 分组筛选 chips：仅平铺视图显示（中转站视图按 base_url 归并，分组筛选不适用） -->
     <div class="row gap-2 mb-3" style="flex-wrap:wrap">
-      <button class="seg" :class="{ on: groupFilter == null }" @click="groupFilter = null">全部站点</button>
-      <button v-for="g in groups" :key="g.id" class="seg" :class="{ on: groupFilter === g.id }" @click="groupFilter = g.id">
-        {{ g.name }}<span class="seg-count">{{ g.channel_count }}</span>
-      </button>
-      <!-- 视图切换：平铺 / 中转站归并 -->
+      <template v-if="view === 'flat'">
+        <button class="seg" :class="{ on: groupFilter == null }" @click="groupFilter = null">全部站点</button>
+        <button v-for="g in groups" :key="g.id" class="seg" :class="{ on: groupFilter === g.id }" @click="groupFilter = g.id">
+          {{ g.name }}<span class="seg-count">{{ g.channel_count }}</span>
+        </button>
+      </template>
+      <!-- 视图切换：平铺 / 中转站归并（两个视图都保留） -->
       <div class="seg-group" style="margin-left:auto">
         <button class="seg" :class="{ on: view === 'flat' }" @click="view = 'flat'">平铺</button>
         <button class="seg" :class="{ on: view === 'stations' }" @click="view = 'stations'">中转站</button>

@@ -97,7 +97,7 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="col gap-2">
+  <div class="col gap-3">
     <div class="row gap-2 mb-1">
       <div class="grow" style="position:relative">
         <span style="position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--text-3);display:flex"><Icon name="search" :size="14" /></span>
@@ -108,8 +108,8 @@ onMounted(load)
       </label>
     </div>
 
-    <div v-if="loading" class="col" style="gap:10px">
-      <div v-for="i in 3" :key="i" class="card skeleton" style="height:76px" />
+    <div v-if="loading" class="col" style="gap:14px">
+      <div v-for="i in 3" :key="i" class="card skeleton" style="height:108px" />
     </div>
 
     <div v-else-if="filtered.length === 0" class="card" style="padding:40px;text-align:center;color:var(--text-3)">
@@ -119,32 +119,32 @@ onMounted(load)
     <div v-for="s in filtered" :key="s.id" class="card st-card" :class="{ open: expanded.has(s.id) }" @click="toggle(s)">
       <!-- 卡片头 -->
       <div class="row gap-2" style="align-items:center">
-        <Icon name="chevron_right" :size="14" class="st-chevron" :class="{ down: expanded.has(s.id) }" style="color:var(--text-3);flex-shrink:0" />
+        <Icon name="chevron_right" :size="18" class="st-chevron" :class="{ down: expanded.has(s.id) }" style="color:var(--text-3);flex-shrink:0" />
         <template v-if="renaming?.id === s.id">
           <input
-            v-model="renameInput" class="input" style="max-width:260px;font-weight:600"
+            v-model="renameInput" class="input" style="max-width:300px;font-weight:600"
             placeholder="留空 = 自动命名" @click.stop @keyup.enter="saveRename(s)" @keyup.esc="cancelRename"
           />
           <button class="btn btn-primary btn-sm" :disabled="renameSaving" @click.stop="saveRename(s)">保存</button>
           <button class="btn btn-ghost btn-sm" @click.stop="cancelRename">取消</button>
         </template>
         <template v-else>
-          <span style="font-size:14.5px;font-weight:600" class="truncate">{{ s.display_name }}</span>
-          <span v-if="s.custom_name" class="badge badge-teal" style="font-size:10px">自定义名</span>
-          <button class="btn btn-ghost btn-sm" style="padding:2px 8px" title="重命名" @click.stop="startRename(s, $event)"><Icon name="pencil" :size="12" /></button>
+          <span class="st-name truncate">{{ s.display_name }}</span>
+          <span v-if="s.custom_name" class="badge badge-teal" style="font-size:10.5px">自定义名</span>
+          <button class="btn btn-ghost btn-sm" style="padding:2px 8px" title="重命名" @click.stop="startRename(s, $event)"><Icon name="pencil" :size="13" /></button>
         </template>
 
-        <span class="st-balance mono">
-          💰 {{ fmtBalance(s.balance) }}
-          <span v-if="s.balance_checked_at" class="text-3" style="font-size:10.5px;font-weight:400" :title="'检测于 ' + fmtTime(s.balance_checked_at)">{{ fmtTime(s.balance_checked_at) }}</span>
+        <span class="st-balance">
+          💰 <b :class="{ low: s.balance != null && s.balance <= 1 }">{{ fmtBalance(s.balance) }}</b>
+          <span v-if="s.balance_checked_at" class="text-3" style="font-size:11px;font-weight:400" :title="'检测于 ' + fmtTime(s.balance_checked_at)">{{ fmtTime(s.balance_checked_at) }}</span>
         </span>
-        <span class="badge badge-gray mono" style="margin-left:auto">{{ s.enabled_count }}/{{ s.channel_count }} 启用</span>
+        <span class="badge badge-gray mono" style="margin-left:auto;font-size:11.5px;padding:3px 9px">{{ s.enabled_count }}/{{ s.channel_count }} 启用</span>
       </div>
-      <div class="text-3 mono" style="font-size:11px;margin-top:2px">{{ s.base_url }}</div>
+      <div class="st-base text-3 mono">{{ s.base_url }}</div>
 
       <!-- 展开成员列表 -->
       <div v-if="expanded.has(s.id)" class="st-members" @click.stop>
-        <div v-if="memberList(s).length === 0" class="text-3" style="font-size:12.5px;padding:8px 4px">
+        <div v-if="memberList(s).length === 0" class="text-3" style="font-size:13px;padding:10px 4px">
           {{ (s.members || []).length === 0 ? '暂无成员站点' : '成员站点均已禁用（勾选「显示已禁用成员」查看）' }}
         </div>
         <div
@@ -152,13 +152,13 @@ onMounted(load)
           class="st-member row gap-2" style="align-items:center"
           @click="emit('open-channel', m.channel_id)"
         >
-          <span style="width:8px;height:8px;border-radius:50%;flex-shrink:0" :style="{ background: m.healthy === true ? 'var(--green)' : m.healthy === false ? 'var(--red)' : 'var(--text-3)' }" :title="m.healthy == null ? '健康未知' : m.healthy ? '存活' : '离线'" />
-          <span class="grow truncate" style="font-size:13px">{{ m.name }}</span>
-          <span v-if="m.protocol" class="badge" :class="m.protocol === 'anthropic' ? 'badge-purple' : 'badge-blue'" style="font-size:10px">{{ m.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI' }}</span>
-          <span class="badge" :class="{ primary: 'badge-blue', backup: 'badge-gray', emergency: 'badge-orange' }[m.role] || 'badge-gray'" style="font-size:10px">{{ roleLabel(m.role) }}</span>
-          <span v-if="m.ratio != null" class="badge mono badge-teal" style="font-size:10px" :title="'模型 ' + m.ratio_model + ' · ' + (m.ratio_basis === 'official' ? '官网价基准' : '混合基准')">{{ Number(m.ratio).toFixed(2) }}x</span>
-          <span class="badge" :class="circuitBadge(m.circuit_state).cls" style="font-size:10px">{{ circuitBadge(m.circuit_state).label }}</span>
-          <span class="badge" :class="m.enabled ? 'badge-green' : 'badge-gray'" style="font-size:10px">{{ m.enabled ? '启用' : '禁用' }}</span>
+          <span style="width:9px;height:9px;border-radius:50%;flex-shrink:0" :style="{ background: m.healthy === true ? 'var(--green)' : m.healthy === false ? 'var(--red)' : 'var(--text-3)' }" :title="m.healthy == null ? '健康未知' : m.healthy ? '存活' : '离线'" />
+          <span class="grow truncate" style="font-size:14px">{{ m.name }}</span>
+          <span v-if="m.protocol" class="badge" :class="m.protocol === 'anthropic' ? 'badge-purple' : 'badge-blue'" style="font-size:10.5px">{{ m.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI' }}</span>
+          <span class="badge" :class="{ primary: 'badge-blue', backup: 'badge-gray', emergency: 'badge-orange' }[m.role] || 'badge-gray'" style="font-size:10.5px">{{ roleLabel(m.role) }}</span>
+          <span v-if="m.ratio != null" class="badge mono badge-teal" style="font-size:10.5px" :title="'模型 ' + m.ratio_model + ' · ' + (m.ratio_basis === 'official' ? '官网价基准' : '混合基准')">{{ Number(m.ratio).toFixed(2) }}x</span>
+          <span class="badge" :class="circuitBadge(m.circuit_state).cls" style="font-size:10.5px">{{ circuitBadge(m.circuit_state).label }}</span>
+          <span class="badge" :class="m.enabled ? 'badge-green' : 'badge-gray'" style="font-size:10.5px">{{ m.enabled ? '启用' : '禁用' }}</span>
         </div>
       </div>
     </div>
@@ -166,12 +166,17 @@ onMounted(load)
 </template>
 
 <style scoped>
-.st-card { cursor: pointer; padding: 12px 14px; transition: box-shadow .15s ease; }
+.st-card { cursor: pointer; padding: 18px 22px; transition: box-shadow .15s ease, border-color .15s ease; }
 .st-card:hover { box-shadow: var(--shadow); }
 .st-card.open { box-shadow: var(--shadow); border-color: var(--accent); }
 .st-chevron { transition: transform .15s ease; }
-.st-chevron.down { transform: rotate(90deg); }.st-balance { font-size: 13px; font-weight: 600; color: var(--text-1); }
-.st-members { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
-.st-member { padding: 7px 8px; border-radius: 8px; cursor: pointer; }
+.st-chevron.down { transform: rotate(90deg); }
+.st-name { font-size: 17.5px; font-weight: 700; letter-spacing: .2px; }
+.st-balance { font-size: 14px; color: var(--text-2); display: inline-flex; align-items: baseline; gap: 6px; margin-left: 10px; }
+.st-balance b { font-size: 16.5px; font-weight: 700; color: var(--text-1); font-variant-numeric: tabular-nums; }
+.st-balance b.low { color: var(--red); }
+.st-base { font-size: 11.5px; margin-top: 5px; letter-spacing: .2px; }
+.st-members { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 5px; }
+.st-member { padding: 10px 12px; border-radius: 10px; cursor: pointer; }
 .st-member:hover { background: var(--bg-2); }
 </style>
