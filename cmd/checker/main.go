@@ -19,6 +19,7 @@ import (
 	"smart-router/internal/crypto"
 	"smart-router/internal/migrate"
 	"smart-router/internal/quality"
+	"smart-router/internal/safenet"
 	"smart-router/internal/store"
 	"smart-router/internal/telegram"
 
@@ -131,6 +132,12 @@ func main() {
 	qualityExecutor := quality.NewExecutor(db, qualityRepo,
 		quality.NewRedisPublisher(redisClient), cfg.Security.EncryptionKey, cfg.Checker.ProbeModel, logger.Named("quality"))
 	qualityExecutor.SetAlertSink(alert.NewQualityAlertSink(alert.NewSQLStore(db)))
+	// H3：质量检测出站 HTTP 与网关写入路径同口径的 SSRF 校验
+	// （开发配置可放宽私网/http，生产默认仅 https 公网上游）。
+	qualityExecutor.SetSafenetOptions(safenet.Options{
+		AllowHTTP:    cfg.Server.AllowHTTPUpstream,
+		AllowPrivate: cfg.Server.AllowPrivateUpstream,
+	})
 	go quality.NewWorker(qualityRepo, qualityExecutor, checkerWorkerID(), logger.Named("quality-worker")).Run(ctx)
 	logger.Info("Quality worker started (max 3 concurrent)")
 
@@ -521,7 +528,7 @@ func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, g
 		last["probe"] = now
 		return
 	}
-	estimateCents := checker.ToCentsForBudget(estCost)
+	estimateUnits := checker.ToBudgetUnits(estCost)
 	// C3：DB 当日已消费金额作为 Redis 键缺失时的播种基线
 	globalSpent, gerr := s.probe.TodaySpent(ctx)
 	if gerr != nil {
@@ -529,13 +536,13 @@ func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, g
 		last["probe"] = now
 		return
 	}
-	globalSpentCents := checker.ToCentsForBudget(globalSpent)
-	channelSpentCents := checker.ToCentsForBudget(upstreamSpent)
+	globalSpentUnits := checker.ToBudgetUnits(globalSpent)
+	channelSpentUnits := checker.ToBudgetUnits(upstreamSpent)
 	reserved := false
-	ok, rerr := s.budget.Reserve(ctx, sch.ID, estimateCents,
-		checker.ToCentsForBudget(sch.EffectiveBudget),
-		checker.ToCentsForBudget(s.cfg.Checker.DailyProbeBudget),
-		channelSpentCents, globalSpentCents)
+	ok, day, rerr := s.budget.Reserve(ctx, sch.ID, estimateUnits,
+		checker.ToBudgetUnits(sch.EffectiveBudget),
+		checker.ToBudgetUnits(s.cfg.Checker.DailyProbeBudget),
+		channelSpentUnits, globalSpentUnits)
 	if rerr != nil {
 		s.logger.Warn("Budget reservation failed, probe skipped", zap.String("channel", sch.Name), zap.Error(rerr))
 		last["probe"] = now
@@ -553,19 +560,18 @@ func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, g
 	// 执行探测
 	res, err := s.probe.ProbeChannel(ctx, sch.Upstream, s.pendingEpoch)
 	if reserved {
-		// 结算：实际成本 - 预留估算（失败全额退款）。
-		// C5：余额后读取失败（CostPending）时保留预留不退款——
-		// 聊天已成功、上游可能已扣费，退款会让账目凭空少记一笔。
-		actualCents := int64(0)
-		if res != nil && res.Cost > 0 {
-			actualCents = checker.ToCentsForBudget(res.Cost)
-		}
-		if res != nil && res.CostPending {
-			actualCents = estimateCents // 保留预留
+		// 结算：BudgetSettlement 决定按实际成本结算或保守保留预留
+		// （C5 扩展：聊天已发起即可能已扣费——chat 失败/余额后读取
+		// 失败/成功但成本不可测都保留预留，绝不「已扣费但账目为零」；
+		// 仅 balance_before 失败全额退款）。
+		keep, costUSD := res.BudgetSettlement()
+		actualUnits := checker.ToBudgetUnits(costUSD)
+		if keep {
+			actualUnits = estimateUnits
 		}
 		// H8：结算失败必须告警并保守处置——补扣失败意味着 Redis 少记消费，
 		// 立即失败关闭本 tick 剩余探测（globalBudgetLeft 清零），防预算继续超支。
-		if aerr := s.budget.Adjust(ctx, sch.ID, actualCents-estimateCents); aerr != nil {
+		if aerr := s.budget.Adjust(ctx, sch.ID, day, actualUnits-estimateUnits); aerr != nil {
 			s.logger.Error("Budget adjustment failed; paid probes disabled for this tick",
 				zap.Int64("channel_id", int64(sch.ID)), zap.Error(aerr))
 			*globalBudgetLeft = 0

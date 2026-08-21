@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"smart-router/internal/migrate"
+	"smart-router/internal/safenet"
 	"smart-router/internal/store"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -84,6 +85,8 @@ func TestExecutorFullHappyPath(t *testing.T) {
 
 	repo := NewPostgresRepository(&store.DB{Pool: pool})
 	exec := NewExecutor(&store.DB{Pool: pool}, repo, nil, "", "gpt-4o", zap.NewNop())
+	// 测试上游为本地 httptest（http+环回）：放宽 SSRF 校验，与开发配置口径一致
+	exec.SetSafenetOptions(safenet.Options{AllowHTTP: true, AllowPrivate: true})
 
 	run, err := repo.Create(ctx, channelID, "gpt-4o", "full", "hash")
 	if err != nil {
@@ -145,6 +148,7 @@ func TestExecutorUpstreamFailureOverallFailed(t *testing.T) {
 
 	repo := NewPostgresRepository(&store.DB{Pool: pool})
 	exec := NewExecutor(&store.DB{Pool: pool}, repo, nil, "", "gpt-4o", zap.NewNop())
+	exec.SetSafenetOptions(safenet.Options{AllowHTTP: true, AllowPrivate: true})
 
 	run, err := repo.Create(ctx, channelID, "gpt-4o", "full", "hash")
 	if err != nil {
@@ -184,6 +188,7 @@ func TestExecutorBasicStopsAfterStream(t *testing.T) {
 
 	repo := NewPostgresRepository(&store.DB{Pool: pool})
 	exec := NewExecutor(&store.DB{Pool: pool}, repo, nil, "", "gpt-4o", zap.NewNop())
+	exec.SetSafenetOptions(safenet.Options{AllowHTTP: true, AllowPrivate: true})
 
 	run, err := repo.Create(ctx, channelID, "gpt-4o", "basic", "hash")
 	if err != nil {

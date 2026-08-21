@@ -15,7 +15,8 @@ import (
 // RunConnectivity connectivity 阶段：调用当前协议对应的 /v1/models 做连接、认证和可达性检查。
 // 上游不支持模型列表但聊天端点可用时记录 models_endpoint_unavailable（attention），继续后续检测。
 // 凭据绝不写入 result.Error / Details。
-func RunConnectivity(ctx context.Context, ch *Channel, timeout time.Duration) StageResult {
+// client 为共享出站客户端（含 SSRF 重定向校验，H3）；nil 时退回裸客户端（测试）。
+func RunConnectivity(ctx context.Context, ch *Channel, timeout time.Duration, client *http.Client) StageResult {
 	res := StageResult{Stage: StageConnectivity, CheckName: "models_endpoint", Details: map[string]interface{}{}}
 
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -36,7 +37,9 @@ func RunConnectivity(ctx context.Context, ch *Channel, timeout time.Duration) St
 		req.Header.Set("Authorization", "Bearer "+ch.APIKey)
 	}
 
-	client := &http.Client{Timeout: timeout}
+	if client == nil {
+		client = &http.Client{Timeout: timeout}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		res.Status = StatusFailed

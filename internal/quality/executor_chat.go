@@ -124,7 +124,7 @@ func (s protocolStage) Run(ctx context.Context, input *StageContext) StageResult
 	// 首次进入时发起非流式探测（整个任务至多一次）
 	if input.NonStream == nil {
 		sc := BuildProbeScenario(input.Channel.Capabilities, input.Run.Model, 32)
-		ev, err := RunChat(ctx, input.Channel, sc, effectiveTimeout(input.Channel, chatTimeout))
+		ev, err := RunChat(ctx, input.Channel, sc, effectiveTimeout(input.Channel, chatTimeout), s.executor.httpClient())
 		input.NonStream = ev
 		if err != nil {
 			// 保留原始错误（如 first byte timeout / upstream 401），
@@ -147,7 +147,7 @@ func (s streamStage) Run(ctx context.Context, input *StageContext) StageResult {
 	if input.Stream == nil {
 		sc := BuildProbeScenario(input.Channel.Capabilities, input.Run.Model, 32)
 		sc.Stream = true
-		ev, err := RunChat(ctx, input.Channel, sc, effectiveTimeout(input.Channel, chatTimeout))
+		ev, err := RunChat(ctx, input.Channel, sc, effectiveTimeout(input.Channel, chatTimeout), s.executor.httpClient())
 		input.Stream = ev
 		if err != nil {
 			// 保留原始错误（如 first byte timeout），不掩盖真实原因
@@ -168,7 +168,7 @@ func (s usageStage) Name() string { return StageUsage }
 func (s usageStage) Run(ctx context.Context, input *StageContext) StageResult {
 	if input.NonStream == nil {
 		sc := BuildProbeScenario(input.Channel.Capabilities, input.Run.Model, 32)
-		ev, _ := RunChat(ctx, input.Channel, sc, effectiveTimeout(input.Channel, chatTimeout))
+		ev, _ := RunChat(ctx, input.Channel, sc, effectiveTimeout(input.Channel, chatTimeout), s.executor.httpClient())
 		input.NonStream = ev
 	}
 	ev, source := evidenceForStages(input.NonStream, input.Stream)
@@ -187,7 +187,7 @@ func (s behaviorStage) Name() string { return StageBehavior }
 func (s behaviorStage) Run(ctx context.Context, input *StageContext) StageResult {
 	if input.NonStream == nil {
 		sc := BuildProbeScenario(input.Channel.Capabilities, input.Run.Model, 32)
-		ev, _ := RunChat(ctx, input.Channel, sc, effectiveTimeout(input.Channel, chatTimeout))
+		ev, _ := RunChat(ctx, input.Channel, sc, effectiveTimeout(input.Channel, chatTimeout), s.executor.httpClient())
 		input.NonStream = ev
 	}
 	// 映射后的上游模型名

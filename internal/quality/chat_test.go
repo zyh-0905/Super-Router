@@ -42,7 +42,7 @@ func TestNonStreamOpenAI(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
-	ev, err := RunChat(ctx(), ch, BuildProbeScenario(nil, "gpt-4o", 32), 10*time.Second)
+	ev, err := RunChat(ctx(), ch, BuildProbeScenario(nil, "gpt-4o", 32), 10*time.Second, nil)
 	if err != nil {
 		t.Fatalf("chat: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestNonStreamAnthropicConversion(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	ch := &Channel{BaseURL: srv.URL, Protocol: "anthropic", APIKey: "sk-ant-test"}
-	ev, err := RunChat(ctx(), ch, BuildProbeScenario(nil, "claude-sonnet-5", 32), 10*time.Second)
+	ev, err := RunChat(ctx(), ch, BuildProbeScenario(nil, "claude-sonnet-5", 32), 10*time.Second, nil)
 	if err != nil {
 		t.Fatalf("chat: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestStreamOpenAIFullSequence(t *testing.T) {
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
 	sc := BuildProbeScenario(nil, "gpt-4o", 32)
 	sc.Stream = true
-	ev, err := RunChat(ctx(), ch, sc, 10*time.Second)
+	ev, err := RunChat(ctx(), ch, sc, 10*time.Second, nil)
 	if err != nil {
 		t.Fatalf("stream: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestStreamAnthropicConversion(t *testing.T) {
 	ch := &Channel{BaseURL: srv.URL, Protocol: "anthropic", APIKey: "sk-ant-test"}
 	sc := BuildProbeScenario(nil, "claude-sonnet-5", 32)
 	sc.Stream = true
-	ev, err := RunChat(ctx(), ch, sc, 10*time.Second)
+	ev, err := RunChat(ctx(), ch, sc, 10*time.Second, nil)
 	if err != nil {
 		t.Fatalf("anthropic stream: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestStreamMissingDone(t *testing.T) {
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
 	sc := BuildProbeScenario(nil, "gpt-4o", 32)
 	sc.Stream = true
-	ev, err := RunChat(ctx(), ch, sc, 10*time.Second)
+	ev, err := RunChat(ctx(), ch, sc, 10*time.Second, nil)
 	if err != nil {
 		t.Fatalf("stream: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestStreamInvalidJSONMidway(t *testing.T) {
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
 	sc := BuildProbeScenario(nil, "gpt-4o", 32)
 	sc.Stream = true
-	ev, err := RunChat(ctx(), ch, sc, 10*time.Second)
+	ev, err := RunChat(ctx(), ch, sc, 10*time.Second, nil)
 	if err != nil {
 		t.Fatalf("stream: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestChatFirstByteTimeout(t *testing.T) {
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	if _, err := RunChat(ctx, ch, BuildProbeScenario(nil, "gpt-4o", 32), 10*time.Second); err == nil {
+	if _, err := RunChat(ctx, ch, BuildProbeScenario(nil, "gpt-4o", 32), 10*time.Second, nil); err == nil {
 		t.Fatal("expected first byte timeout error")
 	}
 }
@@ -217,7 +217,7 @@ func TestChatUsageMissing(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
-	ev, err := RunChat(ctx(), ch, BuildProbeScenario(nil, "gpt-4o", 32), 10*time.Second)
+	ev, err := RunChat(ctx(), ch, BuildProbeScenario(nil, "gpt-4o", 32), 10*time.Second, nil)
 	if err != nil {
 		t.Fatalf("chat: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestChatCredentialNotInError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
-	_, err := RunChat(ctx(), ch, BuildProbeScenario(nil, "gpt-4o", 32), 10*time.Second)
+	_, err := RunChat(ctx(), ch, BuildProbeScenario(nil, "gpt-4o", 32), 10*time.Second, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}

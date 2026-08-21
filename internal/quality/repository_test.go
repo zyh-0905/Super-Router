@@ -87,7 +87,7 @@ func TestRepositoryLifecycle(t *testing.T) {
 
 	// UpsertResult + Get
 	res := StageResult{Stage: StageConnectivity, CheckName: "models", Status: StatusPassed, LatencyMS: i32(42), Details: map[string]interface{}{"latency_ms": 42}}
-	if err := repo.UpsertResult(ctx, run.ID, res); err != nil {
+	if err := repo.UpsertResult(ctx, run.ID, "worker-1", res); err != nil {
 		t.Fatalf("upsert result: %v", err)
 	}
 	got, results, err := repo.Get(ctx, run.ID)
@@ -95,11 +95,19 @@ func TestRepositoryLifecycle(t *testing.T) {
 		t.Fatalf("get = %+v %+v %v", got, results, err)
 	}
 
+	// 所有权谓词：其它 worker 不可写结果/终态（C3）
+	if err := repo.UpsertResult(ctx, run.ID, "intruder", res); !errors.Is(err, ErrLostOwnership) {
+		t.Fatalf("intruder upsert err = %v, want ErrLostOwnership", err)
+	}
+	if err := repo.Complete(ctx, run.ID, "intruder", OverallGood); !errors.Is(err, ErrLostOwnership) {
+		t.Fatalf("intruder complete err = %v, want ErrLostOwnership", err)
+	}
+
 	// Heartbeat + Complete
 	if err := repo.Heartbeat(ctx, run.ID, "worker-1"); err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}
-	if err := repo.Complete(ctx, run.ID, OverallGood); err != nil {
+	if err := repo.Complete(ctx, run.ID, "worker-1", OverallGood); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	got, _, _ = repo.Get(ctx, run.ID)

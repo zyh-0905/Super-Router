@@ -178,7 +178,8 @@ func (h *RatioHandler) GetRatio(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid channel id"})
 		return
 	}
-	ctx := context.Background()
+	// M11：使用请求上下文——客户端断开即取消慢查询，避免占满连接池
+	ctx := c.Request.Context()
 
 	var exists bool
 	if err := h.db.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM upstreams WHERE id = $1)`, channelID).Scan(&exists); err != nil || !exists {
@@ -207,6 +208,12 @@ func (h *RatioHandler) GetRatio(c *gin.Context) {
 			declared = append(declared, declaredEntry(model, promptRatio, completionRatio, checkedAt))
 		}
 		rows.Close()
+		// M11：rows.Err() 检查——连接中断导致的提前终止不得伪装成完整结果
+		if err := rows.Err(); err != nil {
+			h.logger.Warn("GetRatio declared rows truncated", zap.Error(err))
+			c.JSON(500, gin.H{"error": "读取声明倍率失败"})
+			return
+		}
 	}
 
 	// 实测历史（最近 100 次成功）
@@ -234,6 +241,11 @@ func (h *RatioHandler) GetRatio(c *gin.Context) {
 			})
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			h.logger.Warn("GetRatio history rows truncated", zap.Error(err))
+			c.JSON(500, gin.H{"error": "读取实测历史失败"})
+			return
+		}
 	}
 
 	// 各模型最新实测
@@ -258,6 +270,11 @@ func (h *RatioHandler) GetRatio(c *gin.Context) {
 			}
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			h.logger.Warn("GetRatio latest rows truncated", zap.Error(err))
+			c.JSON(500, gin.H{"error": "读取实测倍率失败"})
+			return
+		}
 	}
 
 	// 倍率检测分组（含代表倍率与组内明细）
@@ -307,6 +324,11 @@ func (h *RatioHandler) GetRatio(c *gin.Context) {
 			groups = append(groups, g)
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			h.logger.Warn("GetRatio groups rows truncated", zap.Error(err))
+			c.JSON(500, gin.H{"error": "读取倍率分组失败"})
+			return
+		}
 	}
 
 	c.JSON(200, gin.H{
@@ -474,12 +496,12 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 	}
 	reserved := false
 	var res *checker.ProbeResult
-	ok, rerr := tracker.Reserve(ctx, channelID,
-		checker.ToCentsForBudget(reserve),
-		checker.ToCentsForBudget(effectiveBudget),
-		checker.ToCentsForBudget(globalBudget),
-		checker.ToCentsForBudget(upstreamSpent), // C3：DB 已消费播种
-		checker.ToCentsForBudget(globalSpent))
+	ok, day, rerr := tracker.Reserve(ctx, channelID,
+		checker.ToBudgetUnits(reserve),
+		checker.ToBudgetUnits(effectiveBudget),
+		checker.ToBudgetUnits(globalBudget),
+		checker.ToBudgetUnits(upstreamSpent), // C3：DB 已消费播种
+		checker.ToBudgetUnits(globalSpent))
 	if rerr != nil {
 		return gin.H{"error": "预算预留失败，探测已取消"}, 500
 	}
@@ -487,20 +509,18 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 		return gin.H{"error": "今日探测预算已用完（并发探测占用中）", "remaining_budget": round2(math.Min(remainingGlobal, remainingChannel))}, 429
 	}
 	reserved = true
-	// 探测结束后按实际成本结算（失败全额退款；成功分支结算实际成本）。
-	// C5：余额后读取失败（CostPending）时保留预留不退款——
-	// 聊天已成功、上游可能已扣费，退款会让账目凭空少记一笔。
+	// 探测结束后结算：BudgetSettlement 决定按实际成本结算或保守保留预留
+	// （chat 失败/余额后读取失败/成本不可测都保留预留；仅 balance_before
+	// 失败全额退款），日桶随预留传递保证跨日结算落在同一桶。
 	// H8：结算失败记日志（补扣失败会少记消费，需人工核查账目）。
 	defer func() {
 		if reserved {
-			actualCents := int64(0)
-			if res != nil && res.Cost > 0 {
-				actualCents = checker.ToCentsForBudget(res.Cost)
+			keep, costUSD := res.BudgetSettlement()
+			actualUnits := checker.ToBudgetUnits(costUSD)
+			if keep {
+				actualUnits = checker.ToBudgetUnits(reserve)
 			}
-			if res != nil && res.CostPending {
-				actualCents = checker.ToCentsForBudget(reserve)
-			}
-			if aerr := tracker.Adjust(ctx, channelID, actualCents-checker.ToCentsForBudget(reserve)); aerr != nil {
+			if aerr := tracker.Adjust(ctx, channelID, day, actualUnits-checker.ToBudgetUnits(reserve)); aerr != nil {
 				h.logger.Error("Manual probe budget adjustment failed; spending ledger may be under-counted",
 					zap.Int("channel_id", channelID), zap.Error(aerr))
 			}
@@ -620,7 +640,7 @@ func (h *RatioHandler) CreateRatioGroup(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid channel id"})
 		return
 	}
-	ctx := context.Background()
+	ctx := c.Request.Context() // M11: 请求上下文（客户端断开即取消）
 
 	var exists bool
 	if err := h.db.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM upstreams WHERE id = $1)`, channelID).Scan(&exists); err != nil || !exists {
@@ -633,13 +653,19 @@ func (h *RatioHandler) CreateRatioGroup(c *gin.Context) {
 		return
 	}
 
-	// 模型必须属于该站点的映射键
-	if _, mapping, err := h.loadUpstream(ctx, channelID); err == nil {
-		for _, m := range req.Models {
-			if _, ok := mapping[m]; !ok {
-				c.JSON(400, gin.H{"error": fmt.Sprintf("模型 %q 不在该站点的模型映射中", m)})
-				return
-			}
+	// 模型必须属于该站点的映射键（M1 整改：校验 fail-closed）。
+	// 原先校验包在 err == nil 里——loadUpstream 失败（含凭据解密失败）
+	// 会静默跳过全部模型校验，未校验的 default_model 可入库并触发付费探测。
+	_, mapping, err := h.loadUpstream(ctx, channelID)
+	if err != nil {
+		h.logger.Warn("CreateRatioGroup validation aborted: load upstream failed", zap.Error(err))
+		c.JSON(500, gin.H{"error": "无法校验站点模型映射"})
+		return
+	}
+	for _, m := range req.Models {
+		if _, ok := mapping[m]; !ok {
+			c.JSON(400, gin.H{"error": fmt.Sprintf("模型 %q 不在该站点的模型映射中", m)})
+			return
 		}
 	}
 
@@ -671,7 +697,7 @@ func (h *RatioHandler) UpdateRatioGroup(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid group id"})
 		return
 	}
-	ctx := context.Background()
+	ctx := c.Request.Context() // M11: 请求上下文（客户端断开即取消）
 
 	_, curName, curDefault, curModels, err := h.loadRatioGroup(ctx, channelID, groupID)
 	if err != nil {
@@ -711,14 +737,18 @@ func (h *RatioHandler) UpdateRatioGroup(c *gin.Context) {
 		return
 	}
 
-	// 模型必须属于该站点的映射键
+	// 模型必须属于该站点的映射键（M1 整改：fail-closed）
 	if req.Models != nil {
-		if _, mapping, err := h.loadUpstream(ctx, channelID); err == nil {
-			for _, m := range models {
-				if _, ok := mapping[m]; !ok {
-					c.JSON(400, gin.H{"error": fmt.Sprintf("模型 %q 不在该站点的模型映射中", m)})
-					return
-				}
+		_, mapping, err := h.loadUpstream(ctx, channelID)
+		if err != nil {
+			h.logger.Warn("UpdateRatioGroup validation aborted: load upstream failed", zap.Error(err))
+			c.JSON(500, gin.H{"error": "无法校验站点模型映射"})
+			return
+		}
+		for _, m := range models {
+			if _, ok := mapping[m]; !ok {
+				c.JSON(400, gin.H{"error": fmt.Sprintf("模型 %q 不在该站点的模型映射中", m)})
+				return
 			}
 		}
 	}
@@ -753,7 +783,7 @@ func (h *RatioHandler) DeleteRatioGroup(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid group id"})
 		return
 	}
-	ctx := context.Background()
+	ctx := c.Request.Context() // M11: 请求上下文（客户端断开即取消）
 
 	ct, err := h.db.Pool.Exec(ctx, `DELETE FROM channel_ratio_groups WHERE id = $1 AND channel_id = $2`, groupID, channelID)
 	if err != nil {
@@ -823,7 +853,7 @@ func (h *RatioHandler) upsertModelPrice(ctx context.Context, model string, input
 
 // ListModelPrices GET /admin/model-prices - 官方模型价格库
 func (h *RatioHandler) ListModelPrices(c *gin.Context) {
-	ctx := context.Background()
+	ctx := c.Request.Context() // M11: 请求上下文（客户端断开即取消）
 	rows, err := h.db.Pool.Query(ctx, `
 		SELECT model, input_price_per_m, output_price_per_m,
 		       COALESCE(cached_read_per_m, 0), COALESCE(cached_write_per_m, 0),
@@ -883,7 +913,7 @@ func (h *RatioHandler) UpsertModelPrice(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := c.Request.Context() // M11: 请求上下文（客户端断开即取消）
 	if err := h.upsertModelPrice(ctx, req.Model, req.InputPricePerM, req.OutputPricePerM, req.CachedReadPerM, req.CachedWritePerM, req.Note); err != nil {
 		h.logger.Warn("Failed to upsert model price", zap.Error(err))
 		c.JSON(500, gin.H{"error": "failed to save model price"})
@@ -897,7 +927,7 @@ func (h *RatioHandler) UpsertModelPrice(c *gin.Context) {
 // DeleteModelPrice DELETE /admin/model-prices/:model - 删除官方模型价格
 func (h *RatioHandler) DeleteModelPrice(c *gin.Context) {
 	model := c.Param("model")
-	ctx := context.Background()
+	ctx := c.Request.Context() // M11: 请求上下文（客户端断开即取消）
 
 	ct, err := h.db.Pool.Exec(ctx, `DELETE FROM model_prices WHERE model = $1`, model)
 	if err != nil {
@@ -918,7 +948,7 @@ func (h *RatioHandler) DeleteModelPrice(c *gin.Context) {
 // 健康（最近 50 次存活探测）、倍率上限与超限标记、默认检测模型
 func (h *RatioHandler) GetChannelMetrics(c *gin.Context) {
 	gid := parseGroupIDParam(c)
-	ctx := context.Background()
+	ctx := c.Request.Context() // M11: 请求上下文（客户端断开即取消）
 
 	// 1. 站点列表（支持分组筛选）
 	rows, err := h.db.Pool.Query(ctx, `

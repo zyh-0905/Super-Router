@@ -27,7 +27,7 @@ func newModelsServer(t *testing.T, status int, body string) (*httptest.Server, *
 func TestConnectivityOpenAIBearer(t *testing.T) {
 	srv, headers := newModelsServer(t, 200, `{"data":[{"id":"gpt-4o"}]}`)
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
-	res := RunConnectivity(context.Background(), ch, 10*time.Second)
+	res := RunConnectivity(context.Background(), ch, 10*time.Second, nil)
 	if res.Status != StatusPassed {
 		t.Fatalf("status = %s, err = %s", res.Status, res.Error)
 	}
@@ -46,7 +46,7 @@ func TestConnectivityOpenAIBearer(t *testing.T) {
 func TestConnectivityAnthropicHeaders(t *testing.T) {
 	srv, headers := newModelsServer(t, 200, `{"data":[]}`)
 	ch := &Channel{BaseURL: srv.URL, Protocol: "anthropic", APIKey: "sk-ant-test"}
-	res := RunConnectivity(context.Background(), ch, 10*time.Second)
+	res := RunConnectivity(context.Background(), ch, 10*time.Second, nil)
 	if res.Status != StatusPassed {
 		t.Fatalf("status = %s, err = %s", res.Status, res.Error)
 	}
@@ -64,7 +64,7 @@ func TestConnectivityAnthropicHeaders(t *testing.T) {
 func TestConnectivityUnauthorized(t *testing.T) {
 	srv, _ := newModelsServer(t, 401, `{"error":{"message":"bad key"}}`)
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
-	res := RunConnectivity(context.Background(), ch, 10*time.Second)
+	res := RunConnectivity(context.Background(), ch, 10*time.Second, nil)
 	if res.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed", res.Status)
 	}
@@ -77,7 +77,7 @@ func TestConnectivityModels404ButChatAvailable(t *testing.T) {
 	// 404 模型列表 → attention + models_endpoint_unavailable（后续聊天检测可继续）
 	srv, _ := newModelsServer(t, 404, `{"error":"not found"}`)
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
-	res := RunConnectivity(context.Background(), ch, 10*time.Second)
+	res := RunConnectivity(context.Background(), ch, 10*time.Second, nil)
 	if res.Status != StatusAttention {
 		t.Fatalf("status = %s, want attention", res.Status)
 	}
@@ -93,7 +93,7 @@ func TestConnectivityTimeout(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	ch := &Channel{BaseURL: srv.URL, Protocol: "openai", APIKey: "sk-test"}
-	res := RunConnectivity(context.Background(), ch, 500*time.Millisecond)
+	res := RunConnectivity(context.Background(), ch, 500*time.Millisecond, nil)
 	if res.Status != StatusFailed {
 		t.Fatalf("status = %s, want failed on timeout", res.Status)
 	}

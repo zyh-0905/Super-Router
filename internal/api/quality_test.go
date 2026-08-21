@@ -67,7 +67,7 @@ func (f *fakeQualityRepo) FindActiveByChannel(ctx context.Context, channelID int
 func (f *fakeQualityRepo) ClaimNext(ctx context.Context, workerID string) (*quality.Run, error) {
 	return nil, nil
 }
-func (f *fakeQualityRepo) UpsertResult(ctx context.Context, runID int64, result quality.StageResult) error {
+func (f *fakeQualityRepo) UpsertResult(ctx context.Context, runID int64, workerID string, result quality.StageResult) error {
 	return nil
 }
 func (f *fakeQualityRepo) SetProgress(ctx context.Context, runID int64, stage string, progress int) error {
@@ -77,14 +77,16 @@ func (f *fakeQualityRepo) Heartbeat(ctx context.Context, runID int64, workerID s
 	return nil
 }
 func (f *fakeQualityRepo) RequestCancel(ctx context.Context, runID int64) error { return nil }
-func (f *fakeQualityRepo) IsCancelRequested(ctx context.Context, runID int64) (bool, error) {
+func (f *fakeQualityRepo) CancelIfRequested(ctx context.Context, runID int64, workerID string) (bool, error) {
 	return false, nil
 }
-func (f *fakeQualityRepo) Complete(ctx context.Context, runID int64, overall quality.OverallStatus) error {
+func (f *fakeQualityRepo) Complete(ctx context.Context, runID int64, workerID string, overall quality.OverallStatus) error {
 	return nil
 }
-func (f *fakeQualityRepo) Fail(ctx context.Context, runID int64, message string) error { return nil }
-func (f *fakeQualityRepo) Cancel(ctx context.Context, runID int64) error              { return nil }
+func (f *fakeQualityRepo) Fail(ctx context.Context, runID int64, workerID string, message string) error {
+	return nil
+}
+func (f *fakeQualityRepo) Cancel(ctx context.Context, runID int64, workerID string) error { return nil }
 func (f *fakeQualityRepo) RecoverStale(ctx context.Context, olderThan time.Time, maxAttempts int) (int64, error) {
 	return 0, nil
 }

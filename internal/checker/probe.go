@@ -97,6 +97,35 @@ type ProbeResult struct {
 	CostPending bool `json:"cost_pending,omitempty"`
 }
 
+// BudgetSettlement 返回预算结算规则（微美元记账的语义来源）：
+//   keep=true  保留预留金额（actual = reserved）——聊天已发起即可能已扣费：
+//              chat 阶段失败（上游可能已生成并计费）、余额后读取失败
+//              （CostPending）、成功但成本不可测（余额波动/充值导致
+//              cost <= 0）。保守方向：宁可账面多记，不可「已扣费但账目为零」。
+//   keep=false 按 costUSD 结算——仅当聊天未发起（balance_before 失败）
+//              全额退款，或成功且测得正成本按实际值结算。
+func (r *ProbeResult) BudgetSettlement() (keep bool, costUSD float64) {
+	if r == nil {
+		return true, 0
+	}
+	switch r.Stage {
+	case "balance_before":
+		return false, 0
+	case "chat", "balance_after":
+		return true, 0
+	}
+	if r.Cost > 0 {
+		return false, r.Cost
+	}
+	return true, 0
+}
+
+// probeEstimateBaseline 按 $10/1M 混合基准估算探测成本。
+// 失败行保守记账用：探测 ctx 可能已取消，不能查价格库，只能用纯函数。
+func probeEstimateBaseline(promptTokens, completionTokens int) float64 {
+	return float64(promptTokens+completionTokens) * 10.0 / 1_000_000
+}
+
 // 计价基准常量（probe_results.basis）
 const (
 	BasisOfficial = "official" // 相对该模型官网价
@@ -345,6 +374,26 @@ func (p *ProbeChecker) UpstreamTodaySpent(ctx context.Context, upstreamID int) (
 	return p.getUpstreamTodaySpent(ctx, upstreamID)
 }
 
+// recordProbeFailure 写入探测失败审计行（含保守估算成本）。
+// 独立后台上下文 + 错误日志：探测 ctx 可能已取消，失败记录恰恰
+// 最需要落库；这些行是 DB 预算汇总闸门的输入，写失败必须可见
+// 而非静默丢弃（原实现 `_, _ =` 吞错）。
+func (p *ProbeChecker) recordProbeFailure(upstreamID int, epoch int64, model, source string, maxTokens int) {
+	if p.db == nil || p.db.Pool == nil {
+		return
+	}
+	auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := p.db.Pool.Exec(auditCtx, `
+		INSERT INTO probe_results (upstream_id, epoch, model, success, source, cost, checked_at)
+		VALUES ($1, $2, $3, false, $4, $5, NOW())
+	`, upstreamID, epoch, model, source, probeEstimateBaseline(16, maxTokens))
+	if err != nil {
+		p.logger.Warn("Failed to record probe failure (budget gate may under-count)",
+			zap.Int("upstream_id", upstreamID), zap.String("model", model), zap.Error(err))
+	}
+}
+
 func (p *ProbeChecker) probeOne(ctx context.Context, upstream Upstream, epoch int64, model string, maxTokens int, source string) (*ProbeResult, error) {
 	start := time.Now()
 	res := &ProbeResult{Model: model}
@@ -376,29 +425,24 @@ func (p *ProbeChecker) probeOne(ctx context.Context, upstream Upstream, epoch in
 
 	if err != nil {
 		res.Error = fmt.Sprintf("推理请求失败: %v", err)
-		// 记录失败（含来源）
-		_, _ = p.db.Pool.Exec(ctx, `
-			INSERT INTO probe_results (upstream_id, epoch, model, success, source, checked_at)
-			VALUES ($1, $2, $3, false, $4, NOW())
-		`, upstream.ID, epoch, model, source)
+		// 记录失败（含保守估算成本）：聊天已发起、上游可能已扣费，
+		// DB 汇总闸门须与 Redis「保留预留」的结算语义一致——否则
+		// Redis 键丢失后播种基线会少记这一笔（审计整改）。
+		p.recordProbeFailure(upstream.ID, epoch, model, source, maxTokens)
 		return res, fmt.Errorf("call completion: %w", err)
 	}
 
 	// 3. 读取余额后
 	// C5：聊天已成功（上游可能已扣费）但余额后读取失败时，绝不能
 	// 把 Cost 记为 0 全额退款——否则下一次重试会重复扣费且账目为零。
-	// 标记 CostPending，调用方保留预留金额；同时落失败记录（不携带
-	// cost 数值，DB 汇总闸门不计入，Redis 账上保留预留即保守正确）。
+	// 标记 CostPending，调用方保留预留金额；失败行同样记保守估算
+	// 成本，让 DB 汇总闸门与 Redis 账上保留预留的语义保持一致。
 	res.Stage = "balance_after"
 	balanceAfter, err := p.getBalance(ctx, upstream)
 	if err != nil {
 		res.Error = fmt.Sprintf("读取余额失败: %v", err)
 		res.CostPending = true
-		_, _ = p.db.Pool.Exec(ctx, `
-			INSERT INTO probe_results (
-				upstream_id, epoch, model, success, source, checked_at
-			) VALUES ($1, $2, $3, false, $4, NOW())
-		`, upstream.ID, epoch, model, source)
+		p.recordProbeFailure(upstream.ID, epoch, model, source, maxTokens)
 		return res, fmt.Errorf("get balance after (cost pending): %w", err)
 	}
 	res.BalanceAfter = balanceAfter

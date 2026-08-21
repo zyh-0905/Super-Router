@@ -45,7 +45,7 @@ func (f *fakeRepo) ClaimNext(ctx context.Context, workerID string) (*Run, error)
 	f.claims = append(f.claims, r)
 	return r, nil
 }
-func (f *fakeRepo) UpsertResult(ctx context.Context, runID int64, result StageResult) error {
+func (f *fakeRepo) UpsertResult(ctx context.Context, runID int64, workerID string, result StageResult) error {
 	return nil
 }
 func (f *fakeRepo) SetProgress(ctx context.Context, runID int64, stage string, progress int) error {
@@ -53,11 +53,13 @@ func (f *fakeRepo) SetProgress(ctx context.Context, runID int64, stage string, p
 }
 func (f *fakeRepo) Heartbeat(ctx context.Context, runID int64, workerID string) error { return nil }
 func (f *fakeRepo) RequestCancel(ctx context.Context, runID int64) error             { return nil }
-func (f *fakeRepo) IsCancelRequested(ctx context.Context, runID int64) (bool, error) { return false, nil }
-func (f *fakeRepo) Complete(ctx context.Context, runID int64, overall OverallStatus) error {
+func (f *fakeRepo) CancelIfRequested(ctx context.Context, runID int64, workerID string) (bool, error) {
+	return false, nil
+}
+func (f *fakeRepo) Complete(ctx context.Context, runID int64, workerID string, overall OverallStatus) error {
 	return nil
 }
-func (f *fakeRepo) Fail(ctx context.Context, runID int64, message string) error {
+func (f *fakeRepo) Fail(ctx context.Context, runID int64, workerID string, message string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failures == nil {
@@ -66,7 +68,7 @@ func (f *fakeRepo) Fail(ctx context.Context, runID int64, message string) error 
 	f.failures[runID] = message
 	return nil
 }
-func (f *fakeRepo) Cancel(ctx context.Context, runID int64) error { return nil }
+func (f *fakeRepo) Cancel(ctx context.Context, runID int64, workerID string) error { return nil }
 func (f *fakeRepo) RecoverStale(ctx context.Context, olderThan time.Time, maxAttempts int) (int64, error) {
 	return 0, nil
 }

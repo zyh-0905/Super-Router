@@ -17,7 +17,8 @@ import (
 // RunChat 执行一次聊天探测（非流式或流式），返回 ChatEvidence。
 // 首字节超时、无 [DONE]、非法 JSON 等异常只影响证据字段，不 panic。
 // 凭据绝不写入错误信息（上游错误响应体最多截断 300 rune，且不包含请求头）。
-func RunChat(ctx context.Context, ch *Channel, sc ProbeScenario, timeout time.Duration) (*ChatEvidence, error) {
+// client 为共享出站客户端（含 SSRF 重定向校验，H3）；nil 时退回裸客户端（测试）。
+func RunChat(ctx context.Context, ch *Channel, sc ProbeScenario, timeout time.Duration, client *http.Client) (*ChatEvidence, error) {
 	ev := &ChatEvidence{RequestedModel: sc.Model}
 	start := time.Now()
 
@@ -42,7 +43,9 @@ func RunChat(ctx context.Context, ch *Channel, sc ProbeScenario, timeout time.Du
 		req.Header.Set("Authorization", "Bearer "+ch.APIKey)
 	}
 
-	client := &http.Client{Timeout: timeout}
+	if client == nil {
+		client = &http.Client{Timeout: timeout}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		if reqCtx.Err() != nil {

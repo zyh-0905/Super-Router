@@ -3,11 +3,14 @@ package quality
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"smart-router/internal/crypto"
+	"smart-router/internal/safenet"
 	"smart-router/internal/store"
 
 	"go.uber.org/zap"
@@ -24,6 +27,12 @@ type Executor struct {
 	ProbeModel string
 	AlertSink  AlertSink
 	Logger     *zap.Logger
+
+	// SafenetOpts SSRF 校验选项（H3）：由 Checker 按配置注入；
+	// 零值 = 生产默认（仅 https 公网上游）。
+	SafenetOpts safenet.Options
+	clientOnce  sync.Once
+	client      *http.Client
 }
 
 // NewExecutor 创建执行器（AlertSink 默认 Noop，Task 6 替换为 internal/alert 实现）。
@@ -44,6 +53,42 @@ func NewExecutor(db *store.DB, repo Repository, pub Publisher, cryptoKey, probeM
 		AlertSink:  NoopAlertSink{},
 		Logger:     logger,
 	}
+}
+
+// SetSafenetOptions 注入 SSRF 校验选项（Checker 装配时按配置文件设置；
+// 开发配置可放宽 AllowHTTP/AllowPrivate，与网关写入路径的口径一致）。
+func (e *Executor) SetSafenetOptions(o safenet.Options) {
+	e.SafenetOpts = o
+}
+
+// httpClient 返回带 SSRF 重定向校验的共享客户端（懒构建缓存）。
+// 质量检测的全部出站 HTTP 必须经它发出：裸 client 会跟随重定向
+// 直达内网/云元数据地址（H3 整改）。
+func (e *Executor) httpClient() *http.Client {
+	e.clientOnce.Do(func() {
+		base := e.HTTPClient
+		if base == nil {
+			base = &http.Client{Timeout: 60 * time.Second}
+		}
+		c := *base // 拷贝：Transport 指针共享安全，CheckRedirect 独立
+		if c.Transport == nil {
+			c.Transport = http.DefaultTransport
+		}
+		c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return safenet.ValidateRedirect(req.URL.String(), e.SafenetOpts)
+		}
+		e.client = &c
+	})
+	return e.client
+}
+
+// Execute 执行一个任务（Worker 调用；run 必须带 WorkerID——
+// ClaimNext 领取后写入，作为所有权谓词的凭据）。
+func (e *Executor) Execute(ctx context.Context, run *Run) error {
+	return e.execute(ctx, run, run.WorkerID)
 }
 
 // nilPublisher 无事件发布的兜底。
@@ -116,12 +161,18 @@ func StageNames(depth string) []string {
 	return FullStages
 }
 
-// Execute 执行一个任务：固定阶段顺序，每阶段之间检查取消；
+// execute 执行一个任务：固定阶段顺序，每阶段之间检查取消；
 // 阶段开始/结束都更新 Repository 与 Publisher；basic 在 StreamStage 后完成。
-func (e *Executor) Execute(ctx context.Context, run *Run) error {
+// workerID 用于全部写库操作的所有权谓词（C3）。
+func (e *Executor) execute(ctx context.Context, run *Run, workerID string) error {
 	ch, err := e.LoadChannel(ctx, run.ChannelID)
 	if err != nil {
 		return fmt.Errorf("load channel: %w", err)
+	}
+	// H3：加载后校验 BaseURL（历史数据/直接改库可能绕过写入路径的校验），
+	// 重定向校验由 httpClient 的 CheckRedirect 在请求时执行。
+	if err := safenet.ValidateUpstreamURL(ch.BaseURL, e.SafenetOpts); err != nil {
+		return fmt.Errorf("upstream url rejected: %w", err)
 	}
 
 	// 模型解析：显式（任务自带）→ test_model → probe_model → 首映射
@@ -142,10 +193,13 @@ func (e *Executor) Execute(ctx context.Context, run *Run) error {
 
 	step := 0
 	for _, name := range stages {
-		// 取消检查（阶段之间）
-		cancelRequested, _ := e.Repo.IsCancelRequested(ctx, run.ID)
-		if cancelRequested {
-			_ = e.Repo.Cancel(ctx, run.ID)
+		// 取消检查（阶段之间）：单语句检查+推进（M9），
+		// 错误不再静默丢弃——查询失败时中止任务而非装作未取消。
+		cancelled, cerr := e.Repo.CancelIfRequested(ctx, run.ID, workerID)
+		if cerr != nil {
+			return fmt.Errorf("check cancel: %w", cerr)
+		}
+		if cancelled {
 			e.publish(ctx, run.ID, "task_cancelled", name, 0, nil)
 			return nil
 		}
@@ -155,7 +209,10 @@ func (e *Executor) Execute(ctx context.Context, run *Run) error {
 			// 未实现阶段（如 usage/behavior 在 Task 4 之前）→ skipped
 			res := StageResult{Stage: name, CheckName: name, Status: StatusSkipped,
 				Details: map[string]interface{}{"reason": "stage_not_implemented"}}
-			if err := e.Repo.UpsertResult(ctx, run.ID, res); err != nil {
+			if err := e.Repo.UpsertResult(ctx, run.ID, workerID, res); err != nil {
+				if errors.Is(err, ErrLostOwnership) {
+					return err // 所有权丢失：立即停止（C3）
+				}
 				e.Logger.Warn("Upsert skipped stage failed", zap.Error(err))
 			}
 			step++
@@ -174,19 +231,14 @@ func (e *Executor) Execute(ctx context.Context, run *Run) error {
 		if res.CheckName == "" {
 			res.CheckName = name
 		}
-		if err := e.Repo.UpsertResult(ctx, run.ID, res); err != nil {
+		if err := e.Repo.UpsertResult(ctx, run.ID, workerID, res); err != nil {
+			if errors.Is(err, ErrLostOwnership) {
+				return err // 所有权丢失：立即停止（C3）
+			}
 			e.Logger.Warn("Upsert stage result failed", zap.Error(err))
 		}
 		step++
 		e.publish(ctx, run.ID, "stage_result", name, progressOf(step, len(stages)), res)
-
-		// 阶段之间再次检查取消
-		cancelRequested, _ = e.Repo.IsCancelRequested(ctx, run.ID)
-		if cancelRequested {
-			_ = e.Repo.Cancel(ctx, run.ID)
-			e.publish(ctx, run.ID, "task_cancelled", name, 0, nil)
-			return nil
-		}
 	}
 
 	// 归纳总体结论
@@ -195,7 +247,7 @@ func (e *Executor) Execute(ctx context.Context, run *Run) error {
 		return fmt.Errorf("load results for summary: %w", err)
 	}
 	overall := Summarize(results)
-	if err := e.Repo.Complete(ctx, run.ID, overall); err != nil {
+	if err := e.Repo.Complete(ctx, run.ID, workerID, overall); err != nil {
 		return fmt.Errorf("complete run: %w", err)
 	}
 	e.publish(ctx, run.ID, "task_completed", "", 100, map[string]interface{}{"overall": string(overall)})
@@ -274,5 +326,5 @@ func (s connectivityStage) Run(ctx context.Context, input *StageContext) StageRe
 			timeout = t
 		}
 	}
-	return RunConnectivity(ctx, input.Channel, timeout)
+	return RunConnectivity(ctx, input.Channel, timeout, s.executor.httpClient())
 }

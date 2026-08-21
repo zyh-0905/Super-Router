@@ -2,6 +2,7 @@ package quality
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -27,7 +28,10 @@ type Worker struct {
 	Logger        *zap.Logger
 }
 
-// NewWorker 创建 Worker（默认并发 3、轮询 2s、心跳 10s、过期 2 分钟、重试 2 次）。
+// NewWorker 创建 Worker（默认并发 3、轮询 2s、心跳 10s、过期 5 分钟、重试 2 次）。
+// StaleAfter 必须明显大于单次聊天探测上限（maxChatTimeout=2m）：
+// 与 2m 相等时，DB 短暂抖动导致心跳连续失败即可在正常任务仍
+// 执行期间触发误回收（M8），5m 提供 2.5 倍余量。
 func NewWorker(repo Repository, executor ExecutorRunner, workerID string, logger *zap.Logger) *Worker {
 	if logger == nil {
 		logger = zap.NewNop()
@@ -39,7 +43,7 @@ func NewWorker(repo Repository, executor ExecutorRunner, workerID string, logger
 		MaxConcurrent:  3,
 		PollInterval:   2 * time.Second,
 		HeartbeatEvery: 10 * time.Second,
-		StaleAfter:     2 * time.Minute,
+		StaleAfter:     5 * time.Minute,
 		MaxAttempts:    2,
 		Logger:         logger,
 	}
@@ -126,8 +130,17 @@ func (w *Worker) executeTask(ctx context.Context, run *Run) {
 	taskCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// 心跳循环
+	// 心跳循环（C3 整改）：心跳失败——尤其是所有权丢失——必须立即
+	// 取消任务上下文终止执行。只记日志会让被 RecoverStale 回收的
+	// 执行体继续探测同一上游（与接管者并行、重复扣费），并继续写库。
 	done := make(chan struct{})
+	var cancelOnce sync.Once
+	abort := func(reason string) {
+		cancelOnce.Do(func() {
+			w.Logger.Warn("Quality task aborted", zap.Int64("run_id", run.ID), zap.String("reason", reason))
+			cancel()
+		})
+	}
 	go func() {
 		t := time.NewTicker(w.HeartbeatEvery)
 		defer t.Stop()
@@ -137,7 +150,14 @@ func (w *Worker) executeTask(ctx context.Context, run *Run) {
 				return
 			case <-t.C:
 				if err := w.Repo.Heartbeat(taskCtx, run.ID, w.WorkerID); err != nil {
-					w.Logger.Warn("Heartbeat failed", zap.Int64("run_id", run.ID), zap.Error(err))
+					if taskCtx.Err() != nil {
+						return // 任务已取消/结束，心跳随之下线
+					}
+					if errors.Is(err, ErrLostOwnership) {
+						abort("ownership lost")
+					} else {
+						w.Logger.Warn("Heartbeat failed", zap.Int64("run_id", run.ID), zap.Error(err))
+					}
 				}
 			}
 		}
@@ -148,9 +168,20 @@ func (w *Worker) executeTask(ctx context.Context, run *Run) {
 	close(done)
 
 	if execErr != nil {
+		// 所有权丢失：任务已被其它 worker 接管，绝不再写终态/结果。
+		if errors.Is(execErr, ErrLostOwnership) {
+			w.Logger.Warn("Quality task lost ownership, discarding result",
+				zap.Int64("run_id", run.ID))
+			return
+		}
+		if taskCtx.Err() != nil && ctx.Err() == nil {
+			// 心跳中止的执行：不写终态（接管者/回收流程负责该行）
+			w.Logger.Warn("Quality task aborted by heartbeat loss, no terminal write",
+				zap.Int64("run_id", run.ID))
+			return
+		}
 		// 检查是否取消请求（取消优先于失败）
-		if cancelled, _ := w.Repo.IsCancelRequested(ctx, run.ID); cancelled {
-			_ = w.Repo.Cancel(ctx, run.ID)
+		if cancelled, _ := w.Repo.CancelIfRequested(ctx, run.ID, w.WorkerID); cancelled {
 			w.Logger.Info("Quality task cancelled", zap.Int64("run_id", run.ID))
 			return
 		}
@@ -158,8 +189,12 @@ func (w *Worker) executeTask(ctx context.Context, run *Run) {
 		if len(msg) > 500 {
 			msg = msg[:500]
 		}
-		if err := w.Repo.Fail(ctx, run.ID, msg); err != nil {
-			w.Logger.Warn("Fail write failed", zap.Int64("run_id", run.ID), zap.Error(err))
+		if err := w.Repo.Fail(ctx, run.ID, w.WorkerID, msg); err != nil {
+			if errors.Is(err, ErrLostOwnership) {
+				w.Logger.Warn("Quality task lost ownership at Fail", zap.Int64("run_id", run.ID))
+			} else {
+				w.Logger.Warn("Fail write failed", zap.Int64("run_id", run.ID), zap.Error(err))
+			}
 		}
 		w.Logger.Warn("Quality task failed", zap.Int64("run_id", run.ID), zap.Error(execErr))
 		return
