@@ -379,7 +379,7 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 			}}
 		}
 		if err != nil {
-			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, err, &attempts, i, false, probeReserved)
+			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, err, &attempts, i, false, probeReserved, 0, 0)
 			if !isRetryable(err, ctx) {
 				h.logger.Info("Error not retryable", zap.String("error_class", classifyError(err)))
 				c.Set("proxy_outcome", "upstream_error")
@@ -403,7 +403,7 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 					// 只记历史（error_class=client_canceled，熔断统计排除），
 					// 不更新熔断、不记上游失败指标。
 					h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, true,
-						int(time.Since(attemptStart).Milliseconds()), groupID, "client_canceled")
+						int(time.Since(attemptStart).Milliseconds()), groupID, "client_canceled", 0, 0)
 					c.Set("proxy_outcome", "client_canceled")
 					return
 				}
@@ -411,20 +411,23 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 					// 客户端已收到部分数据，只能中断连接（上游中断）
 					c.Set("proxy_outcome", "stream_interrupted")
 					h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart,
-						fmt.Errorf("stream interrupted: %w", io.ErrUnexpectedEOF), &attempts, i, true, probeReserved)
+						fmt.Errorf("stream interrupted: %w", io.ErrUnexpectedEOF), &attempts, i, true, probeReserved, 0, 0)
 					return
 				}
 				// 客户端未收到任何字节（含 H4 空 SSE），安全切换
 				h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart,
-					fmt.Errorf("stream failed before first byte"), &attempts, i, false, probeReserved)
+					fmt.Errorf("stream failed before first byte"), &attempts, i, false, probeReserved, 0, 0)
 				continue
 			}
 			c.Set("proxy_outcome", "success")
-			h.succeedAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, &attempts, i, probeReserved)
+			// B1：流式末尾 usage chunk 经 gin context 传给 succeedAttempt 落库
+			h.succeedAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, &attempts, i, probeReserved,
+				c.GetInt("usage_prompt"), c.GetInt("usage_completion"))
 			return
 		}
 
 		// 非流式：先完整缓冲响应；读取失败时客户端未收到任何数据，可安全切换。
+		// B1：响应体已在内存中，顺带解析 usage（成本统计，零额外开销）。
 		// 读取阶段受渠道 timeout_total_ms 约束（P2-07），并保留 10 分钟兜底上限。
 		readCtx, cancelRead := context.WithTimeout(ctx, 10*time.Minute)
 		if channel.TimeoutTotalMS > 0 {
@@ -449,7 +452,7 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 			if errors.Is(readErr, context.Canceled) && ctx.Err() == nil && !firstByte.Load() {
 				attemptErr = fmt.Errorf("%w: no first byte within %dms", errTTFBTimeout, ttfbBudgetMS)
 			}
-			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, attemptErr, &attempts, i, false, probeReserved)
+			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, attemptErr, &attempts, i, false, probeReserved, 0, 0)
 			if isRetryable(attemptErr, ctx) {
 				continue
 			}
@@ -461,12 +464,20 @@ func (h *ProxyHandler) HandleChatCompletion(c *gin.Context) {
 		var response map[string]interface{}
 		if err := json.Unmarshal(data, &response); err != nil {
 			h.failAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart,
-				fmt.Errorf("invalid upstream response: %w", err), &attempts, i, false, probeReserved)
+				fmt.Errorf("invalid upstream response: %w", err), &attempts, i, false, probeReserved, 0, 0)
 			continue
 		}
 
+		// B1：非流式响应直接解析 usage（已在内存中，零额外开销）
+		if usage, ok := response["usage"].(map[string]interface{}); ok {
+			c.Set("usage_prompt", asInt(usage["prompt_tokens"]))
+			c.Set("usage_completion", asInt(usage["completion_tokens"]))
+		}
+
 		c.Set("proxy_outcome", "success")
-		h.succeedAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, &attempts, i, probeReserved)
+		// B1：非流式 usage 已解析进 gin context
+		h.succeedAttempt(ctx, requestID, &req, routeResult, groupID, channel, attemptStart, &attempts, i, probeReserved,
+			c.GetInt("usage_prompt"), c.GetInt("usage_completion"))
 		h.setRoutingHeaders(c, requestID, channel, routeResult)
 		c.Set("model", req.Model)
 		c.Set("channel", fmt.Sprintf("%d", channel.ID))
@@ -563,7 +574,7 @@ func (h *ProxyHandler) setRoutingHeaders(c *gin.Context, requestID string, chann
 }
 
 // failAttempt 记录一次失败尝试：指标、熔断、请求历史与故障切换计数
-func (h *ProxyHandler) failAttempt(ctx context.Context, requestID string, req *ChatCompletionRequest, routeResult *router.RouteResult, groupID *int, channel *router.ChannelHealth, attemptStart time.Time, err error, attempts *[]router.AttemptRecord, index int, firstByteCommitted bool, probeReserved bool) {
+func (h *ProxyHandler) failAttempt(ctx context.Context, requestID string, req *ChatCompletionRequest, routeResult *router.RouteResult, groupID *int, channel *router.ChannelHealth, attemptStart time.Time, err error, attempts *[]router.AttemptRecord, index int, firstByteCommitted bool, probeReserved bool, promptTokens, completionTokens int) {
 	if probeReserved {
 		// 探测完成（无论成败），释放半开探测名额（按分组桶，P1-04）
 		h.router.ReleaseHalfOpenProbe(ctx, channel.ID, req.Model, groupID)
@@ -592,10 +603,13 @@ func (h *ProxyHandler) failAttempt(ctx context.Context, requestID string, req *C
 		h.buffer.Enqueue(circuitSample{
 			requestID: requestID, channelID: channel.ID, model: req.Model, groupID: groupID,
 			success: false, firstByte: firstByteCommitted,
-			durationMS: int(time.Since(attemptStart).Milliseconds()), errorClass: errClass,
+			durationMS:       int(time.Since(attemptStart).Milliseconds()),
+			errorClass:       errClass,
+			promptTokens:     promptTokens,
+			completionTokens: completionTokens,
 		})
 	} else {
-		h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, firstByteCommitted, int(time.Since(attemptStart).Milliseconds()), groupID, errClass)
+		h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, firstByteCommitted, int(time.Since(attemptStart).Milliseconds()), groupID, errClass, promptTokens, completionTokens)
 		if h.circuit != nil {
 			if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, false, errClass); cerr != nil {
 				h.logger.Warn("Failed to update circuit state (failure)",
@@ -620,8 +634,9 @@ func (h *ProxyHandler) failAttempt(ctx context.Context, requestID string, req *C
 	)
 }
 
-// succeedAttempt 记录一次成功尝试：指标、熔断、请求历史与故障切换计数
-func (h *ProxyHandler) succeedAttempt(ctx context.Context, requestID string, req *ChatCompletionRequest, routeResult *router.RouteResult, groupID *int, channel *router.ChannelHealth, attemptStart time.Time, attempts *[]router.AttemptRecord, index int, probeReserved bool) {
+// succeedAttempt 记录一次成功尝试：指标、熔断、请求历史与故障切换计数。
+// promptTokens/completionTokens 为上游返回的真实用量（B1 成本统计；0 = 未捕获）。
+func (h *ProxyHandler) succeedAttempt(ctx context.Context, requestID string, req *ChatCompletionRequest, routeResult *router.RouteResult, groupID *int, channel *router.ChannelHealth, attemptStart time.Time, attempts *[]router.AttemptRecord, index int, probeReserved bool, promptTokens, completionTokens int) {
 	if probeReserved {
 		// 探测成功，释放半开探测名额（按分组桶，P1-04）
 		h.router.ReleaseHalfOpenProbe(ctx, channel.ID, req.Model, groupID)
@@ -648,10 +663,13 @@ func (h *ProxyHandler) succeedAttempt(ctx context.Context, requestID string, req
 		h.buffer.Enqueue(circuitSample{
 			requestID: requestID, channelID: channel.ID, model: req.Model, groupID: groupID,
 			success: true, firstByte: true,
-			durationMS: int(time.Since(attemptStart).Milliseconds()), errorClass: "",
+			durationMS:       int(time.Since(attemptStart).Milliseconds()),
+			errorClass:       "",
+			promptTokens:     promptTokens,
+			completionTokens: completionTokens,
 		})
 	} else {
-		h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, true, true, int(time.Since(attemptStart).Milliseconds()), groupID, "")
+		h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, true, true, int(time.Since(attemptStart).Milliseconds()), groupID, "", promptTokens, completionTokens)
 		if h.circuit != nil {
 			if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, true, ""); cerr != nil {
 				h.logger.Warn("Failed to update circuit state (success)",
@@ -800,6 +818,8 @@ func (h *ProxyHandler) callAnthropic(ctx context.Context, channel *router.Channe
 //     视为上游未产出任何内容，调用方可切换下一个候选）；
 //   - clientGone：客户端主动断开（H5：与上游故障严格区分，
 //     调用方不得将其计入上游熔断/失败指标）。
+//
+// B1：嗅探流末尾的 usage chunk（转发不拦截，只透传时顺带解析成本统计用）。
 func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHeaders func()) (committed bool, ok bool, clientGone bool) {
 	defer body.Close()
 
@@ -807,12 +827,16 @@ func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHea
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 
+	var usagePrompt, usageCompletion int
 	buf := make([]byte, 4096)
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
 			if !committed {
 				setHeaders()
+			}
+			if p, comp := scanUsageChunk(buf[:n]); p > 0 || comp > 0 {
+				usagePrompt, usageCompletion = p, comp
 			}
 			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
 				// 客户端已断开：不是上游故障
@@ -824,6 +848,10 @@ func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHea
 		if err != nil {
 			if err == io.EOF {
 				// H4：首字节前就 EOF = 空 SSE 响应，不算成功
+				if committed {
+					c.Set("usage_prompt", usagePrompt)
+					c.Set("usage_completion", usageCompletion)
+				}
 				return committed, committed, false
 			}
 			return committed, false, false
@@ -831,10 +859,49 @@ func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHea
 	}
 }
 
+// scanUsageChunk 从 SSE 字节流中嗅探 usage 字段（B1 成本统计，best-effort）。
+// 流式响应的 usage 通常出现在最后一帧（include_usage 或结束帧），
+// 逐块扫描 `"usage":{...}` 并取最后一次出现（跨块边界不完整时丢弃，
+// 只做尽力而为的统计，绝不影响转发）。
+func scanUsageChunk(chunk []byte) (promptTokens, completionTokens int) {
+	idx := 0
+	for {
+		i := bytes.Index(chunk[idx:], []byte(`"usage"`))
+		if i < 0 {
+			return promptTokens, completionTokens
+		}
+		start := idx + i + len(`"usage"`)
+		// 找 { 到匹配 } 的最小窗口
+		open := bytes.IndexByte(chunk[start:], '{')
+		if open < 0 {
+			return promptTokens, completionTokens // 跨块截断：丢弃
+		}
+		body := chunk[start+open:]
+		closeIdx := bytes.IndexByte(body, '}')
+		if closeIdx < 0 {
+			return promptTokens, completionTokens
+		}
+		var usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		}
+		if json.Unmarshal(body[:closeIdx+1], &usage) == nil {
+			promptTokens = usage.PromptTokens
+			completionTokens = usage.CompletionTokens
+			if promptTokens == 0 && completionTokens == 0 && usage.TotalTokens > 0 {
+				// 上游只给 total：无法拆分，prompt 记 total（保守计入输入）
+				promptTokens = usage.TotalTokens
+			}
+		}
+		idx = start + open + closeIdx + 1
+	}
+}
+
 // recordRequestHistory 写入请求历史（requestID 复用本次请求，便于全链路追踪）。
 // errorClass 用于熔断样本过滤（client_canceled 不参与开闸统计）。
 // A3：优先经 CircuitBuffer 异步批量落库；队列满时回退同步。
-func (h *ProxyHandler) recordRequestHistory(ctx context.Context, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int, errorClass string) {
+func (h *ProxyHandler) recordRequestHistory(ctx context.Context, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int, errorClass string, promptTokens, completionTokens int) {
 	if h.buffer != nil {
 		h.buffer.Enqueue(circuitSample{
 			requestID:  requestID,
@@ -846,11 +913,13 @@ func (h *ProxyHandler) recordRequestHistory(ctx context.Context, requestID strin
 			durationMS: durationMS,
 			errorClass: errorClass,
 			// client_canceled 等不计入熔断的样本（H5）：只写历史不更新熔断
-			skipCircuit: errorClass == "client_canceled",
+			skipCircuit:      errorClass == "client_canceled",
+			promptTokens:     promptTokens,
+			completionTokens: completionTokens,
 		})
 		return
 	}
-	insertRequestHistory(h.ctxOrDefault(ctx), h.db, requestID, channelID, model, success, firstByte, durationMS, groupID, errorClass)
+	insertRequestHistory(h.ctxOrDefault(ctx), h.db, requestID, channelID, model, success, firstByte, durationMS, groupID, errorClass, promptTokens, completionTokens)
 }
 
 // ctxOrDefault 缓冲不可用时以请求上下文写库（保持旧行为；带兜底超时）。
@@ -862,26 +931,56 @@ func (h *ProxyHandler) ctxOrDefault(ctx context.Context) context.Context {
 }
 
 // insertRequestHistory 历史写入的核心语句（同步单语句路径；缓冲批量路径见 insertRequestHistoryQ）。
-func insertRequestHistory(ctx context.Context, db *store.DB, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int, errorClass string) {
+func insertRequestHistory(ctx context.Context, db *store.DB, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int, errorClass string, promptTokens, completionTokens int) {
 	if _, err := db.Pool.Exec(ctx, `
 		INSERT INTO request_history (
 			request_id, channel_id, model, success, first_byte_commit,
-			ttft_ms, total_duration_ms, group_id, error_class, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-	`, requestID, channelID, model, success, firstByte, durationMS, durationMS, groupID, errorClass); err != nil {
+			ttft_ms, total_duration_ms, group_id, error_class,
+			prompt_tokens, completion_tokens, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+	`, requestID, channelID, model, success, firstByte, durationMS, durationMS,
+		groupID, errorClass, nullableInt(promptTokens), nullableInt(completionTokens)); err != nil {
 		// 同步路径仅告警（缓冲路径由 worker 负责重试/回退）
 	}
 }
 
+// asInt 宽松数字转换（usage 字段可能为 float64，JSON 解码默认）。
+func asInt(v interface{}) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return 0
+}
+
 // insertRequestHistoryQ 缓冲批量路径的历史写入（事务内；失败返回错误供回退）。
+// prompt/completion tokens 为上游返回的真实用量（B1 成本统计）；0 或 NULL 表示未捕获。
 func insertRequestHistoryQ(ctx context.Context, q circuitTx, s circuitSample) error {
 	_, err := q.Exec(ctx, `
 		INSERT INTO request_history (
 			request_id, channel_id, model, success, first_byte_commit,
-			ttft_ms, total_duration_ms, group_id, error_class, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-	`, s.requestID, s.channelID, s.model, s.success, s.firstByte, s.durationMS, s.durationMS, s.groupID, s.errorClass)
+			ttft_ms, total_duration_ms, group_id, error_class,
+			prompt_tokens, completion_tokens, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+	`, s.requestID, s.channelID, s.model, s.success, s.firstByte, s.durationMS, s.durationMS,
+		s.groupID, s.errorClass, nullableInt(s.promptTokens), nullableInt(s.completionTokens))
 	return err
+}
+
+// nullableInt 0 → NULL（未捕获的用量以 NULL 入库，聚合时区分「无数据」与「真实 0」）。
+func nullableInt(v int) interface{} {
+	if v <= 0 {
+		return nil
+	}
+	return v
 }
 
 // resolveGroupID 将分组名（或数字 ID）解析为分组 ID

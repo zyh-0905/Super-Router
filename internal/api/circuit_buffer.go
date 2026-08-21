@@ -42,6 +42,9 @@ type circuitSample struct {
 	errorClass string
 	// skipCircuit 只写历史不更新熔断（client_canceled 等不计入熔断样本的路径）
 	skipCircuit bool
+	// B1：上游返回的真实用量（仅统计成本用，不用于计费）；失败/未捕获为 0
+	promptTokens     int
+	completionTokens int
 }
 
 // CircuitBuffer 异步缓冲器。

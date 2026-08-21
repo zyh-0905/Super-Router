@@ -244,6 +244,7 @@ func main() {
 		adminGroup.GET("/circuit", adminHandler.GetCircuitStates)
 		adminGroup.POST("/circuit/:channel_id/reset", adminHandler.ResetCircuit)
 		adminGroup.GET("/stats", adminHandler.GetStats)
+		adminGroup.GET("/costs", adminHandler.GetCosts)
 		adminGroup.GET("/alerts", adminHandler.GetAlerts)
 		adminGroup.GET("/keys", adminHandler.ListKeys)
 		adminGroup.POST("/keys", adminHandler.CreateKey)
