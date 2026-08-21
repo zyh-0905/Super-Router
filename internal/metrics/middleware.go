@@ -103,10 +103,12 @@ func RecordSnapshotLoadDuration(duration float64) {
 	SnapshotLoadDuration.Observe(duration)
 }
 
-// RecordProxyRequest 记录代理请求
+// RecordProxyRequest 记录代理请求（M6：模型名经 sanitize 收敛基数——
+// 原先直接以原始 model 名作 label，绕过了 300 上限防护，
+// 伪造模型名可撑爆指标存储）。
 func RecordProxyRequest(channel, model, status string, duration float64) {
-	ProxyRequestsTotal.WithLabelValues(channel, model, status).Inc()
-	ProxyDuration.WithLabelValues(channel, model).Observe(duration)
+	ProxyRequestsTotal.WithLabelValues(channel, sanitizeModelLabel(model), status).Inc()
+	ProxyDuration.WithLabelValues(channel, sanitizeModelLabel(model)).Observe(duration)
 }
 
 // RecordFailover 记录故障切换

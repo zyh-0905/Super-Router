@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"smart-router/internal/store"
 
+	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 )
 
@@ -70,15 +72,16 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 
 	// 锁定行并读取当前状态（串行化同一 (渠道, 模型, 分组桶) 的并发更新）
 	var currentState string
-	var failureCount, successCount int
+	var failureCount, successCount, coolingLevel int
 	var coolingUntil time.Time
 
 	err = tx.QueryRow(ctx, `
-		SELECT state, failure_count, success_count, COALESCE(cooling_until, '1970-01-01'::timestamp)
+		SELECT state, failure_count, success_count, cooling_level,
+		       COALESCE(cooling_until, '1970-01-01'::timestamp)
 		FROM circuit_states
 		WHERE channel_id = $1 AND model = $2 AND capability = '' AND group_id = $3
 		FOR UPDATE
-	`, channelID, model, bucket).Scan(&currentState, &failureCount, &successCount, &coolingUntil)
+	`, channelID, model, bucket).Scan(&currentState, &failureCount, &successCount, &coolingLevel, &coolingUntil)
 
 	if err != nil {
 		// DB 错误：不 fail-open，避免把已开闸状态误重置
@@ -103,7 +106,7 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 		shouldOpen = m.shouldOpen(ctx, channelID, model, bucket, cfg)
 	}
 
-	newState, newCoolingUntil := transitionCircuitState(currentState, coolingUntil, success, failureCount, successCount, shouldOpen, cfg)
+	newState, newCoolingUntil, newCoolingLevel := transitionCircuitState(currentState, coolingUntil, coolingLevel, success, failureCount, successCount, shouldOpen, cfg)
 	if newState != currentState {
 		m.logger.Info("Circuit state transition",
 			zap.Int("channel_id", channelID),
@@ -122,11 +125,11 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 
 	// 写入数据库（单一语句：指针为 nil 时写入 NULL；按分组桶 upsert）
 	_, err = tx.Exec(ctx, `
-		INSERT INTO circuit_states (channel_id, model, capability, group_id, state, opened_at, cooling_until, failure_count, success_count, updated_at)
-		VALUES ($1, $2, '', $3, $4, $5, $6, $7, $8, NOW())
+		INSERT INTO circuit_states (channel_id, model, capability, group_id, state, opened_at, cooling_until, failure_count, success_count, cooling_level, updated_at)
+		VALUES ($1, $2, '', $3, $4, $5, $6, $7, $8, $9, NOW())
 		ON CONFLICT (channel_id, model, capability, group_id)
-		DO UPDATE SET state = $4, opened_at = $5, cooling_until = $6, failure_count = $7, success_count = $8, updated_at = NOW()
-	`, channelID, model, bucket, newState, openedAt, newCoolingUntil, failureCount, successCount)
+		DO UPDATE SET state = $4, opened_at = $5, cooling_until = $6, failure_count = $7, success_count = $8, cooling_level = $9, updated_at = NOW()
+	`, channelID, model, bucket, newState, openedAt, newCoolingUntil, failureCount, successCount, newCoolingLevel)
 	if err != nil {
 		return err
 	}
@@ -138,7 +141,11 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 // transitionCircuitState 计算熔断状态转换（纯函数，便于测试）。
 // coolingUntil 为当前记录的冷却截止时间：open 且已到期 → 按 half_open 处理，
 // 使探测成功/失败直接进入 half_open 分支（open → half_open 时间驱动，无需等待请求）。
-func transitionCircuitState(currentState string, coolingUntil time.Time, success bool, failureCount, successCount int, shouldOpen bool, cfg CircuitBreakerConfig) (string, *time.Time) {
+// coolingLevel 为持久化退避档位（H4）：degraded 再失败开闸时延续此前的档位
+// 并升一级——进入 degraded 必经一次成功，failureCount 已被清零，
+// 仅靠 failureCount 会让不稳定上游在 open→degraded→open 循环中
+// 永久钉在最短冷却档。
+func transitionCircuitState(currentState string, coolingUntil time.Time, coolingLevel int, success bool, failureCount, successCount int, shouldOpen bool, cfg CircuitBreakerConfig) (string, *time.Time, int) {
 	now := time.Now()
 
 	// 时间驱动转换：open 且冷却到期 → 视为 half_open
@@ -151,26 +158,44 @@ func transitionCircuitState(currentState string, coolingUntil time.Time, success
 	case "closed":
 		if shouldOpen {
 			t := now.Add(time.Duration(cfg.InitialCoolingSeconds) * time.Second)
-			return "open", &t
+			return "open", &t, 0
 		}
 	case "half_open":
 		if success {
-			// 探测成功 → 降级状态（放行正常流量，持续观察）
-			return "degraded", nil
+			// 探测成功 → 降级状态（放行正常流量，持续观察）；
+			// 保留冷却档位供 degraded 再失败时延续
+			return "degraded", nil, coolingLevel
 		}
 		// 探测失败 → 重新开闸，进入下一级指数退避冷却
 		t := now.Add(nextCoolingDuration(failureCount, cfg))
-		return "open", &t
+		return "open", &t, coolingLevel
 	case "degraded":
 		if successCount >= cfg.RecoverySuccessThreshold {
-			return "closed", nil
+			return "closed", nil, 0
 		}
 		if !success && shouldOpen {
-			t := now.Add(time.Duration(cfg.InitialCoolingSeconds) * time.Second)
-			return "open", &t
+			// H4：延续历史档位并升一级，而不是退回最短冷却
+			t := now.Add(coolingDurationAtLevel(coolingLevel+1, cfg))
+			return "open", &t, coolingLevel + 1
 		}
 	}
-	return currentState, nil
+	return currentState, nil, coolingLevel
+}
+
+// coolingDurationAtLevel 按持久化档位取冷却时长（0 = 首档，超出封顶）。
+func coolingDurationAtLevel(level int, cfg CircuitBreakerConfig) time.Duration {
+	idx := level
+	if idx >= len(cfg.CoolingBackoff) {
+		idx = len(cfg.CoolingBackoff) - 1
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	seconds := cfg.CoolingBackoff[idx]
+	if seconds > cfg.MaxCoolingSeconds {
+		seconds = cfg.MaxCoolingSeconds
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // nextCoolingDuration 按失败次数计算指数退避冷却时长
@@ -239,6 +264,12 @@ func (m *CircuitBreakerManager) effectiveConfig(ctx context.Context, groupID *in
 		FROM channel_groups WHERE id = $1
 	`, *groupID).Scan(&minSamples, &openFailureRate, &openMinFailures, &initialCooling, &maxCooling)
 	if err != nil {
+		// M12：分组不存在/列为 NULL 时回退全局配置必须可见，
+		// 否则管理员配置的分组熔断参数会无声失效且难以排查。
+		if !errors.Is(err, pgx.ErrNoRows) {
+			m.logger.Warn("Group circuit config unavailable, falling back to global",
+				zap.Int("group_id", *groupID), zap.Error(err))
+		}
 		return cfg
 	}
 

@@ -103,7 +103,10 @@ func loadKeyGroupIDs(db *store.DB, keyHash string, ctx context.Context) ([]int, 
 	for rows.Next() {
 		var id int
 		if err := rows.Scan(&id); err != nil {
-			continue
+			// M10 整改：授权数据加载失败必须 fail-closed——
+			// 原先 continue 吞掉 Scan 错误仍返回成功，空切片语义是
+			// 「不限制」，受限 Key 会静默退化为不受分组约束。
+			return nil, fmt.Errorf("scan key group: %w", err)
 		}
 		ids = append(ids, id)
 	}

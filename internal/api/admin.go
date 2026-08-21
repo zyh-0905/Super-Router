@@ -840,6 +840,21 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 
 // ==================== 上游模型列表 ====================
 
+// classifyUpstreamHTTPStatus HTTP 状态 → 稳定错误类别（不含响应体，
+// 上游错误正文可能回显凭据，禁止回传客户端/写入日志）。
+func classifyUpstreamHTTPStatus(code int) string {
+	switch {
+	case code == http.StatusTooManyRequests:
+		return "rate_limited"
+	case code == http.StatusUnauthorized || code == http.StatusForbidden:
+		return "auth_error"
+	case code >= 500:
+		return "upstream_error"
+	default:
+		return "request_rejected"
+	}
+}
+
 // UpstreamModel 上游返回的单个模型
 type UpstreamModel struct {
 	ID      string `json:"id"`
@@ -897,11 +912,10 @@ func fetchUpstreamModels(baseURL, apiKey, proto string, netOpts safenet.Options)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		detail := strings.TrimSpace(string(body))
-		if len(detail) > 300 {
-			detail = detail[:300] + "…"
-		}
-		return nil, fmt.Errorf("上游返回 %d: %s", resp.StatusCode, detail)
+		// M2 整改：上游错误正文不回传客户端——中转站在 401/403 时
+		// 常在正文回显请求上下文（含凭据前缀/账号标识），属凭据侧信道。
+		// 错误只携带状态码与稳定类别（与 proxy.go C4 的口径一致）。
+		return nil, fmt.Errorf("上游返回状态 %d (%s)", resp.StatusCode, classifyUpstreamHTTPStatus(resp.StatusCode))
 	}
 
 	var raw struct {
