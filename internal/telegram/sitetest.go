@@ -394,9 +394,9 @@ func (r *SiteTestRunner) modelPriceValues(ctx context.Context, model string) (fl
 func formatSiteTestReport(rep siteTestReport) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🧪 <b>站点测试</b>：%s\n", EscapeHTML(rep.channelName))
-	fmt.Fprintf(&b, "协议：%s · 模型：%s · max_tokens：%d\n",
+	b.WriteString("━━━━━━━━━━━━\n")
+	fmt.Fprintf(&b, "🔌 协议：%s ｜ 🤖 模型：%s ｜ 🎯 max_tokens：%d\n",
 		EscapeHTML(rep.protocol), EscapeHTML(rep.upstreamModel), rep.maxTokens)
-	b.WriteString("━━━━━━━━━━━━━━━━\n")
 
 	if rep.balanceOK {
 		fmt.Fprintf(&b, "💰 余额：$%.4f → $%.4f → $%.4f\n", rep.before, rep.mid, rep.after)
@@ -407,24 +407,26 @@ func formatSiteTestReport(rep siteTestReport) string {
 	b.WriteString("\n")
 	b.WriteString(formatChatLine("流式", rep.stream))
 	b.WriteString("\n")
+	b.WriteString("━━━━━━━━━━━━\n")
 
 	if rep.balanceOK {
-		fmt.Fprintf(&b, "━━━━━━━━━━━━━━━━\n💵 余额差合计：$%.4f\n", rep.costTotal)
+		fmt.Fprintf(&b, "💵 余额差合计：$%.4f\n", rep.costTotal)
 	}
 	if rep.ratioOK {
 		basisLabel := "官网价基准"
 		if rep.basis == checker.BasisBaseline {
 			basisLabel = "$10/1M 基准估测"
 		}
-		fmt.Fprintf(&b, "📐 实测倍率：%.4fx（%s）\n", rep.ratio, basisLabel)
+		fmt.Fprintf(&b, "📐 实测倍率：<b>%.2fx</b>（%s）\n", rep.ratio, basisLabel)
 		if rep.basis == checker.BasisOfficial {
-			fmt.Fprintf(&b, "估算单价：输入 $%.2f/1M · 输出 $%.2f/1M\n", rep.estInPerM, rep.estOutPerM)
+			fmt.Fprintf(&b, "💱 估算单价：输入 $%.2f/1M ｜ 输出 $%.2f/1M\n", rep.estInPerM, rep.estOutPerM)
 		} else {
 			b.WriteString("⚠️ 官方价格库未收录该模型，倍率按混合基准估算\n")
 		}
 	} else {
 		fmt.Fprintf(&b, "📐 实测倍率：✗ %s\n", EscapeHTML(rep.ratioErr))
 	}
+	b.WriteString("💡 再测一次点下方按钮")
 	return b.String()
 }
 
@@ -440,16 +442,16 @@ func formatChatLine(label string, out chatOutcome) string {
 	if ev.HTTPStatus != http.StatusOK {
 		return fmt.Sprintf("%s：✗ upstream %d", label, ev.HTTPStatus)
 	}
-	s := fmt.Sprintf("%s：✅ 200 · TTFT %dms · 总耗时 %dms", label, ev.TTFBMS, ev.TotalMS)
+	s := fmt.Sprintf("%s：✅ ⏱ TTFT %dms ｜ 总耗时 %dms", label, ev.TTFBMS, ev.TotalMS)
 	if ev.Usage.Present {
-		s += fmt.Sprintf(" · usage %d+%d", ev.Usage.PromptTokens, ev.Usage.CompletionTokens)
+		s += fmt.Sprintf(" ｜ tokens %d+%d", ev.Usage.PromptTokens, ev.Usage.CompletionTokens)
 	}
 	if ev.StreamEvents > 0 {
-		s += fmt.Sprintf(" · SSE %d 事件", ev.StreamEvents)
+		s += fmt.Sprintf(" ｜ SSE %d 事件", ev.StreamEvents)
 		if ev.DoneReceived {
-			s += " · [DONE] ✓"
+			s += " ｜ [DONE] ✓"
 		} else {
-			s += " · [DONE] ✗"
+			s += " ｜ [DONE] ✗"
 		}
 	}
 	return s

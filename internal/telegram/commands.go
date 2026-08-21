@@ -126,18 +126,18 @@ func (c *CommandService) SetLogger(l *zap.Logger) {
 }
 
 const helpText = `📋 <b>可用命令</b>
-/start /help — 显示帮助
-/alerts — 当前活跃告警
-/alerts critical — 只看严重告警
-/alert &lt;alert_key&gt; — 单条告警详情
-/status — 系统状态摘要
-/relay — 中转站列表
-/relay &lt;id&gt; — 站点详情
-/balance — 余额列表
-/health — 健康列表
-/ratio — 倍率列表
-/quality &lt;id&gt; — 最近一次接口质量检测
-/sitetest &lt;id&gt; [模型] [max_tokens] — 站点直达测试（少量费用，结果异步推送）`
+━━━━━━━━━━━━
+📡 <code>/relay [id]</code> — 站点列表 / 详情
+💰 <code>/balance [id]</code> — 中转站账户余额
+🩺 <code>/health [id]</code> — 健康状态
+📐 <code>/ratio [id]</code> — 实测倍率
+🚨 <code>/alerts [critical]</code> — 活跃告警
+🔍 <code>/alert &lt;key&gt;</code> — 单条告警详情
+🛰 <code>/status</code> — 系统状态摘要
+🧪 <code>/quality &lt;id&gt;</code> — 最近一次质量检测
+🚀 <code>/sitetest &lt;id&gt; [模型] [tokens]</code> — 站点直达测试（少量费用，异步推送）
+━━━━━━━━━━━━
+💡 也可以点下方按钮快速查看`
 
 // unauthorized 统一拒绝文案（未授权 Chat ID / 停用订阅者 / 无查询权限）。
 const unauthorized = "⛔ 当前 Chat ID 未授权，请联系管理员。"
@@ -653,7 +653,34 @@ func (c *CommandService) handleStatus(ctx context.Context, sub Subscriber) (stri
 	if alertsQuery != nil {
 		alertsLine, _ = alertsQuery(ctx, sub.GroupIDs, false)
 	}
-	return "🛰 <b>系统状态</b>\n" + relays + "\n" + alertsLine, nil
+	out := "🛰 <b>系统状态</b>\n━━━━━━━━━━━━\n"
+	// RelayList 自带「📡 中转站列表（N 站）」标题，剥离后作为状态分区
+	body := relays
+	if i := indexOfNewline(relays); i >= 0 {
+		body = relays[i+1:]
+	}
+	// 移除 RelayList 的底部提示行（避免与状态摘要提示重复）
+	body = strings.TrimSuffix(body, "💡 详情：/relay &lt;ID&gt;")
+	body = strings.TrimRight(body, "\n")
+	out += "📡 <b>站点状态</b>\n" + body + "\n━━━━━━━━━━━━\n"
+	if alertsLine != "" {
+		if strings.HasPrefix(alertsLine, "✅") {
+			out += alertsLine
+		} else {
+			// FormatAlerts 自带标题与分隔线，直接拼接
+			out += alertsLine
+		}
+	}
+	return out, nil
+}
+
+func indexOfNewline(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			return i
+		}
+	}
+	return -1
 }
 
 // parseCommand 去掉 /command@botname 后缀，返回命令与空白分隔的参数。

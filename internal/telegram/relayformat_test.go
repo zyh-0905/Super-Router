@@ -26,11 +26,14 @@ func TestFormatRelayListEscapesAndMarks(t *testing.T) {
 	if !strings.Contains(msg, "Relay &lt;A&gt;") {
 		t.Fatalf("HTML not escaped: %s", msg)
 	}
-	if !strings.Contains(msg, "✅") || !strings.Contains(msg, "❌") {
+	if !strings.Contains(msg, "🟢") || !strings.Contains(msg, "🔴") {
 		t.Fatalf("health marks missing: %s", msg)
 	}
-	if !strings.Contains(msg, "$2.50") || !strings.Contains(msg, "1.2000x") {
+	if !strings.Contains(msg, "$2.50") || !strings.Contains(msg, "1.20x") {
 		t.Fatalf("metrics missing: %s", msg)
+	}
+	if !strings.Contains(msg, "💡 详情：/relay") {
+		t.Fatalf("hint missing: %s", msg)
 	}
 }
 
@@ -97,8 +100,15 @@ func TestFormatBalanceHealthRatioLists(t *testing.T) {
 	}
 	r := 2.5
 	rs := []RatioSummary{{ChannelID: 1, Name: "A", Model: "gpt-4o", Ratio: &r, Limit: 2.0}}
-	if got := FormatRatioList(rs); !strings.Contains(got, "2.5000x") || !strings.Contains(got, "上限 2.0000x") {
+	if got := FormatRatioList(rs); !strings.Contains(got, "2.50x") || !strings.Contains(got, "上限 2.00x") {
 		t.Fatal(got)
+	}
+	// 详情：超限标记
+	if got := FormatRatioDetail("A", 2.0, []RatioDetailItem{
+		{Model: "gpt-4o", Ratio: 2.5, Basis: "official", CheckedAt: now},
+		{Model: "gpt-4o-mini", Ratio: 1.2, Basis: "baseline", CheckedAt: now},
+	}); !strings.Contains(got, "2.50x") || !strings.Contains(got, "超限") || !strings.Contains(got, "官网价基准") {
+		t.Fatal("ratio detail wrong:\n" + got)
 	}
 }
 

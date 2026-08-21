@@ -130,6 +130,21 @@ type BalanceMember struct {
 	Enabled   bool
 }
 
+// HealthHistoryItem /health <id> 单次检测记录。
+type HealthHistoryItem struct {
+	Alive     bool
+	LatencyMS *int
+	CheckedAt time.Time
+}
+
+// RatioDetailItem /ratio <id> 模型实测倍率。
+type RatioDetailItem struct {
+	Model     string
+	Ratio     float64
+	Basis     string
+	CheckedAt time.Time
+}
+
 // HealthSummary /health 列表项。
 type HealthSummary struct {
 	ChannelID    int

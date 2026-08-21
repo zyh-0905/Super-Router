@@ -81,22 +81,23 @@ func formatQualityMessage(name string, run *qualityRunView, results []qualityRes
 		return fmt.Sprintf("🧪 <b>%s</b> 最近一次接口质量检测\n暂无质量检测结果。", EscapeHTML(name))
 	}
 	var b strings.Builder
-	b.WriteString("🧪 <b>最近一次接口质量检测</b>\n")
-	b.WriteString("站点：" + EscapeHTML(name) + "\n")
-	b.WriteString("模型：" + EscapeHTML(run.Model) + "\n")
+	b.WriteString("🧪 <b>接口质量检测</b>\n")
+	b.WriteString("━━━━━━━━━━━━\n")
+	b.WriteString("🏢 站点：" + EscapeHTML(name) + "\n")
+	b.WriteString("🤖 模型：" + EscapeHTML(run.Model) + "\n")
 
 	statusLabel := map[string]string{
 		"queued": "排队中", "running": "检测中", "cancel_requested": "正在停止",
 		"completed": "已完成", "failed": "失败", "cancelled": "已取消", "expired": "已过期",
 	}[run.Status]
 	if run.Status == "running" || run.Status == "queued" || run.Status == "cancel_requested" {
-		b.WriteString("状态：" + statusLabel)
+		b.WriteString("📌 状态：" + statusLabel)
 		if run.Status == "running" {
-			b.WriteString(fmt.Sprintf(" · 进度 %d%%", run.Progress))
+			b.WriteString(fmt.Sprintf(" ｜ 进度 %d%%", run.Progress))
 		}
 		b.WriteString("\n")
 		if run.CurrentStage != "" {
-			b.WriteString("当前阶段：" + EscapeHTML(stageLabelZh(run.CurrentStage)) + "\n")
+			b.WriteString("⏭ 当前阶段：" + EscapeHTML(stageLabelZh(run.CurrentStage)) + "\n")
 		}
 		return b.String()
 	}
@@ -108,7 +109,7 @@ func formatQualityMessage(name string, run *qualityRunView, results []qualityRes
 	if overallLabel == "" {
 		overallLabel = run.OverallStatus
 	}
-	b.WriteString("结果：" + overallLabel + "\n")
+	b.WriteString("📊 结果：" + overallLabel + "\n")
 
 	for _, r := range results {
 		b.WriteString(EscapeHTML(stageLabelZh(r.Stage)) + "：" + resultLabelZh(r.Status) + "\n")
@@ -116,7 +117,7 @@ func formatQualityMessage(name string, run *qualityRunView, results []qualityRes
 
 	if run.FinishedAt != nil && !run.CreatedAt.IsZero() {
 		d := run.FinishedAt.Sub(run.CreatedAt)
-		b.WriteString(fmt.Sprintf("总耗时：%.2f 秒\n", d.Seconds()))
+		b.WriteString(fmt.Sprintf("⏱ 总耗时：%.2f 秒", d.Seconds()))
 	}
 	return b.String()
 }

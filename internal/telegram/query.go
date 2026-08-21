@@ -457,31 +457,15 @@ func (q *SQLQueryService) HealthDetail(ctx context.Context, id int, groupIDs []i
 	var name string
 	_ = q.DB.Pool.QueryRow(ctx, `SELECT name FROM upstreams WHERE id = $1`, id).Scan(&name)
 
-	var b strings.Builder
-	b.WriteString("🩺 <b>" + EscapeHTML(name) + "</b> 最近健康\n")
-	count := 0
+	items := []HealthHistoryItem{}
 	for rows.Next() {
-		var alive bool
-		var latency *int
-		var checkedAt time.Time
-		if rows.Scan(&alive, &latency, &checkedAt) != nil {
+		var it HealthHistoryItem
+		if rows.Scan(&it.Alive, &it.LatencyMS, &it.CheckedAt) != nil {
 			continue
 		}
-		state := "✅ 存活"
-		if !alive {
-			state = "❌ 离线"
-		}
-		lat := "—"
-		if latency != nil {
-			lat = fmt.Sprintf("%dms", *latency)
-		}
-		b.WriteString(fmt.Sprintf("%s %s · %s\n", state, lat, checkedAt.Format("01-02 15:04")))
-		count++
+		items = append(items, it)
 	}
-	if count == 0 {
-		b.WriteString("暂无有效检测结果。\n")
-	}
-	return b.String(), rows.Err()
+	return FormatHealthDetail(name, items), rows.Err()
 }
 
 // RatioList /ratio 全量列表（每站点最新实测模型）。
@@ -531,33 +515,13 @@ func (q *SQLQueryService) RatioDetail(ctx context.Context, id int, groupIDs []in
 	var limit float64
 	_ = q.DB.Pool.QueryRow(ctx, `SELECT name, COALESCE(ratio_limit, 0) FROM upstreams WHERE id = $1`, id).Scan(&name, &limit)
 
-	var b strings.Builder
-	b.WriteString("📐 <b>" + EscapeHTML(name) + "</b> 实测倍率")
-	if limit > 0 {
-		b.WriteString(fmt.Sprintf("（上限 %.4fx）", limit))
-	}
-	b.WriteString("\n")
-	count := 0
+	items := []RatioDetailItem{}
 	for rows.Next() {
-		var model, basis string
-		var ratio float64
-		var checkedAt time.Time
-		if rows.Scan(&model, &ratio, &basis, &checkedAt) != nil {
+		var it RatioDetailItem
+		if rows.Scan(&it.Model, &it.Ratio, &it.Basis, &it.CheckedAt) != nil {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("%s：%.4fx（%s）· %s\n",
-			EscapeHTML(model), ratio, basisLabel(basis), checkedAt.Format("01-02 15:04")))
-		count++
+		items = append(items, it)
 	}
-	if count == 0 {
-		b.WriteString("暂无有效检测结果。\n")
-	}
-	return b.String(), rows.Err()
-}
-
-func basisLabel(b string) string {
-	if b == "official" {
-		return "官网价基准"
-	}
-	return "基准估测"
+	return FormatRatioDetail(name, limit, items), rows.Err()
 }

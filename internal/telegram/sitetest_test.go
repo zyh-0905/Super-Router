@@ -116,8 +116,8 @@ func TestFormatSiteTestReportFull(t *testing.T) {
 	}
 	out := formatSiteTestReport(rep)
 	for _, want := range []string{"🧪", "247-claudemax", "anthropic", "claude-opus-4-8", "max_tokens：128",
-		"$48.6200", "$48.5800", "✅ 200", "TTFT 3000ms", "SSE 12 事件", "[DONE] ✓",
-		"余额差合计：$0.0400", "实测倍率：2.5000x", "官网价基准", "输入 $12.50/1M"} {
+		"$48.6200", "$48.5800", "✅", "⏱ TTFT 3000ms", "SSE 12 事件", "[DONE] ✓",
+		"余额差合计：$0.0400", "实测倍率：<b>2.50x</b>", "官网价基准", "输入 $12.50/1M", "💡 再测一次"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("report missing %q:\n%s", want, out)
 		}

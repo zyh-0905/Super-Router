@@ -1,5 +1,12 @@
 package telegram
 
+// Bot 输出的统一设计语言：
+//   - 标题：emoji + <b>粗体</b>，第二行 🕐 更新时间（当天只显示时分）；
+//   - 行内分隔：竖线「｜」（全角，避免与 Telegram 表格语法冲突）；
+//   - 卡片/条目之间用 ━━━━ 分隔线；
+//   - 底部统一 💡 提示行（下一步命令）；
+//   - 紧凑列表不换行（/relay /health /ratio 列表），详情分节换行。
+
 import (
 	"fmt"
 	"net/url"
@@ -19,7 +26,7 @@ func hostOnly(raw string) string {
 	return u.Host
 }
 
-// fmtTime 统一时间格式。
+// fmtTime 统一时间格式（完整时间戳场景）。
 func fmtTime(t *time.Time) string {
 	if t == nil || t.IsZero() {
 		return "—"
@@ -50,65 +57,76 @@ func fmtCircuitState(s string) string {
 	return s
 }
 
-// FormatRelayList /relay 站点总览。
-func FormatRelayList(items []RelaySummary) string {
-	if len(items) == 0 {
-		return "📡 <b>中转站列表</b>\n暂无有效检测结果，请启动 checker 后重试。"
+// healthIcon 健康状态图标。
+func healthIcon(healthy bool) string {
+	if healthy {
+		return "🟢"
 	}
+	return "🔴"
+}
+
+// FormatRelayList /relay 站点总览（紧凑列表）。
+func FormatRelayList(items []RelaySummary) string {
 	var b strings.Builder
-	b.WriteString("📡 <b>中转站列表</b>\n")
+	b.WriteString("📡 <b>中转站列表</b>")
+	if len(items) == 0 {
+		return b.String() + "\n暂无有效检测结果，请启动 checker 后重试。"
+	}
+	b.WriteString("（" + fmt.Sprintf("%d 站", len(items)) + "）\n")
 	for _, it := range items {
-		state := "✅"
-		if !it.Healthy {
-			state = "❌"
-		} else if it.CircuitState != "" && it.CircuitState != "closed" {
-			state = "⚠️"
+		icon := healthIcon(it.Healthy)
+		if it.Healthy && it.CircuitState != "" && it.CircuitState != "closed" {
+			icon = "🟠"
 		}
-		line := fmt.Sprintf("%s <b>%d</b> %s", state, it.ID, EscapeHTML(it.Name))
+		line := fmt.Sprintf("%s <b>%d</b> %s", icon, it.ID, EscapeHTML(it.Name))
 		if it.Host != "" {
-			line += " · " + EscapeHTML(it.Host)
+			line += " ｜ " + EscapeHTML(it.Host)
 		}
 		if it.Balance != nil {
-			line += fmt.Sprintf(" · 余额 $%.2f", *it.Balance)
+			line += fmt.Sprintf(" ｜ 💵 $%.2f", *it.Balance)
 		}
 		if it.Ratio != nil {
-			line += fmt.Sprintf(" · 倍率 %.4fx", *it.Ratio)
+			line += fmt.Sprintf(" ｜ %.2fx", *it.Ratio)
 		}
 		if it.CircuitState != "" && it.CircuitState != "closed" {
-			line += " · " + EscapeHTML(fmtCircuitState(it.CircuitState))
+			line += " ｜ ⚡ " + EscapeHTML(fmtCircuitState(it.CircuitState))
 		}
 		b.WriteString(line + "\n")
 	}
+	b.WriteString("💡 详情：/relay &lt;ID&gt;")
 	return b.String()
 }
 
 // FormatRelayDetail /relay <id> 单站点详情。
 func FormatRelayDetail(it RelayDetail) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("📡 <b>%s</b>（ID %d）\n", EscapeHTML(it.Name), it.ID))
-	b.WriteString("━━━━━━━━━━━━━━━━\n")
+	b.WriteString(fmt.Sprintf("📡 <b>%s</b> ［ID %d］\n", EscapeHTML(it.Name), it.ID))
+	b.WriteString("━━━━━━━━━━━━\n")
 	if it.Host != "" {
-		b.WriteString("域名：" + EscapeHTML(it.Host) + "\n")
+		b.WriteString("🌐 域名：" + EscapeHTML(it.Host) + "\n")
 	}
 	proto := "OpenAI 兼容"
 	if it.Protocol == "anthropic" {
 		proto = "Anthropic 原生"
 	}
-	b.WriteString("协议：" + proto + "\n")
+	b.WriteString("🔌 协议：" + proto)
 	if it.RelayType != "" {
-		b.WriteString("类型：" + EscapeHTML(relayTypeLabel(it.RelayType)) + "\n")
+		b.WriteString(" ｜ " + EscapeHTML(relayTypeLabel(it.RelayType)))
 	}
+	b.WriteString("\n")
 	if len(it.Groups) > 0 {
-		b.WriteString("分组：" + EscapeHTML(strings.Join(it.Groups, "、")) + "\n")
+		b.WriteString("📁 分组：" + EscapeHTML(strings.Join(it.Groups, "、")) + "\n")
 	}
 	healthy := "离线"
 	if it.Healthy {
 		healthy = "存活"
 	}
-	b.WriteString(fmt.Sprintf("健康：%s · 平均延迟 %dms · P95 %dms\n", healthy, it.AverageMS, it.P95MS))
-	b.WriteString(fmt.Sprintf("24h：%d 请求 · 成功率 %.1f%%\n", it.Requests24h, it.SuccessRate*100))
-	b.WriteString("熔断：" + EscapeHTML(fmtCircuitState(it.CircuitState)) + "\n")
-	b.WriteString("余额：" + fmtBalance(it.Balance) + "\n")
+	b.WriteString("🩺 健康：" + healthy +
+		fmt.Sprintf(" ｜ ⏱ %dms ｜ P95 %dms\n", it.AverageMS, it.P95MS))
+	b.WriteString(fmt.Sprintf("📈 24h：%d 请求 ｜ 成功率 %.1f%%\n", it.Requests24h, it.SuccessRate*100))
+	b.WriteString("⚡ 熔断：" + EscapeHTML(fmtCircuitState(it.CircuitState)) + "\n")
+	b.WriteString("💵 余额：" + fmtBalance(it.Balance) + "\n")
+	b.WriteString("💡 测试：/sitetest " + fmt.Sprintf("%d", it.ID) + " ｜ 倍率：/ratio " + fmt.Sprintf("%d", it.ID))
 	return b.String()
 }
 
@@ -134,7 +152,7 @@ func FormatBalanceList(items []BalanceSummary, checkedAt *time.Time) string {
 	var b strings.Builder
 	b.WriteString("💰 <b>中转站余额</b>\n")
 	b.WriteString("🕐 更新于 " + formatCheckedAt(checkedAt) + "\n")
-	for i, it := range items {
+	for _, it := range items {
 		b.WriteString("━━━━━━━━━━━━\n")
 		b.WriteString("🏢 <b>" + EscapeHTML(it.Name) + "</b>")
 		if it.StationID > 0 {
@@ -146,7 +164,6 @@ func FormatBalanceList(items []BalanceSummary, checkedAt *time.Time) string {
 			b.WriteString(fmt.Sprintf(" ｜ %d 个站点", it.MemberCount))
 		}
 		b.WriteString("\n")
-		_ = i
 	}
 	b.WriteString("━━━━━━━━━━━━\n")
 	b.WriteString("💡 明细：/balance &lt;ID&gt;")
@@ -175,6 +192,7 @@ func FormatBalanceDetail(name string, balance *float64, checkedAt *time.Time, me
 		}
 		b.WriteString(fmt.Sprintf("%s [%d] %s\n", state, m.ChannelID, EscapeHTML(m.Name)))
 	}
+	b.WriteString("💡 站点详情：/relay &lt;ID&gt;")
 	return b.String()
 }
 
@@ -190,48 +208,102 @@ func formatCheckedAt(t *time.Time) string {
 	return t.Format("01-02 15:04")
 }
 
-// FormatHealthList /health 全量紧凑列表。
+// FormatHealthList /health 全量列表（紧凑）。
 func FormatHealthList(items []HealthSummary) string {
-	if len(items) == 0 {
-		return "🩺 <b>健康列表</b>\n暂无有效检测结果。"
-	}
 	var b strings.Builder
-	b.WriteString("🩺 <b>健康列表</b>\n")
+	b.WriteString("🩺 <b>健康列表</b>")
+	if len(items) == 0 {
+		return b.String() + "\n暂无有效检测结果。"
+	}
+	b.WriteString("（" + fmt.Sprintf("%d 站", len(items)) + "）\n")
 	for _, it := range items {
-		state := "✅"
-		if !it.Alive {
-			state = "❌"
-		}
-		line := fmt.Sprintf("%s %d %s", state, it.ChannelID, EscapeHTML(it.Name))
+		line := fmt.Sprintf("%s <b>%d</b> %s", healthIcon(it.Alive), it.ChannelID, EscapeHTML(it.Name))
 		if it.LatencyMS != nil {
-			line += fmt.Sprintf(" · %dms", *it.LatencyMS)
+			line += fmt.Sprintf(" ｜ ⏱ %dms", *it.LatencyMS)
 		}
 		if it.CircuitState != "" && it.CircuitState != "closed" {
-			line += " · " + EscapeHTML(fmtCircuitState(it.CircuitState))
+			line += " ｜ ⚡ " + EscapeHTML(fmtCircuitState(it.CircuitState))
 		}
 		b.WriteString(line + "\n")
+	}
+	b.WriteString("💡 详情：/health &lt;ID&gt;")
+	return b.String()
+}
+
+// FormatHealthDetail /health <id> 最近历史（结构化数据由 query 层提供）。
+func FormatHealthDetail(name string, items []HealthHistoryItem) string {
+	var b strings.Builder
+	b.WriteString("🩺 <b>" + EscapeHTML(name) + "</b> 最近健康\n")
+	b.WriteString("━━━━━━━━━━━━\n")
+	if len(items) == 0 {
+		b.WriteString("暂无有效检测结果。\n")
+		return b.String()
+	}
+	for _, it := range items {
+		state := healthIcon(it.Alive) + " 存活"
+		if !it.Alive {
+			state = "🔴 离线"
+		}
+		lat := "—"
+		if it.LatencyMS != nil {
+			lat = fmt.Sprintf("%dms", *it.LatencyMS)
+		}
+		b.WriteString(fmt.Sprintf("%s ｜ ⏱ %s ｜ 🕐 %s\n", state, lat, formatCheckedAt(&it.CheckedAt)))
 	}
 	return b.String()
 }
 
-// FormatRatioList /ratio 全量紧凑列表。
+// FormatRatioList /ratio 全量列表（紧凑）。
 func FormatRatioList(items []RatioSummary) string {
-	if len(items) == 0 {
-		return "📐 <b>倍率列表</b>\n暂无有效检测结果。"
-	}
 	var b strings.Builder
-	b.WriteString("📐 <b>倍率列表</b>\n")
+	b.WriteString("📐 <b>倍率列表</b>")
+	if len(items) == 0 {
+		return b.String() + "\n暂无有效检测结果。"
+	}
+	b.WriteString("（" + fmt.Sprintf("%d 站", len(items)) + "）\n")
 	for _, it := range items {
-		line := fmt.Sprintf("%d %s · %s：", it.ChannelID, EscapeHTML(it.Name), EscapeHTML(it.Model))
+		line := fmt.Sprintf("<b>%d</b> %s ｜ %s：", it.ChannelID, EscapeHTML(it.Name), EscapeHTML(it.Model))
 		if it.Ratio == nil {
 			line += "暂无实测"
 		} else {
-			line += fmt.Sprintf("%.4fx", *it.Ratio)
+			line += fmt.Sprintf("%.2fx", *it.Ratio)
 			if it.Limit > 0 {
-				line += fmt.Sprintf("（上限 %.4fx）", it.Limit)
+				line += fmt.Sprintf("（上限 %.2fx）", it.Limit)
 			}
 		}
 		b.WriteString(line + "\n")
 	}
+	b.WriteString("💡 详情：/ratio &lt;ID&gt;")
 	return b.String()
+}
+
+// FormatRatioDetail /ratio <id> 站点各模型实测倍率（结构化数据由 query 层提供）。
+func FormatRatioDetail(name string, limit float64, items []RatioDetailItem) string {
+	var b strings.Builder
+	b.WriteString("📐 <b>" + EscapeHTML(name) + "</b> 实测倍率")
+	if limit > 0 {
+		b.WriteString(fmt.Sprintf("（上限 %.2fx）", limit))
+	}
+	b.WriteString("\n")
+	b.WriteString("━━━━━━━━━━━━\n")
+	if len(items) == 0 {
+		b.WriteString("暂无有效检测结果。\n")
+		return b.String()
+	}
+	for _, it := range items {
+		over := ""
+		if limit > 0 && it.Ratio > limit {
+			over = " 🔴超限"
+		}
+		b.WriteString(fmt.Sprintf("📐 %s：<b>%.2fx</b>（%s）｜ 🕐 %s%s\n",
+			EscapeHTML(it.Model), it.Ratio, basisLabel(it.Basis), formatCheckedAt(&it.CheckedAt), over))
+	}
+	return b.String()
+}
+
+func basisLabel(b string) string {
+	if b == "official" {
+		return "官网价基准"
+	}
+	return "混合基准"
 }

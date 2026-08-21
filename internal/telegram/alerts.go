@@ -41,7 +41,7 @@ func (a *AlertQueries) ListActive(ctx context.Context, groupIDs []int, criticalO
 // FormatAlerts 格式化告警列表（Telegram 消息）。
 func FormatAlerts(alerts []alert.Alert, now time.Time) string {
 	if len(alerts) == 0 {
-		return "✅ <b>当前没有活跃告警</b>"
+		return "✅ <b>当前没有活跃告警</b> 🎉"
 	}
 	var b strings.Builder
 	critical, warning := 0, 0
@@ -52,28 +52,33 @@ func FormatAlerts(alerts []alert.Alert, now time.Time) string {
 			warning++
 		}
 	}
-	b.WriteString(fmt.Sprintf("🚨 <b>活跃告警 %d 条</b>（🔴 %d / 🟠 %d）\n", len(alerts), critical, warning))
-	for _, a := range alerts {
+	b.WriteString(fmt.Sprintf("🚨 <b>活跃告警</b> ｜ 🔴 %d ｜ 🟠 %d\n", critical, warning))
+	b.WriteString("━━━━━━━━━━━━\n")
+	for i, a := range alerts {
+		if i > 0 {
+			b.WriteString("━━━━━━━━━━━━\n")
+		}
 		icon := "🟠"
 		if a.Severity == alert.SeverityCritical {
 			icon = "🔴"
 		}
-		b.WriteString(fmt.Sprintf("\n%s <b>%s</b>\n", icon, EscapeHTML(a.Title)))
+		b.WriteString(fmt.Sprintf("%s <b>%s</b>", icon, EscapeHTML(a.Title)))
 		if a.ChannelName != "" {
-			b.WriteString("站点：" + EscapeHTML(a.ChannelName) + "\n")
+			b.WriteString(" ｜ " + EscapeHTML(a.ChannelName))
 		}
+		b.WriteString("\n")
 		if a.Model != "" {
-			b.WriteString("模型：" + EscapeHTML(a.Model) + "\n")
+			b.WriteString("🤖 " + EscapeHTML(a.Model) + "\n")
 		}
 		if a.CurrentValue != nil && a.ThresholdValue != nil {
-			b.WriteString(fmt.Sprintf("当前：%.4g%s / 阈值：%.4g%s\n", *a.CurrentValue, a.Unit, *a.ThresholdValue, a.Unit))
+			b.WriteString(fmt.Sprintf("📊 %.4g%s ｜ 阈值 %.4g%s\n", *a.CurrentValue, a.Unit, *a.ThresholdValue, a.Unit))
 		}
 		if !a.FirstSeenAt.IsZero() {
-			b.WriteString("持续：" + alert.FormatDuration(now.Sub(a.FirstSeenAt)) + "\n")
+			b.WriteString("⏳ 持续 " + alert.FormatDuration(now.Sub(a.FirstSeenAt)) + "\n")
 		}
-		b.WriteString("Key：" + EscapeHTML(a.Key) + "\n")
+		b.WriteString("🔑 " + EscapeHTML(a.Key) + "\n")
 	}
-	b.WriteString("\n/alert &lt;alert_key&gt; 查看单条详情")
+	b.WriteString("💡 单条详情：/alert &lt;key&gt;")
 	return b.String()
 }
 
@@ -93,34 +98,35 @@ func (a *AlertQueries) Detail(ctx context.Context, key string, groupIDs []int) (
 		icon = "🔴"
 	}
 	b.WriteString(fmt.Sprintf("%s <b>%s</b>\n", icon, EscapeHTML(al.Title)))
-	b.WriteString("Key：" + EscapeHTML(al.Key) + "\n")
+	b.WriteString("━━━━━━━━━━━━\n")
 	if al.ChannelName != "" {
-		b.WriteString("站点：" + EscapeHTML(al.ChannelName) + "\n")
+		b.WriteString("🏢 站点：" + EscapeHTML(al.ChannelName) + "\n")
 	}
 	if al.Model != "" {
-		b.WriteString("模型：" + EscapeHTML(al.Model) + "\n")
+		b.WriteString("🤖 模型：" + EscapeHTML(al.Model) + "\n")
 	}
-	b.WriteString("状态：" + statusLabel(al.Status) + "\n")
+	b.WriteString("📌 状态：" + statusLabel(al.Status) + "\n")
 	if al.Message != "" {
-		b.WriteString("详情：" + EscapeHTML(al.Message) + "\n")
+		b.WriteString("📝 " + EscapeHTML(al.Message) + "\n")
 	}
 	if al.CurrentValue != nil && al.ThresholdValue != nil {
-		b.WriteString(fmt.Sprintf("当前：%.4g%s / 阈值：%.4g%s\n", *al.CurrentValue, al.Unit, *al.ThresholdValue, al.Unit))
+		b.WriteString(fmt.Sprintf("📊 当前 %.4g%s ｜ 阈值 %.4g%s\n", *al.CurrentValue, al.Unit, *al.ThresholdValue, al.Unit))
 	}
 	if al.Impact != "" {
-		b.WriteString("影响：" + EscapeHTML(al.Impact) + "\n")
+		b.WriteString("💥 影响：" + EscapeHTML(al.Impact) + "\n")
 	}
 	if al.Recommendation != "" {
-		b.WriteString("建议：" + EscapeHTML(al.Recommendation) + "\n")
+		b.WriteString("💡 建议：" + EscapeHTML(al.Recommendation) + "\n")
 	}
 	if !al.FirstSeenAt.IsZero() {
-		b.WriteString("首次出现：" + al.FirstSeenAt.Format("2006-01-02 15:04") + "\n")
+		b.WriteString("🕐 首次出现：" + al.FirstSeenAt.Format("2006-01-02 15:04") + "\n")
 	}
 	if al.RecoveredAt != nil {
-		b.WriteString("恢复时间：" + al.RecoveredAt.Format("2006-01-02 15:04") + "\n")
+		b.WriteString("✅ 恢复时间：" + al.RecoveredAt.Format("2006-01-02 15:04") + "\n")
 	} else {
-		b.WriteString("持续：" + alert.FormatDuration(time.Since(al.FirstSeenAt)) + "\n")
+		b.WriteString("⏳ 持续：" + alert.FormatDuration(time.Since(al.FirstSeenAt)) + "\n")
 	}
+	b.WriteString("🔑 Key：" + EscapeHTML(al.Key))
 	return b.String(), nil
 }
 
