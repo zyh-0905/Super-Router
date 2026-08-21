@@ -113,14 +113,21 @@ type RelayDetail struct {
 	P95MS       int
 }
 
-// BalanceSummary /balance 列表项。
+// BalanceSummary /balance 列表项（中转站归并汇总：同 base_url 成员站点归为一行）。
 type BalanceSummary struct {
+	StationID   int      // relay_stations.id（0 = 尚未 reconcile）
+	ChannelID   int      // 成员中最近余额检测的站点（代表 ID）
+	Name        string   // 中转站名（自定义名或自动命名）
+	Balance     *float64 // 账户余额（同账户成员共享，取成员最近一次成功检测）
+	MemberCount int      // 成员站点数（按订阅者分组过滤后的口径）
+	CheckedAt   *time.Time
+}
+
+// BalanceMember 中转站成员明细（/balance <id> 用，不展示站点各自余额）。
+type BalanceMember struct {
 	ChannelID int
 	Name      string
-	Balance   *float64
-	Currency  string
-	Source    string
-	CheckedAt *time.Time
+	Enabled   bool
 }
 
 // HealthSummary /health 列表项。

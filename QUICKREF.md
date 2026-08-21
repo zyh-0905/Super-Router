@@ -145,6 +145,7 @@ docker compose -p smart-router down
 | 默认状态 | **关闭**（`telegram_config.enabled=false`），开启后由 checker 长轮询 + 每小时整点汇总 |
 | 配置入口 | Web「设置 → Telegram 告警」（Bot Token 加密保存，页面只显示尾号）；订阅者只能后台手动录入 |
 | 查询命令 | `/start` `/help` `/alerts [critical]` `/alert <alert_key>` `/status` `/relay [id]` `/balance [id]` `/health [id]` `/ratio [id]` `/quality <id>` `/sitetest <id> [模型] [max_tokens]` |
+| 余额口径 | `/balance` 按中转站归并汇总（同 base_url 归一行：账户余额 + 站点数）；`/balance <id>` = 中转站 ID 详情（账户余额 + 成员名单，不显示站点各自余额） |
 | 站点直达测试 | `/sitetest` = 测试台「站点测试」同款（非流式+流式各一次真实推理，TTFT/延迟/余额差/实测倍率）；模型默认站点 test_model，max_tokens 默认 128（上限 512）；结果异步推送，可能产生少量上游费用，受订阅者分组授权约束 |
 | 交互体验 | 私聊「/」命令菜单自动维护；查询显示「正在输入…」；内联键盘（站点列表直达详情 / 告警严重过滤 / 详情页一键测试）；/sitetest 进度消息原位更新为结果 + 「🔁 再测一次」按钮 |
 | 未授权 Chat ID | 统一回复「⛔ 当前 Chat ID 未授权，请联系管理员。」 |

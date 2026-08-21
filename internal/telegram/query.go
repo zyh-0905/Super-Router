@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"smart-router/internal/station"
 	"smart-router/internal/store"
 )
 
@@ -171,76 +172,222 @@ func (q *SQLQueryService) channelInGroups(ctx context.Context, channelID int, gr
 	return err == nil && ok
 }
 
-// BalanceList /balance 全量列表。
+// BalanceList /balance 全量列表：按中转站归并汇总（同 base_url 成员站点归为一行）。
+// 订阅者分组过滤作用于成员口径：该站只要有成员在授权分组内即显示，
+// 成员数只计范围内；账户余额取范围内成员最近一次成功检测（账户级共享）。
 func (q *SQLQueryService) BalanceList(ctx context.Context, groupIDs []int) (string, error) {
+	// 先做 lazy reconcile（与 Web 中转站视图同口径：共享 station 归一化）
+	if err := q.reconcileStations(ctx); err != nil {
+		return "", err
+	}
+
 	rows, err := q.DB.Pool.Query(ctx, `
-		SELECT DISTINCT ON (bc.channel_id) bc.channel_id, u.name, bc.balance, bc.currency, bc.source, bc.checked_at
-		FROM balance_checks bc
-		JOIN upstreams u ON u.id = bc.channel_id
-		WHERE bc.source != ''
-		  AND `+fmt.Sprintf(groupClause, "bc.channel_id")+`
-		ORDER BY bc.channel_id, bc.checked_at DESC
+		SELECT u.id, u.name, u.base_url, u.enabled, b.balance, b.checked_at
+		FROM upstreams u
+		LEFT JOIN LATERAL (
+			SELECT balance, checked_at FROM balance_checks bc
+			WHERE bc.channel_id = u.id AND bc.source != ''
+			ORDER BY bc.checked_at DESC LIMIT 1
+		) b ON true
+		WHERE `+fmt.Sprintf(groupClause, "u.id")+`
+		ORDER BY u.id
 	`, grouped(groupIDs))
 	if err != nil {
 		return "", fmt.Errorf("query balances: %w", err)
 	}
 	defer rows.Close()
 
-	items := []BalanceSummary{}
-	var latest *time.Time
+	type memberRow struct {
+		id        int
+		name      string
+		key       string
+		enabled   bool
+		balance   *float64
+		checkedAt *time.Time
+	}
+	var members []memberRow
 	for rows.Next() {
-		var it BalanceSummary
-		if err := rows.Scan(&it.ChannelID, &it.Name, &it.Balance, &it.Currency, &it.Source, &it.CheckedAt); err != nil {
+		var r memberRow
+		var rawBase string
+		if err := rows.Scan(&r.id, &r.name, &rawBase, &r.enabled, &r.balance, &r.checkedAt); err != nil {
 			continue
 		}
-		if latest == nil || (it.CheckedAt != nil && it.CheckedAt.After(*latest)) {
-			latest = it.CheckedAt
-		}
-		items = append(items, it)
+		r.key = station.NormalizeBaseURL(rawBase)
+		members = append(members, r)
 	}
-	return FormatBalanceList(items, latest), rows.Err()
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("scan balances: %w", err)
+	}
+
+	// 中转站名（自定义名优先，空 = 自动命名）
+	names := map[string]string{}
+	srows, err := q.DB.Pool.Query(ctx, `SELECT base_url, display_name FROM relay_stations`)
+	if err == nil {
+		for srows.Next() {
+			var key, dn string
+			if srows.Scan(&key, &dn) == nil {
+				names[key] = dn
+			}
+		}
+		srows.Close()
+	}
+
+	// 分组聚合：key → {余额(最近), 成员数, 代表站点ID}
+	type agg struct {
+		balance   *float64
+		checkedAt *time.Time
+		count     int
+		repID     int
+	}
+	byKey := map[string]*agg{}
+	var order []string
+	for _, r := range members {
+		a := byKey[r.key]
+		if a == nil {
+			a = &agg{}
+			byKey[r.key] = a
+			order = append(order, r.key)
+		}
+		a.count++
+		if a.repID == 0 {
+			a.repID = r.id
+		}
+		if r.checkedAt != nil && (a.checkedAt == nil || r.checkedAt.After(*a.checkedAt)) {
+			at := *r.checkedAt
+			a.checkedAt = &at
+			b := *r.balance
+			a.balance = &b
+		}
+	}
+
+	items := []BalanceSummary{}
+	var latest *time.Time
+	for _, key := range order {
+		a := byKey[key]
+		dn := names[key]
+		if dn == "" {
+			dn = station.AutoName(key)
+		}
+		items = append(items, BalanceSummary{
+			ChannelID: a.repID, Name: dn, Balance: a.balance,
+			MemberCount: a.count, CheckedAt: a.checkedAt,
+		})
+		if a.checkedAt != nil && (latest == nil || a.checkedAt.After(*latest)) {
+			latest = a.checkedAt
+		}
+	}
+	return FormatBalanceList(items, latest), nil
 }
 
-// BalanceDetail /balance <id> 最近历史。
-func (q *SQLQueryService) BalanceDetail(ctx context.Context, id int, groupIDs []int) (string, error) {
-	if !q.channelInGroups(ctx, id, groupIDs) {
-		return "⛔ 无权查看该站点。", nil
+// reconcileStations lazy reconcile：上游站点出现的新 base_url 自动建站（与 Web 同口径）。
+func (q *SQLQueryService) reconcileStations(ctx context.Context) error {
+	rows, err := q.DB.Pool.Query(ctx, `SELECT DISTINCT base_url FROM upstreams`)
+	if err != nil {
+		return fmt.Errorf("query base urls: %w", err)
 	}
+	var raw []string
+	for rows.Next() {
+		var b string
+		if rows.Scan(&b) == nil && b != "" {
+			raw = append(raw, b)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, b := range raw {
+		if _, err := q.DB.Pool.Exec(ctx, `
+			INSERT INTO relay_stations (base_url) VALUES ($1)
+			ON CONFLICT (base_url) DO NOTHING
+		`, station.NormalizeBaseURL(b)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BalanceDetail /balance <id> 中转站详情：账户余额 + 成员站点名列表
+// （不展示成员各自余额——按用户要求，余额只在汇总口径展示）。
+func (q *SQLQueryService) BalanceDetail(ctx context.Context, id int, groupIDs []int) (string, error) {
+	var key, dn string
+	if err := q.DB.Pool.QueryRow(ctx, `
+		SELECT base_url, display_name FROM relay_stations WHERE id = $1
+	`, id).Scan(&key, &dn); err != nil {
+		return "中转站不存在（ID 见 /balance 列表）。", nil
+	}
+	if dn == "" {
+		dn = station.AutoName(key)
+	}
+
+	// 成员（分组过滤：只列订阅者范围内的成员站点）
 	rows, err := q.DB.Pool.Query(ctx, `
-		SELECT balance, currency, source, checked_at
-		FROM balance_checks
-		WHERE channel_id = $1
-		ORDER BY checked_at DESC LIMIT 10
-	`, id)
+		SELECT u.id, u.name, u.enabled
+		FROM upstreams u
+		WHERE `+fmt.Sprintf(groupClause, "u.id")+`
+		ORDER BY u.id
+	`, grouped(groupIDs))
 	if err != nil {
 		return "", fmt.Errorf("query balance detail: %w", err)
 	}
 	defer rows.Close()
 
-	var name string
-	_ = q.DB.Pool.QueryRow(ctx, `SELECT name FROM upstreams WHERE id = $1`, id).Scan(&name)
+	keyMatch := map[int]bool{}
+	allRows, err := q.DB.Pool.Query(ctx, `SELECT id, base_url FROM upstreams`)
+	if err != nil {
+		return "", fmt.Errorf("query upstream keys: %w", err)
+	}
+	for allRows.Next() {
+		var cid int
+		var b string
+		if allRows.Scan(&cid, &b) == nil && station.NormalizeBaseURL(b) == key {
+			keyMatch[cid] = true
+		}
+	}
+	allRows.Close()
 
-	var b strings.Builder
-	b.WriteString("💰 <b>" + EscapeHTML(name) + "</b> 最近余额\n")
-	count := 0
+	var members []BalanceMember
+	inRange := 0
 	for rows.Next() {
-		var balance float64
-		var currency, source string
-		var checkedAt time.Time
-		if rows.Scan(&balance, &currency, &source, &checkedAt) != nil {
+		var m BalanceMember
+		if err := rows.Scan(&m.ChannelID, &m.Name, &m.Enabled); err != nil {
 			continue
 		}
-		status := "✓"
-		if source == "" {
-			status = "✗"
+		if !keyMatch[m.ChannelID] {
+			continue
 		}
-		b.WriteString(fmt.Sprintf("%s $%.2f %s · %s\n", status, balance, currency, checkedAt.Format("01-02 15:04")))
-		count++
+		members = append(members, m)
+		inRange++
 	}
-	if count == 0 {
-		b.WriteString("暂无有效检测结果。\n")
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("scan balance detail: %w", err)
 	}
-	return b.String(), rows.Err()
+
+	// 账户余额：范围内成员最近一次成功检测
+	var balance *float64
+	var checkedAt *time.Time
+	if inRange > 0 {
+		brows, err := q.DB.Pool.Query(ctx, `
+			SELECT bc.balance, bc.checked_at
+			FROM balance_checks bc
+			WHERE bc.source != ''
+			  AND `+fmt.Sprintf(groupClause, "bc.channel_id")+`
+			ORDER BY bc.checked_at DESC LIMIT 1
+		`, grouped(groupIDs))
+		if err == nil {
+			if brows.Next() {
+				var bal float64
+				var at time.Time
+				if brows.Scan(&bal, &at) == nil {
+					balance = &bal
+					checkedAt = &at
+				}
+			}
+			brows.Close()
+		}
+	}
+
+	return FormatBalanceDetail(dn, balance, checkedAt, members), nil
 }
 
 // HealthList /health 全量列表。

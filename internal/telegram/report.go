@@ -10,12 +10,12 @@ import (
 
 // SystemOverview 汇总消息中的系统概况（可用站点/熔断/告警统计）。
 type SystemOverview struct {
-	TotalChannels   int
-	ActiveChannels  int
-	OpenCircuits    int
-	ActiveAlerts    int
-	CriticalAlerts  int
-	WarningAlerts   int
+	TotalChannels  int
+	ActiveChannels int
+	OpenCircuits   int
+	ActiveAlerts   int
+	CriticalAlerts int
+	WarningAlerts  int
 }
 
 // FormatReport 组装每小时告警汇总消息（HTML）。

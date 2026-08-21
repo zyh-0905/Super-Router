@@ -44,7 +44,7 @@ func TestFormatRelayListEmpty(t *testing.T) {
 func TestFormatRelayDetailNoCredentialLeak(t *testing.T) {
 	it := RelayDetail{
 		RelaySummary: RelaySummary{ID: 5, Name: "Claude Relay", Host: "claude.example.com", Healthy: true, Balance: f64(3.14), CircuitState: "open"},
-		Protocol: "anthropic", RelayType: "newapi",
+		Protocol:     "anthropic", RelayType: "newapi",
 		Groups: []string{"默认分组"}, Requests24h: 100, SuccessRate: 0.97, AverageMS: 800, P95MS: 1200,
 	}
 	msg := FormatRelayDetail(it)
@@ -67,9 +67,19 @@ func TestFormatBalanceHealthRatioLists(t *testing.T) {
 		t.Fatal(got)
 	}
 	bal := 1.5
-	bs := []BalanceSummary{{ChannelID: 1, Name: "A", Balance: &bal, CheckedAt: &now}}
+	bs := []BalanceSummary{{ChannelID: 1, Name: "A", Balance: &bal, CheckedAt: &now, MemberCount: 3}}
 	if got := FormatBalanceList(bs, &now); !strings.Contains(got, "$1.50") {
 		t.Fatal(got)
+	}
+	if got := FormatBalanceList(bs, &now); !strings.Contains(got, "3 个站点") {
+		t.Fatal("station member count missing:\n" + got)
+	}
+	// 详情：不包含成员各自的余额数字
+	if got := FormatBalanceDetail("supeai.cc", &bal, &now, []BalanceMember{
+		{ChannelID: 31, Name: "supe-claude-MAX", Enabled: true},
+		{ChannelID: 24, Name: "supe-Kiro-低缓", Enabled: false},
+	}); !strings.Contains(got, "$1.50") || !strings.Contains(got, "supe-claude-MAX") || !strings.Contains(got, "⛔") {
+		t.Fatal("detail format wrong:\n" + got)
 	}
 	lat := 300
 	hs := []HealthSummary{{ChannelID: 1, Name: "A", Alive: true, LatencyMS: &lat}}
