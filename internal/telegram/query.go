@@ -219,14 +219,18 @@ func (q *SQLQueryService) BalanceList(ctx context.Context, groupIDs []int) (stri
 		return "", fmt.Errorf("scan balances: %w", err)
 	}
 
-	// 中转站名（自定义名优先，空 = 自动命名）
+	// 中转站 ID 与名称（自定义名优先，空 = 自动命名）：
+	// ID 用于 /balance <id> 明细，与 Web 中转站视图同口径。
 	names := map[string]string{}
-	srows, err := q.DB.Pool.Query(ctx, `SELECT base_url, display_name FROM relay_stations`)
+	ids := map[string]int{}
+	srows, err := q.DB.Pool.Query(ctx, `SELECT id, base_url, display_name FROM relay_stations`)
 	if err == nil {
 		for srows.Next() {
+			var sid int
 			var key, dn string
-			if srows.Scan(&key, &dn) == nil {
+			if srows.Scan(&sid, &key, &dn) == nil {
 				names[key] = dn
+				ids[key] = sid
 			}
 		}
 		srows.Close()
@@ -269,7 +273,7 @@ func (q *SQLQueryService) BalanceList(ctx context.Context, groupIDs []int) (stri
 			dn = station.AutoName(key)
 		}
 		items = append(items, BalanceSummary{
-			ChannelID: a.repID, Name: dn, Balance: a.balance,
+			StationID: ids[key], ChannelID: a.repID, Name: dn, Balance: a.balance,
 			MemberCount: a.count, CheckedAt: a.checkedAt,
 		})
 		if a.checkedAt != nil && (latest == nil || a.checkedAt.After(*latest)) {

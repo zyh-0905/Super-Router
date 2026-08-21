@@ -132,15 +132,24 @@ func FormatBalanceList(items []BalanceSummary, checkedAt *time.Time) string {
 		return "💰 <b>中转站余额</b>\n暂无有效检测结果。"
 	}
 	var b strings.Builder
-	b.WriteString("💰 <b>中转站余额</b>")
-	if checkedAt != nil {
-		b.WriteString("（数据时间 " + checkedAt.Format("2006-01-02 15:04") + "）")
+	b.WriteString("💰 <b>中转站余额</b>\n")
+	b.WriteString("🕐 更新于 " + formatCheckedAt(checkedAt) + "\n")
+	for i, it := range items {
+		b.WriteString("━━━━━━━━━━━━\n")
+		b.WriteString("🏢 <b>" + EscapeHTML(it.Name) + "</b>")
+		if it.StationID > 0 {
+			b.WriteString(fmt.Sprintf(" ［ID %d］", it.StationID))
+		}
+		b.WriteString("\n")
+		b.WriteString("💵 <b>" + fmtBalance(it.Balance) + "</b>")
+		if it.MemberCount > 0 {
+			b.WriteString(fmt.Sprintf(" ｜ %d 个站点", it.MemberCount))
+		}
+		b.WriteString("\n")
+		_ = i
 	}
-	b.WriteString("\n")
-	for _, it := range items {
-		b.WriteString(fmt.Sprintf("%d %s：%s（%d 个站点）\n",
-			it.ChannelID, EscapeHTML(it.Name), fmtBalance(it.Balance), it.MemberCount))
-	}
+	b.WriteString("━━━━━━━━━━━━\n")
+	b.WriteString("💡 明细：/balance &lt;ID&gt;")
 	return b.String()
 }
 
@@ -148,13 +157,14 @@ func FormatBalanceList(items []BalanceSummary, checkedAt *time.Time) string {
 // 账户余额 + 成员站点名列表（不展示成员各自余额）。
 func FormatBalanceDetail(name string, balance *float64, checkedAt *time.Time, members []BalanceMember) string {
 	var b strings.Builder
-	b.WriteString("💰 <b>" + EscapeHTML(name) + "</b>\n")
-	b.WriteString("账户余额：" + fmtBalance(balance))
+	b.WriteString("🏢 <b>" + EscapeHTML(name) + "</b>\n")
+	b.WriteString("💵 账户余额：<b>" + fmtBalance(balance) + "</b>")
 	if checkedAt != nil {
-		b.WriteString("（检测于 " + checkedAt.Format("2006-01-02 15:04") + "）")
+		b.WriteString("　🕐 " + formatCheckedAt(checkedAt))
 	}
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("成员站点（%d 个）：\n", len(members)))
+	b.WriteString("━━━━━━━━━━━━\n")
+	b.WriteString(fmt.Sprintf("👥 成员站点（%d 个）：\n", len(members)))
 	if len(members) == 0 {
 		b.WriteString("（无授权范围内的成员站点）\n")
 	}
@@ -163,9 +173,21 @@ func FormatBalanceDetail(name string, balance *float64, checkedAt *time.Time, me
 		if !m.Enabled {
 			state = "⛔"
 		}
-		b.WriteString(fmt.Sprintf("%s %d %s\n", state, m.ChannelID, EscapeHTML(m.Name)))
+		b.WriteString(fmt.Sprintf("%s [%d] %s\n", state, m.ChannelID, EscapeHTML(m.Name)))
 	}
 	return b.String()
+}
+
+// formatCheckedAt 检测时间紧凑展示：今天只显示时分，跨天显示月日时分。
+func formatCheckedAt(t *time.Time) string {
+	if t == nil {
+		return "—"
+	}
+	now := time.Now()
+	if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
+		return t.Format("15:04")
+	}
+	return t.Format("01-02 15:04")
 }
 
 // FormatHealthList /health 全量紧凑列表。

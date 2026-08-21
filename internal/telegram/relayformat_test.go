@@ -67,19 +67,28 @@ func TestFormatBalanceHealthRatioLists(t *testing.T) {
 		t.Fatal(got)
 	}
 	bal := 1.5
-	bs := []BalanceSummary{{ChannelID: 1, Name: "A", Balance: &bal, CheckedAt: &now, MemberCount: 3}}
-	if got := FormatBalanceList(bs, &now); !strings.Contains(got, "$1.50") {
-		t.Fatal(got)
+	bs := []BalanceSummary{{StationID: 5, ChannelID: 1, Name: "A", Balance: &bal, CheckedAt: &now, MemberCount: 3}}
+	list := FormatBalanceList(bs, &now)
+	if !strings.Contains(list, "$1.50") {
+		t.Fatal(list)
 	}
-	if got := FormatBalanceList(bs, &now); !strings.Contains(got, "3 个站点") {
-		t.Fatal("station member count missing:\n" + got)
+	if !strings.Contains(list, "3 个站点") {
+		t.Fatal("station member count missing:\n" + list)
+	}
+	if !strings.Contains(list, "更新于") || !strings.Contains(list, "［ID 5］") {
+		t.Fatal("list header or station id missing:\n" + list)
+	}
+	// 渠道 ID 不得出现在列表里（明细接口要的是中转站 ID）
+	if strings.Contains(list, "ChannelID") {
+		t.Fatal("list should show station id, not channel id:\n" + list)
 	}
 	// 详情：不包含成员各自的余额数字
-	if got := FormatBalanceDetail("supeai.cc", &bal, &now, []BalanceMember{
+	detail := FormatBalanceDetail("supeai.cc", &bal, &now, []BalanceMember{
 		{ChannelID: 31, Name: "supe-claude-MAX", Enabled: true},
 		{ChannelID: 24, Name: "supe-Kiro-低缓", Enabled: false},
-	}); !strings.Contains(got, "$1.50") || !strings.Contains(got, "supe-claude-MAX") || !strings.Contains(got, "⛔") {
-		t.Fatal("detail format wrong:\n" + got)
+	})
+	if !strings.Contains(detail, "$1.50") || !strings.Contains(detail, "supe-claude-MAX") || !strings.Contains(detail, "⛔") || !strings.Contains(detail, "[31]") {
+		t.Fatal("detail format wrong:\n" + detail)
 	}
 	lat := 300
 	hs := []HealthSummary{{ChannelID: 1, Name: "A", Alive: true, LatencyMS: &lat}}
