@@ -258,6 +258,10 @@ export const api = {
   getGroupStrategy: (id) => api.get(`/admin/groups/${id}/strategy`),
   updateGroupStrategy: (id, p) => api.put(`/admin/groups/${id}/strategy`, p),
 
+  // ===== 站点直达测试（测试台·站点测试页签；结果仅展示，不落库） =====
+  // 探测耗时可能到 2 分钟（流式+非流式各一次），超时放宽到 300s
+  siteTest: (channelId, payload) => api.post(`/admin/channels/${channelId}/site-test`, payload, { timeout: 300000 }),
+
   // ===== 推理代理（请求测试台用，返回原始 Response 以支持流式） =====
   async chatCompletion(payload, { onDelta } = {}) {
     const ctrl = new AbortController()

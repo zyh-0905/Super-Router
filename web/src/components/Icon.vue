@@ -41,6 +41,7 @@ const icons = {
   gauge: '<path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l4.5-4.5M3 19h18"/>',
   bell: '<path d="M18 9a6 6 0 1 0-12 0c0 6-2.5 7-2.5 7h17S18 15 18 9z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
   send: '<path d="M21 3 3 10.5l7.5 3M21 3 13.5 21l-3-7.5M21 3 10.5 13.5"/>',
+  target: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1"/>',
 }
 </script>
 

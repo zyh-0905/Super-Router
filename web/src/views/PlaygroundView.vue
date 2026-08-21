@@ -6,9 +6,13 @@ import { store, toast } from '../store'
 import EmptyState from '../components/EmptyState.vue'
 import SelectBox from '../components/SelectBox.vue'
 import Icon from '../components/Icon.vue'
+import SiteTestPanel from '../components/SiteTestPanel.vue'
 import { fmtMs } from '../utils'
 
 const router = useRouter()
+
+// 测试模式：分组测试（走网关路由）/ 站点测试（直达站点）
+const mode = ref('group')
 
 const req = ref({
   model: '',
@@ -16,7 +20,7 @@ const req = ref({
   group: '', // 分组名（空 = 不限定）
   max_tokens: 1024,
   temperature: 0.7,
-  messages: [{ role: 'user', content: '' }],
+  messages: [{ role: 'user', content: 'hi' }], // 默认消息 hi，支持自定义
 })
 
 const groups = ref([])
@@ -198,12 +202,25 @@ function reset() {
     <div class="page-head">
       <div>
         <div class="page-title">测试台</div>
-        <div class="page-sub">向网关发送真实的 Chat Completions 请求，验证路由与上游</div>
+        <div class="page-sub">分组测试走网关路由；站点测试直达指定站点验证真实链路</div>
       </div>
-      <button class="btn btn-ghost" @click="copyCurl"><Icon name="copy" :size="15" />复制 cURL</button>
+      <button v-if="mode === 'group'" class="btn btn-ghost" @click="copyCurl"><Icon name="copy" :size="15" />复制 cURL</button>
     </div>
 
-    <div class="play-grid">
+    <!-- 测试模式切换 -->
+    <div class="row gap-2 mb-3">
+      <button class="seg" :class="{ on: mode === 'group' }" @click="mode = 'group'">
+        <Icon name="layers" :size="13" style="margin-right:5px" />分组测试
+      </button>
+      <button class="seg" :class="{ on: mode === 'site' }" @click="mode = 'site'">
+        <Icon name="target" :size="13" style="margin-right:5px" />站点测试
+      </button>
+    </div>
+
+    <!-- 站点测试：直达指定站点（绕过路由引擎） -->
+    <SiteTestPanel v-if="mode === 'site'" />
+
+    <div v-else class="play-grid">
       <!-- 左：请求构建器 -->
       <div class="card play-pane">
         <div class="card-head">请求<Icon name="terminal" :size="15" style="color:var(--text-3);margin-left:2px" /></div>

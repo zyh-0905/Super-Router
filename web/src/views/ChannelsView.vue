@@ -54,6 +54,11 @@ const filter = ref('')
 const showModal = ref(false)
 const editing = ref(null)
 const saving = ref(false)
+// 每个 pair 带稳定 uid 作 v-for key：删除中间行时按 index 复用 DOM
+// 会让后续输入框状态错位（Vue 按 index 复用）。
+// 必须声明在 emptyForm() 调用之前：emptyForm → newPair → ++pairSeq，
+// let 在模块顶层按顺序执行，晚于首调会触发 TDZ 错误。
+let pairSeq = 0
 const form = ref(emptyForm())
 const testResult = ref(null)
 const testing = ref(false)
@@ -600,9 +605,6 @@ function openEdit(ch) {
   showModal.value = true
 }
 
-// 每个 pair 带稳定 uid 作 v-for key：删除中间行时按 index 复用 DOM
-// 会让后续输入框状态错位（Vue 按 index 复用）
-let pairSeq = 0
 function newPair(from = '', to = '') { return { _uid: ++pairSeq, from, to } }
 function addPair() { form.value.model_pairs.push(newPair()) }
 function removePair(i) { form.value.model_pairs.splice(i, 1) }

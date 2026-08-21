@@ -21,6 +21,7 @@ import (
 	"smart-router/internal/migrate"
 	"smart-router/internal/quality"
 	"smart-router/internal/router"
+	"smart-router/internal/safenet"
 	"smart-router/internal/store"
 
 	"github.com/gin-gonic/gin"
@@ -158,6 +159,10 @@ func main() {
 	ratioProbe.SetProbeModel(cfg.Checker.ProbeModel)
 	ratioHandler := api.NewRatioHandler(db, redisClient, cfg, ratioProbe, zapLogger.Named("ratio"))
 
+	// 站点直达测试（测试台·站点测试页签）：复用同一 ratioProbe（余额读取 + 站点级探测锁）
+	siteTestHandler := api.NewSiteTestHandler(db, ratioProbe, cfg.Security.EncryptionKey, zapLogger.Named("site-test"),
+		safenet.Options{AllowHTTP: cfg.Server.AllowHTTPUpstream, AllowPrivate: cfg.Server.AllowPrivateUpstream})
+
 	// 初始化 HTTP 服务器
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -225,6 +230,7 @@ func main() {
 		adminGroup.POST("/model-prices", ratioHandler.UpsertModelPrice)
 		adminGroup.DELETE("/model-prices/:model", ratioHandler.DeleteModelPrice)
 		adminGroup.POST("/channels/:id/probe-ratio", ratioHandler.ProbeRatio)
+		adminGroup.POST("/channels/:id/site-test", siteTestHandler.RunSiteTest)
 		adminGroup.POST("/channels/:id/ratio-groups", ratioHandler.CreateRatioGroup)
 		adminGroup.PATCH("/channels/:id/ratio-groups/:gid", ratioHandler.UpdateRatioGroup)
 		adminGroup.DELETE("/channels/:id/ratio-groups/:gid", ratioHandler.DeleteRatioGroup)
