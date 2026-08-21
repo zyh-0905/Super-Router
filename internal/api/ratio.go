@@ -545,7 +545,7 @@ func (h *RatioHandler) probeChannelModel(ctx context.Context, channelID int, mod
 				msg = "无法读取该站点的余额（可能未开放 /api/user/self 或 Access Token 无效），无法实测倍率"
 			}
 		case "chat":
-			msg = "推理请求失败：" + res.Error
+			msg = res.Error // 已含「推理请求失败:」前缀（probe.go），避免重复拼接
 		default:
 			msg = "探测失败：" + res.Error
 		}

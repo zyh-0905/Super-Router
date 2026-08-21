@@ -84,11 +84,12 @@ func buildChatRequest(ch *Channel, sc ProbeScenario) ([]byte, error) {
 
 // scenarioToOpenAI 探测场景 → OpenAI 请求 map。
 func scenarioToOpenAI(sc ProbeScenario) map[string]interface{} {
+	// 不发送 temperature：新模型（claude-sonnet-5 等）已弃用该字段，
+	// 部分中转站对显式 temperature:0 直接 400 拒绝（实测 supeai.cc）。
 	req := map[string]interface{}{
-		"model":       sc.Model,
-		"max_tokens":  sc.MaxTokens,
-		"temperature": 0,
-		"stream":      sc.Stream,
+		"model":      sc.Model,
+		"max_tokens": sc.MaxTokens,
+		"stream":     sc.Stream,
 	}
 	messages := make([]interface{}, 0, len(sc.Messages))
 	for _, m := range sc.Messages {

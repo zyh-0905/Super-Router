@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"smart-router/internal/protocol"
@@ -46,7 +48,7 @@ type ChatCompletionRequest struct {
 	Model       string        `json:"model"`
 	Messages    []ChatMessage `json:"messages"`
 	MaxTokens   int           `json:"max_tokens"`
-	Temperature float64       `json:"temperature"`
+	Temperature float64       `json:"temperature,omitempty"` // omitempty：新模型（claude-sonnet-5 等）已弃用 temperature，中转站会 400 拒绝显式 temperature:0
 	Stream      bool          `json:"stream"`
 }
 
@@ -132,10 +134,10 @@ const (
 	BasisBaseline = "baseline" // $10/1M 混合基准（价格库未收录）
 )
 
-// computeRealRatio 按 token 拆分计算真实倍率：
+// ComputeRealRatio 按 token 拆分计算真实倍率：
 // 有官网价 → 实际扣费 ÷ 按官网价应扣费（official）
 // 无官网价 → 实际扣费 ÷ tokens ÷ $10/1M（baseline 兜底）
-func computeRealRatio(cost float64, promptTokens, completionTokens int, officialInPerM, officialOutPerM float64) (ratio float64, basis string) {
+func ComputeRealRatio(cost float64, promptTokens, completionTokens int, officialInPerM, officialOutPerM float64) (ratio float64, basis string) {
 	totalTokens := promptTokens + completionTokens
 	if totalTokens <= 0 || cost <= 0 {
 		return 0, BasisBaseline
@@ -374,6 +376,43 @@ func (p *ProbeChecker) UpstreamTodaySpent(ctx context.Context, upstreamID int) (
 	return p.getUpstreamTodaySpent(ctx, upstreamID)
 }
 
+// readUpstreamError 读取上游错误响应体用于诊断（截断 + 凭据脱敏）。
+// C4 边界：代理层绝不透传上游错误正文（上游可能在错误中回显 Key），
+// 但 checker 探测的错误只进入管理端日志/界面，且此处先替换掉全部
+// 凭据字段再回显——这是「测倍率失败」问题定位的关键信息，
+// 与余额检测错误回显（Invalid token 等）同口径。
+func readUpstreamError(resp *http.Response, upstream Upstream) string {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if len(body) == 0 {
+		return ""
+	}
+	if protocol.IsAnthropic(upstream.Protocol) {
+		if _, msg, ok := protocol.AnthropicError(body); ok && msg != "" {
+			return ": " + truncateUpstreamErr(redactCreds(msg, upstream), 200)
+		}
+	}
+	return ": " + truncateUpstreamErr(redactCreds(string(body), upstream), 200)
+}
+
+// redactCreds 把站点凭据从诊断文本中替换掉（防上游错误回显 Key）。
+func redactCreds(s string, upstream Upstream) string {
+	for _, cred := range []string{upstream.APIKey, upstream.AccessToken, upstream.BalanceAPIToken} {
+		if cred != "" {
+			s = strings.ReplaceAll(s, cred, "***")
+		}
+	}
+	return s
+}
+
+// truncateUpstreamErr 截断诊断文本（字节级，防止异常响应撑爆日志/界面）。
+func truncateUpstreamErr(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
 // recordProbeFailure 写入探测失败审计行（含保守估算成本）。
 // 独立后台上下文 + 错误日志：探测 ctx 可能已取消，失败记录恰恰
 // 最需要落库；这些行是 DB 预算汇总闸门的输入，写失败必须可见
@@ -466,7 +505,7 @@ func (p *ProbeChecker) probeOne(ctx context.Context, upstream Upstream, epoch in
 		res.OfficialInputPerM = officialInPerM
 		res.OfficialOutputPerM = officialOutPerM
 	}
-	res.RealRatio, res.Basis = computeRealRatio(cost, usage.PromptTokens, usage.CompletionTokens, officialInPerM, officialOutPerM)
+	res.RealRatio, res.Basis = ComputeRealRatio(cost, usage.PromptTokens, usage.CompletionTokens, officialInPerM, officialOutPerM)
 
 	// 5. 写入数据库（含 token 拆分、计价基准与官网价快照）
 	_, err = p.db.Pool.Exec(ctx, `
@@ -526,14 +565,26 @@ func (p *ProbeChecker) acquireProbeLock(ctx context.Context, upstreamID int) (fu
 	}, nil
 }
 
+// AcquireChannelLock 导出站点级探测互斥锁（与定时/手动探针共用键段 9000000000+）。
+// 供 Gateway 内的站点直达测试使用：余额差测量与探针串行化，防并发扣费串扰。
+func (p *ProbeChecker) AcquireChannelLock(ctx context.Context, upstreamID int) (func(), error) {
+	return p.acquireProbeLock(ctx, upstreamID)
+}
+
 // getBalance 读取站点余额（复用 BalanceChecker 的多协议探测：
 // 站点自定义余额接口 → one-api/new-api → OpenAI 官方）
 func (p *ProbeChecker) getBalance(ctx context.Context, upstream Upstream) (float64, error) {
-	res, err := p.balance.FetchBalance(ctx, upstream)
+	res, err := p.ChannelBalance(ctx, upstream)
 	if err != nil {
 		return 0, err
 	}
 	return res.Balance, nil
+}
+
+// ChannelBalance 导出站点余额读取（多协议探测链，不写库）。
+// 供 Gateway 内的站点直达测试等使用。
+func (p *ProbeChecker) ChannelBalance(ctx context.Context, upstream Upstream) (*BalanceResult, error) {
+	return p.balance.FetchBalance(ctx, upstream)
 }
 
 func (p *ProbeChecker) callChatCompletion(ctx context.Context, upstream Upstream, model string, maxTokens int) (*Usage, error) {
@@ -596,7 +647,7 @@ func (p *ProbeChecker) callChatCompletion(ctx context.Context, upstream Upstream
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status: %d%s", resp.StatusCode, readUpstreamError(resp, upstream))
 	}
 
 	if protocol.IsAnthropic(upstream.Protocol) {
