@@ -153,8 +153,18 @@ func (w *Worker) pollOnce(ctx context.Context) error {
 		// A1：仅在回复全部成功后才推进 offset。
 		// 处理/发送失败时保留当前 offset（返回错误触发退避），
 		// 下一轮 getUpdates 会重新投递该 update，消息不丢失。
-		if err := w.handleUpdate(ctx, u); err != nil {
-			return err
+		err := w.handleUpdate(ctx, u)
+		if err != nil {
+			if isPermanentTelegramError(err) {
+				// M5：确定性拒绝（HTML 解析失败/chat 不存在等）重试永远失败——
+				// 记 last_error 后跳过该 update 并推进 offset，
+				// 防止毒丸消息无限重放卡死后续全部命令。
+				w.logger.Warn("Permanent telegram error, skipping update",
+					zap.Int64("update_id", u.UpdateID), zap.Int64("chat_id", u.ChatID), zap.Error(err))
+				_ = w.store.UpdateLastError(ctx, truncateStr(err.Error(), 500))
+			} else {
+				return err
+			}
 		}
 		if err := w.store.UpdateLastUpdateID(ctx, u.UpdateID+1); err != nil {
 			return fmt.Errorf("update last_update_id: %w", err)

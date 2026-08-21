@@ -245,8 +245,12 @@ func (h *QualityHandler) EventsQualityCheck(c *gin.Context) {
 				send(eventType, h.publicRunSummary(run, results))
 				return
 			}
-			// 非终态：发送进度事件（每秒一次，避免刷屏）
-			send("task_progress", h.publicRunSummary(run, results))
+			// 非终态：发送进度事件（每秒一次，避免刷屏）。
+			// M7：写失败（客户端半开连接未触发 ctx.Done）立即结束，
+			// 不再每秒查库直到租约到期。
+			if !send("task_progress", h.publicRunSummary(run, results)) {
+				return
+			}
 		}
 	}
 }

@@ -1,0 +1,1 @@
+DROP INDEX idx_telegram_delivery_logs_window;

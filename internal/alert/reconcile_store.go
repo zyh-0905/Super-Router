@@ -99,7 +99,7 @@ func (s *SQLStore) Reconcile(ctx context.Context, current []Alert, now time.Time
 				END,
 				metadata = CASE
 					WHEN EXCLUDED.severity = 'critical' AND alert_events.severity <> 'critical'
-						THEN alert_events.metadata || jsonb_build_object('escalated_at', to_char($17, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))
+						THEN alert_events.metadata || jsonb_build_object('escalated_at', to_char($17 AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))
 					ELSE alert_events.metadata
 				END
 		`,

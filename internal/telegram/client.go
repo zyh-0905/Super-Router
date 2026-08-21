@@ -32,6 +32,32 @@ func (e *ErrRetryAfter) Error() string {
 
 func (e *ErrRetryAfter) Unwrap() error { return e.Err }
 
+// permanentError Telegram API 确定性拒绝（4xx 类错误码，429 除外）：
+// HTML 解析失败、chat 不存在、bot 被踢出群等——重试永远失败。
+// 调用方（worker poll 循环）识别后跳过该 update 并推进 offset，
+// 防止毒丸消息无限重放卡死命令轮询（M5）。
+type permanentError struct {
+	err error
+}
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// isPermanentTelegramError 判断错误是否属于 API 确定性拒绝。
+func isPermanentTelegramError(err error) bool {
+	var pe *permanentError
+	return errors.As(err, &pe)
+}
+
+// wrapTelegramAPIError 按错误码分类：4xx（非 429）→ 确定性拒绝；
+// 其余（5xx/429/网络）→ 可重试错误原样返回。
+func wrapTelegramAPIError(code int, err error) error {
+	if code >= 400 && code < 500 && code != 429 {
+		return &permanentError{err: err}
+	}
+	return err
+}
+
 // Client Bot API HTTP 客户端。Bot Token 通过 URL path 传入、只保存在内存，绝不写日志。
 type Client struct {
 	token  string
@@ -95,7 +121,8 @@ func (c *Client) do(ctx context.Context, method string, params url.Values) (*api
 		return nil, &ErrRetryAfter{Seconds: secs, Err: fmt.Errorf("telegram 429")}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("telegram http %d: %s", resp.StatusCode, truncateStr(string(body), 300))
+		return nil, wrapTelegramAPIError(resp.StatusCode,
+			fmt.Errorf("telegram http %d: %s", resp.StatusCode, truncateStr(string(body), 300)))
 	}
 
 	var ar apiResponse
@@ -103,7 +130,8 @@ func (c *Client) do(ctx context.Context, method string, params url.Values) (*api
 		return nil, fmt.Errorf("decode telegram response: %w", err)
 	}
 	if !ar.OK {
-		return nil, fmt.Errorf("telegram error %d: %s", ar.ErrorCode, truncateStr(ar.Description, 300))
+		return nil, wrapTelegramAPIError(ar.ErrorCode,
+			fmt.Errorf("telegram error %d: %s", ar.ErrorCode, truncateStr(ar.Description, 300)))
 	}
 	return &ar, nil
 }
@@ -193,7 +221,8 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, html string) (in
 		return 0, &ErrRetryAfter{Seconds: secs, Err: fmt.Errorf("telegram 429")}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("telegram http %d: %s", resp.StatusCode, truncateStr(string(body), 300))
+		return 0, wrapTelegramAPIError(resp.StatusCode,
+			fmt.Errorf("telegram http %d: %s", resp.StatusCode, truncateStr(string(body), 300)))
 	}
 
 	var ar apiResponse
@@ -201,7 +230,8 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, html string) (in
 		return 0, fmt.Errorf("decode telegram response: %w", err)
 	}
 	if !ar.OK {
-		return 0, fmt.Errorf("telegram error %d: %s", ar.ErrorCode, truncateStr(ar.Description, 300))
+		return 0, wrapTelegramAPIError(ar.ErrorCode,
+			fmt.Errorf("telegram error %d: %s", ar.ErrorCode, truncateStr(ar.Description, 300)))
 	}
 	var result struct {
 		MessageID int64 `json:"message_id"`

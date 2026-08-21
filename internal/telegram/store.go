@@ -132,12 +132,16 @@ func (s *SQLConfigStore) HasDelivery(ctx context.Context, subID int64, kind stri
 	return exists, err
 }
 
-// LogDelivery 写入投递审计。
+// LogDelivery 写入投递审计（M3：成功行幂等——部分唯一索引 +
+// ON CONFLICT DO NOTHING，并发重复写入不产生第二行）。
 func (s *SQLConfigStore) LogDelivery(ctx context.Context, l DeliveryLog) error {
 	_, err := s.Pool.Exec(ctx, `
 		INSERT INTO telegram_delivery_logs
 			(subscriber_id, message_kind, window_start, window_end, success, telegram_message_id, error)
 		VALUES ($1, $2, $3, $4, $5, NULLIF($6, 0), NULLIF($7, ''))
+		ON CONFLICT (subscriber_id, message_kind, window_start, window_end)
+			WHERE success = true
+		DO NOTHING
 	`, l.SubscriberID, l.MessageKind, l.WindowStart, l.WindowEnd, l.Success, l.TelegramMessageID, l.Error)
 	return err
 }
