@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -237,6 +238,13 @@ type scheduler struct {
 	// pendingEpoch 本轮的工作 epoch（H11：先写结果、轮末发布）
 	pendingEpoch int64
 
+	// A1：本 tick 全局探针预算的进程内粗闸门（微美元，近似值）——
+	// Redis 原子预留才是硬闸门；内存值只用于跳过明知无预算的站点。
+	// 并发探测时用原子计数维护（原串行版本共享 float64 指针）。
+	probeBudgetMicro atomic.Int64
+	// H8：预算结算失败 → 禁用本 tick 剩余探测（并发安全版 globalBudgetLeft=0）。
+	probeDisabled atomic.Bool
+
 	lastCleanup time.Time // 保留策略清理（每日一次）
 }
 
@@ -403,22 +411,6 @@ func (s *scheduler) tick(ctx context.Context) {
 	now := time.Now()
 	s.runCleanup(ctx) // 自守卫：每日一次
 
-	// H11：整轮工作 epoch 先写后发布。读取失败则跳过本轮写入
-	// （fail-closed，不复用旧 epoch 写入混合数据）。
-	pendingEpoch, err := s.db.PeekNextEpoch(ctx)
-	if err != nil {
-		s.logger.Error("Peek working epoch failed, tick skipped", zap.Error(err))
-		return
-	}
-	s.pendingEpoch = pendingEpoch // 供 runProbe 使用
-
-	// 全局探针预算检查（DB 汇总，粗粒度闸门）
-	globalSpent, err := s.probe.TodaySpent(ctx)
-	globalBudgetLeft, globalBudgetAvailable := probeBudgetLeft(s.cfg.Checker.DailyProbeBudget, globalSpent, err)
-	if !globalBudgetAvailable {
-		s.logger.Error("Failed to read global probe spending; paid probes disabled for this tick", zap.Error(err))
-	}
-
 	// 初始化新渠道的 lastRun
 	for _, sch := range schedules {
 		if s.lastRun[sch.ID] == nil {
@@ -440,13 +432,67 @@ func (s *scheduler) tick(ctx context.Context) {
 		}
 	}
 
-	// 存活探测：收集到期渠道并并发执行（单个黑洞上游不再拖慢整轮）
+	// 预计算到期任务（纯内存判定，主 goroutine 读 lastRun 无竞态）
 	var dueAlive []checker.ChannelSchedule
+	type channelTasks struct {
+		sch     checker.ChannelSchedule
+		pricing bool
+		probe   bool
+		balance bool
+	}
+	var dueTasks []channelTasks
 	for _, sch := range schedules {
-		if now.Sub(s.lastRun[sch.ID]["alive"]) >= sch.AliveInterval {
+		last := s.lastRun[sch.ID]
+		if now.Sub(last["alive"]) >= sch.AliveInterval {
 			dueAlive = append(dueAlive, sch)
 		}
+		t := channelTasks{sch: sch}
+		if now.Sub(last["pricing"]) >= sch.PricingInterval {
+			t.pricing = true
+		}
+		if probeDue(now, last, sch.ProbeInterval, s.cfg.Checker.ProbeFailedBackoff) {
+			t.probe = true
+		}
+		if now.Sub(last["balance"]) >= sch.BalanceInterval {
+			t.balance = true
+		}
+		if t.pricing || t.probe || t.balance {
+			dueTasks = append(dueTasks, t)
+		}
 	}
+
+	// A2：本轮没有任何到期任务——跳过 epoch 读取与发布。此前每 5s 无条件
+	// bump epoch，快照缓存（TTL 10s）到期后必然全量重建（6 个批量查询 +
+	// 归档），即使数据无任何变化。
+	if len(dueAlive) == 0 && len(dueTasks) == 0 {
+		return
+	}
+
+	// H11：整轮工作 epoch 先写后发布。读取失败则跳过本轮写入
+	// （fail-closed，不复用旧 epoch 写入混合数据）。
+	pendingEpoch, err := s.db.PeekNextEpoch(ctx)
+	if err != nil {
+		s.logger.Error("Peek working epoch failed, tick skipped", zap.Error(err))
+		return
+	}
+	s.pendingEpoch = pendingEpoch // 供 runProbe 使用
+
+	// 全局探针预算粗闸门（DB 汇总；Redis 原子预留是硬闸门）。
+	// 读取失败 → 本 tick 禁用付费探针（fail-closed），价格/余额不受影响。
+	s.probeDisabled.Store(false)
+	globalSpent, err := s.probe.TodaySpent(ctx)
+	if err != nil {
+		s.logger.Error("Failed to read global probe spending; paid probes disabled for this tick", zap.Error(err))
+		s.probeDisabled.Store(true)
+	} else {
+		left := checker.ToBudgetUnits(s.cfg.Checker.DailyProbeBudget) - checker.ToBudgetUnits(globalSpent)
+		if left < 0 {
+			left = 0
+		}
+		s.probeBudgetMicro.Store(left)
+	}
+
+	// 存活探测：收集到期渠道并并发执行（单个黑洞上游不再拖慢整轮）
 	if len(dueAlive) > 0 {
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, 8) // 并发上限
@@ -468,28 +514,71 @@ func (s *scheduler) tick(ctx context.Context) {
 		}
 	}
 
-	for _, sch := range schedules {
-		last := s.lastRun[sch.ID]
-
-		// 价格同步
-		if now.Sub(last["pricing"]) >= sch.PricingInterval {
-			if err := s.pricing.SyncChannel(ctx, sch.Upstream, pendingEpoch); err != nil {
-				s.logger.Debug("Pricing sync failed", zap.String("channel", sch.Name), zap.Error(err))
-			}
-			last["pricing"] = now
+	// A1：价格同步/推理探针/余额检测按站点并发执行。每站点一个 goroutine
+	// 保持站内任务顺序（pricing→probe→balance），跨站并发由 semaphore 4 限流。
+	// 此前串行执行：多站点探针同时到期时单轮 tick 可达 N×30s，期间 epoch
+	// 不发布、快照停更、其余站点任务全部延迟。并发安全性由每站点
+	// advisory lock（跨进程串行化同一站点探测）+ Redis 预算原子预留保证。
+	if len(dueTasks) > 0 {
+		type taskResult struct {
+			id          int
+			pricing     bool
+			probe       bool // 已处理本次到期（含预算跳过等占位，用于推进 lastRun）
+			probeFailed bool
+			balance     bool
+			probeCost   int64 // 微美元（成功探测的实际成本）
 		}
-
-		// 推理探针（预算控制：全局 + 渠道/分组有效预算，P1-06 原子预留）
-		if globalBudgetLeft > 0 && probeDue(now, last, sch.ProbeInterval, s.cfg.Checker.ProbeFailedBackoff) {
-			s.runProbe(ctx, sch, &globalBudgetLeft, last, now)
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 4)
+		results := make(chan taskResult, len(dueTasks))
+		for _, t := range dueTasks {
+			wg.Add(1)
+			go func(t channelTasks) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				r := taskResult{id: t.sch.ID}
+				if t.pricing {
+					if err := s.pricing.SyncChannel(ctx, t.sch.Upstream, pendingEpoch); err != nil {
+						s.logger.Debug("Pricing sync failed", zap.String("channel", t.sch.Name), zap.Error(err))
+					}
+					r.pricing = true
+				}
+				if t.probe && s.probeBudgetOK() {
+					r.probe, r.probeFailed, r.probeCost = s.runProbe(ctx, t.sch)
+				}
+				if t.balance {
+					if err := s.balance.CheckChannel(ctx, t.sch.Upstream); err != nil {
+						s.logger.Debug("Balance check failed", zap.String("channel", t.sch.Name), zap.Error(err))
+					}
+					r.balance = true
+				}
+				results <- r
+			}(t)
 		}
+		wg.Wait()
+		close(results)
 
-		// 余额检测（轻量 GET，不花钱）
-		if now.Sub(last["balance"]) >= sch.BalanceInterval {
-			if err := s.balance.CheckChannel(ctx, sch.Upstream); err != nil {
-				s.logger.Debug("Balance check failed", zap.String("channel", sch.Name), zap.Error(err))
+		// 汇总：lastRun 只在主 goroutine 更新（goroutine 不碰共享 map）
+		for r := range results {
+			last := s.lastRun[r.id]
+			if r.pricing {
+				last["pricing"] = now
 			}
-			last["balance"] = now
+			if r.probe {
+				last["probe"] = now
+			}
+			if r.probeFailed {
+				last["probe_failed"] = now
+			} else if r.probe {
+				delete(last, "probe_failed")
+			}
+			if r.balance {
+				last["balance"] = now
+			}
+			if r.probeCost > 0 {
+				s.probeBudgetMicro.Add(-r.probeCost)
+			}
 		}
 	}
 
@@ -501,21 +590,26 @@ func (s *scheduler) tick(ctx context.Context) {
 }
 
 // runProbe 执行单渠道推理探针（P1-06：预算原子预留 → 探测 → 按实际成本结算）。
-func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, globalBudgetLeft *float64, last map[string]time.Time, now time.Time) {
+// 并发安全：不修改任何共享可变状态，lastRun/预算通过返回值由调度器主循环汇总。
+// 返回 (markedDone, failed, costMicro)：
+//   - markedDone = 本次到期已处理（成功/失败/预算跳过等所有占位路径），
+//     调度器据此推进 lastRun，避免每 5s tick 重复重试；
+//   - failed = 探测真实失败（写 probe_failed 退避）；
+//   - costMicro = 成功探测的微美元实际成本（预算粗闸门扣减用）。
+func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule) (markedDone, failed bool, costMicro int64) {
 	// DB 汇总粗闸门（渠道有效预算）
 	upstreamSpent, err := s.probe.UpstreamTodaySpent(ctx, sch.ID)
 	if err != nil {
 		s.logger.Error("Failed to read channel probe spending; paid probe skipped",
 			zap.String("channel", sch.Name), zap.Error(err))
-		return
+		return true, false, 0
 	}
 	if upstreamSpent >= sch.EffectiveBudget {
 		s.logger.Debug("Channel probe budget exceeded, skipped",
 			zap.String("channel", sch.Name),
 			zap.Float64("spent", upstreamSpent),
 			zap.Float64("budget", sch.EffectiveBudget))
-		last["probe"] = now
-		return
+		return true, false, 0
 	}
 
 	// H7：Redis 不可用时失败关闭付费探针——DB check-then-act 无原子性，
@@ -523,8 +617,7 @@ func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, g
 	if s.budget == nil || !s.budget.Available() {
 		s.logger.Warn("Budget tracker unavailable, paid probe skipped (fail-closed)",
 			zap.String("channel", sch.Name))
-		last["probe"] = now
-		return
+		return true, false, 0
 	}
 
 	// 估算单次探测成本并做原子预留（模型与 ProbeChannel 的选择一致）
@@ -532,66 +625,63 @@ func (s *scheduler) runProbe(ctx context.Context, sch checker.ChannelSchedule, g
 	estCost, err := s.probe.EstimateProbeCost(ctx, probeModel, 16, 16)
 	if err != nil {
 		s.logger.Warn("Estimate probe cost failed, probe skipped", zap.String("channel", sch.Name), zap.Error(err))
-		last["probe"] = now
-		return
+		return true, false, 0
 	}
 	estimateUnits := checker.ToBudgetUnits(estCost)
 	// C3：DB 当日已消费金额作为 Redis 键缺失时的播种基线
 	globalSpent, gerr := s.probe.TodaySpent(ctx)
 	if gerr != nil {
 		s.logger.Warn("Failed to read global probe spending; probe skipped", zap.Error(gerr))
-		last["probe"] = now
-		return
+		return true, false, 0
 	}
 	globalSpentUnits := checker.ToBudgetUnits(globalSpent)
 	channelSpentUnits := checker.ToBudgetUnits(upstreamSpent)
-	reserved := false
 	ok, day, rerr := s.budget.Reserve(ctx, sch.ID, estimateUnits,
 		checker.ToBudgetUnits(sch.EffectiveBudget),
 		checker.ToBudgetUnits(s.cfg.Checker.DailyProbeBudget),
 		channelSpentUnits, globalSpentUnits)
 	if rerr != nil {
 		s.logger.Warn("Budget reservation failed, probe skipped", zap.String("channel", sch.Name), zap.Error(rerr))
-		last["probe"] = now
-		return
+		return true, false, 0
 	}
 	if !ok {
 		s.logger.Info("Probe budget exhausted (concurrent reservations), skipped",
 			zap.String("channel", sch.Name),
 			zap.Float64("effective_budget", sch.EffectiveBudget))
-		last["probe"] = now
-		return
+		return true, false, 0
 	}
-	reserved = true
 
 	// 执行探测
 	res, err := s.probe.ProbeChannel(ctx, sch.Upstream, s.pendingEpoch)
-	if reserved {
-		// 结算：BudgetSettlement 决定按实际成本结算或保守保留预留
-		// （C5 扩展：聊天已发起即可能已扣费——chat 失败/余额后读取
-		// 失败/成功但成本不可测都保留预留，绝不「已扣费但账目为零」；
-		// 仅 balance_before 失败全额退款）。
-		keep, costUSD := res.BudgetSettlement()
-		actualUnits := checker.ToBudgetUnits(costUSD)
-		if keep {
-			actualUnits = estimateUnits
-		}
-		// H8：结算失败必须告警并保守处置——补扣失败意味着 Redis 少记消费，
-		// 立即失败关闭本 tick 剩余探测（globalBudgetLeft 清零），防预算继续超支。
-		if aerr := s.budget.Adjust(ctx, sch.ID, day, actualUnits-estimateUnits); aerr != nil {
-			s.logger.Error("Budget adjustment failed; paid probes disabled for this tick",
-				zap.Int64("channel_id", int64(sch.ID)), zap.Error(aerr))
-			*globalBudgetLeft = 0
-		}
+	// 结算：BudgetSettlement 决定按实际成本结算或保守保留预留
+	// （C5 扩展：聊天已发起即可能已扣费——chat 失败/余额后读取
+	// 失败/成功但成本不可测都保留预留，绝不「已扣费但账目为零」；
+	// 仅 balance_before 失败全额退款）。
+	keep, costUSD := res.BudgetSettlement()
+	actualUnits := checker.ToBudgetUnits(costUSD)
+	if keep {
+		actualUnits = estimateUnits
+	}
+	// H8：结算失败必须告警并保守处置——补扣失败意味着 Redis 少记消费，
+	// 立即失败关闭本 tick 剩余探测（probeDisabled 并发安全版），防预算继续超支。
+	if aerr := s.budget.Adjust(ctx, sch.ID, day, actualUnits-estimateUnits); aerr != nil {
+		s.logger.Error("Budget adjustment failed; paid probes disabled for this tick",
+			zap.Int64("channel_id", int64(sch.ID)), zap.Error(aerr))
+		s.probeDisabled.Store(true)
 	}
 	if err != nil {
-		last["probe_failed"] = now
 		s.logger.Debug("Probe failed", zap.String("channel", sch.Name), zap.Error(err))
-	} else {
-		delete(last, "probe_failed")
-		if res != nil {
-			*globalBudgetLeft -= res.Cost
-		}
+		return true, true, 0
 	}
-	last["probe"] = now
+	cost := int64(0)
+	if res != nil {
+		cost = checker.ToBudgetUnits(res.Cost)
+	}
+	return true, false, cost
+}
+
+// probeBudgetOK 探针粗闸门：本 tick 未被结算失败禁用且内存预算剩余 > 0。
+// tick 级闸门不占位（不推进 lastRun）——预算恢复后下一 tick 即可重试。
+func (s *scheduler) probeBudgetOK() bool {
+	return !s.probeDisabled.Load() && s.probeBudgetMicro.Load() > 0
 }

@@ -47,3 +47,26 @@ func TestAccountProbeResultDeductsCostEvenWhenProbeReturnsError(t *testing.T) {
 		t.Fatal("probe error must still be reported as a failure")
 	}
 }
+
+// TestProbeBudgetGate A1：并发探针的进程内粗闸门。
+// 结算失败禁用本 tick 剩余探测；内存预算耗尽不再发起新探测。
+func TestProbeBudgetGate(t *testing.T) {
+	var s scheduler
+	s.probeBudgetMicro.Store(1000)
+	if !s.probeBudgetOK() {
+		t.Fatal("positive budget must allow probes")
+	}
+	s.probeBudgetMicro.Store(0)
+	if s.probeBudgetOK() {
+		t.Fatal("zero budget must gate probes")
+	}
+	s.probeBudgetMicro.Store(1000)
+	s.probeDisabled.Store(true)
+	if s.probeBudgetOK() {
+		t.Fatal("disabled tick must gate probes even with budget left")
+	}
+	s.probeDisabled.Store(false)
+	if !s.probeBudgetOK() {
+		t.Fatal("gate must recover after disable flag cleared")
+	}
+}
