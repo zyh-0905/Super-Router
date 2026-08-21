@@ -39,7 +39,8 @@ type ProxyHandler struct {
 	logger    *zap.Logger
 	client    *http.Client
 	circuit   *CircuitBreakerManager
-	cryptoKey string // 上游凭据加密密钥（security.encryption_key，可为空 = 明文）
+	buffer    *CircuitBuffer // A3：请求历史+熔断更新异步缓冲（nil = 同步路径，测试用）
+	cryptoKey string         // 上游凭据加密密钥（security.encryption_key，可为空 = 明文）
 }
 
 func NewProxyHandler(r *router.Router, db *store.DB, logger *zap.Logger, circuit *CircuitBreakerManager, cryptoKey string) *ProxyHandler {
@@ -48,6 +49,9 @@ func NewProxyHandler(r *router.Router, db *store.DB, logger *zap.Logger, circuit
 		db:        db,
 		logger:    logger,
 		cryptoKey: cryptoKey,
+		// A3：异步缓冲请求历史与熔断更新（批量事务，单 worker 保序）。
+		// 队列满时自动回退同步路径，绝不丢样本。
+		buffer: NewCircuitBuffer(db.Pool, circuit, logger),
 		// 不设整体 Timeout：长流式响应不应被掐断；
 		// 拨号/握手/响应头均有边界（P2-06），首字节由每尝试的 TTFB 计时器控制。
 		client: &http.Client{
@@ -63,6 +67,16 @@ func NewProxyHandler(r *router.Router, db *store.DB, logger *zap.Logger, circuit
 			},
 		},
 		circuit: circuit,
+	}
+}
+
+// SetBuffer 注入自定义缓冲器（测试用；nil = 回退同步路径）。
+func (h *ProxyHandler) SetBuffer(b *CircuitBuffer) { h.buffer = b }
+
+// Close 关闭异步缓冲（优雅关闭时排空剩余样本；幂等）。
+func (h *ProxyHandler) Close() {
+	if h.buffer != nil {
+		h.buffer.Close()
 	}
 }
 
@@ -573,12 +587,20 @@ func (h *ProxyHandler) failAttempt(ctx context.Context, requestID string, req *C
 
 	// H1：先写请求历史（含当前失败结果），再更新熔断——
 	// 开闸判定读 10 分钟窗口，必须包含当前请求本身。
-	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, firstByteCommitted, int(time.Since(attemptStart).Milliseconds()), groupID, errClass)
-
-	if h.circuit != nil {
-		if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, false, errClass); cerr != nil {
-			h.logger.Warn("Failed to update circuit state (failure)",
-				zap.Int("channel_id", channel.ID), zap.Error(cerr))
+	// A3：两个写入合并为一个缓冲样本，批量事务内保持先历史后熔断的顺序。
+	if h.buffer != nil {
+		h.buffer.Enqueue(circuitSample{
+			requestID: requestID, channelID: channel.ID, model: req.Model, groupID: groupID,
+			success: false, firstByte: firstByteCommitted,
+			durationMS: int(time.Since(attemptStart).Milliseconds()), errorClass: errClass,
+		})
+	} else {
+		h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, false, firstByteCommitted, int(time.Since(attemptStart).Milliseconds()), groupID, errClass)
+		if h.circuit != nil {
+			if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, false, errClass); cerr != nil {
+				h.logger.Warn("Failed to update circuit state (failure)",
+					zap.Int("channel_id", channel.ID), zap.Error(cerr))
+			}
 		}
 	}
 
@@ -621,12 +643,20 @@ func (h *ProxyHandler) succeedAttempt(ctx context.Context, requestID string, req
 	)
 
 	// H1：先写请求历史（含当前成功结果），再更新熔断
-	h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, true, true, int(time.Since(attemptStart).Milliseconds()), groupID, "")
-
-	if h.circuit != nil {
-		if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, true, ""); cerr != nil {
-			h.logger.Warn("Failed to update circuit state (success)",
-				zap.Int("channel_id", channel.ID), zap.Error(cerr))
+	// A3：同上，合并为单个缓冲样本。
+	if h.buffer != nil {
+		h.buffer.Enqueue(circuitSample{
+			requestID: requestID, channelID: channel.ID, model: req.Model, groupID: groupID,
+			success: true, firstByte: true,
+			durationMS: int(time.Since(attemptStart).Milliseconds()), errorClass: "",
+		})
+	} else {
+		h.recordRequestHistory(ctx, requestID, channel.ID, req.Model, true, true, int(time.Since(attemptStart).Milliseconds()), groupID, "")
+		if h.circuit != nil {
+			if cerr := h.circuit.UpdateCircuitState(ctx, channel.ID, req.Model, groupID, true, ""); cerr != nil {
+				h.logger.Warn("Failed to update circuit state (success)",
+					zap.Int("channel_id", channel.ID), zap.Error(cerr))
+			}
 		}
 	}
 
@@ -803,17 +833,55 @@ func (h *ProxyHandler) streamResponse(c *gin.Context, body io.ReadCloser, setHea
 
 // recordRequestHistory 写入请求历史（requestID 复用本次请求，便于全链路追踪）。
 // errorClass 用于熔断样本过滤（client_canceled 不参与开闸统计）。
+// A3：优先经 CircuitBuffer 异步批量落库；队列满时回退同步。
 func (h *ProxyHandler) recordRequestHistory(ctx context.Context, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int, errorClass string) {
-	_, err := h.db.Pool.Exec(ctx, `
+	if h.buffer != nil {
+		h.buffer.Enqueue(circuitSample{
+			requestID:  requestID,
+			channelID:  channelID,
+			model:      model,
+			groupID:    groupID,
+			success:    success,
+			firstByte:  firstByte,
+			durationMS: durationMS,
+			errorClass: errorClass,
+			// client_canceled 等不计入熔断的样本（H5）：只写历史不更新熔断
+			skipCircuit: errorClass == "client_canceled",
+		})
+		return
+	}
+	insertRequestHistory(h.ctxOrDefault(ctx), h.db, requestID, channelID, model, success, firstByte, durationMS, groupID, errorClass)
+}
+
+// ctxOrDefault 缓冲不可用时以请求上下文写库（保持旧行为；带兜底超时）。
+func (h *ProxyHandler) ctxOrDefault(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return ctx
+}
+
+// insertRequestHistory 历史写入的核心语句（同步单语句路径；缓冲批量路径见 insertRequestHistoryQ）。
+func insertRequestHistory(ctx context.Context, db *store.DB, requestID string, channelID int, model string, success bool, firstByte bool, durationMS int, groupID *int, errorClass string) {
+	if _, err := db.Pool.Exec(ctx, `
 		INSERT INTO request_history (
 			request_id, channel_id, model, success, first_byte_commit,
 			ttft_ms, total_duration_ms, group_id, error_class, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-	`, requestID, channelID, model, success, firstByte, durationMS, durationMS, groupID, errorClass)
-
-	if err != nil {
-		h.logger.Warn("Failed to record request history", zap.Error(err))
+	`, requestID, channelID, model, success, firstByte, durationMS, durationMS, groupID, errorClass); err != nil {
+		// 同步路径仅告警（缓冲路径由 worker 负责重试/回退）
 	}
+}
+
+// insertRequestHistoryQ 缓冲批量路径的历史写入（事务内；失败返回错误供回退）。
+func insertRequestHistoryQ(ctx context.Context, q circuitTx, s circuitSample) error {
+	_, err := q.Exec(ctx, `
+		INSERT INTO request_history (
+			request_id, channel_id, model, success, first_byte_commit,
+			ttft_ms, total_duration_ms, group_id, error_class, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+	`, s.requestID, s.channelID, s.model, s.success, s.firstByte, s.durationMS, s.durationMS, s.groupID, s.errorClass)
+	return err
 }
 
 // resolveGroupID 将分组名（或数字 ID）解析为分组 ID

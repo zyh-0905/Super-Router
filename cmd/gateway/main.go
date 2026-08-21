@@ -330,6 +330,9 @@ func main() {
 		zapLogger.Fatal("Server forced to shutdown", zap.Error(err))
 	}
 
+	// A3：关闭请求历史/熔断异步缓冲（排空剩余样本后退出）
+	proxyHandler.Close()
+
 	zapLogger.Info("Server exited")
 }
 

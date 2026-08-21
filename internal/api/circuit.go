@@ -8,6 +8,7 @@ import (
 	"smart-router/internal/store"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 )
 
@@ -37,12 +38,40 @@ func NewCircuitBreakerManager(db *store.DB, logger *zap.Logger, config CircuitBr
 	}
 }
 
+// circuitTx 熔断更新所需的事务接口（pgx.Tx 满足；测试用 fake）。
+type circuitTx interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
+}
+
+// circuitBeginner 事务开启接口（pgxpool.Pool 满足；测试用 fake）。
+type circuitBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
 // UpdateCircuitState 更新熔断状态（每次请求完成后调用）。
 // 使用事务 + SELECT ... FOR UPDATE 原子化「读-计数-状态转换-写」，
 // 避免并发请求丢失计数（退避档位/恢复阈值失真）。
 // P1-04：状态按分组桶隔离——groupID 非空时写入该分组专属桶，
 // nil 时写入全局桶（group_id = 0）。groupID 同时决定分组级熔断参数覆盖。
 func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelID int, model string, groupID *int, success bool, errorClass string) error {
+	tx, err := m.db.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := m.updateCircuitStateTx(ctx, tx, channelID, model, groupID, success, errorClass); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// updateCircuitStateTx 熔断状态更新的事务内核心（供同步路径与异步缓冲批量事务共用）。
+// 必须在同一事务内先完成 request_history 写入（H1：开闸判定窗口包含当前请求）
+// 再调用本函数。
+func (m *CircuitBreakerManager) updateCircuitStateTx(ctx context.Context, tx circuitTx, channelID int, model string, groupID *int, success bool, errorClass string) error {
 	// 生效配置：分组覆盖 > 全局（只读，事务外计算）
 	cfg := m.effectiveConfig(ctx, groupID)
 
@@ -51,12 +80,6 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 	if groupID != nil {
 		bucket = *groupID
 	}
-
-	tx, err := m.db.Pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
 
 	// H2：目标行不存在时 FOR UPDATE 无法锁住「虚空行」，两个并发事务
 	// 都会读到 ErrNoRows 各自从 0 起算，后写者覆盖先写者 → 丢计数。
@@ -75,7 +98,7 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 	var failureCount, successCount, coolingLevel int
 	var coolingUntil time.Time
 
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT state, failure_count, success_count, cooling_level,
 		       COALESCE(cooling_until, '1970-01-01'::timestamp)
 		FROM circuit_states
@@ -98,12 +121,12 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 	}
 
 	// H1：开闸判定必须包含当前请求结果，且成功请求绝不能触发开闸。
-	// 调用方（proxy）保证顺序：先写 request_history（含当前结果），
+	// 调用方保证顺序：先写 request_history（含当前结果），
 	// 再调用本函数——shouldOpen 的 10 分钟窗口自然包含当前请求。
 	// 这里再显式守卫 success：成功结果不参与开闸判定。
 	var shouldOpen bool
 	if !success && (currentState == "closed" || currentState == "degraded") {
-		shouldOpen = m.shouldOpen(ctx, channelID, model, bucket, cfg)
+		shouldOpen = m.shouldOpen(ctx, tx, channelID, model, bucket, cfg)
 	}
 
 	newState, newCoolingUntil, newCoolingLevel := transitionCircuitState(currentState, coolingUntil, coolingLevel, success, failureCount, successCount, shouldOpen, cfg)
@@ -130,13 +153,8 @@ func (m *CircuitBreakerManager) UpdateCircuitState(ctx context.Context, channelI
 		ON CONFLICT (channel_id, model, capability, group_id)
 		DO UPDATE SET state = $4, opened_at = $5, cooling_until = $6, failure_count = $7, success_count = $8, cooling_level = $9, updated_at = NOW()
 	`, channelID, model, bucket, newState, openedAt, newCoolingUntil, failureCount, successCount, newCoolingLevel)
-	if err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
+	return err
 }
-
 
 // transitionCircuitState 计算熔断状态转换（纯函数，便于测试）。
 // coolingUntil 为当前记录的冷却截止时间：open 且已到期 → 按 half_open 处理，
@@ -221,9 +239,11 @@ func nextCoolingDuration(failureCount int, cfg CircuitBreakerConfig) time.Durati
 // 否则只统计该分组的流量，实现组间熔断隔离。
 // H5：客户端主动断开（error_class=client_canceled）不计入样本，
 // 用户停止生成不应污染上游失败率。
-func (m *CircuitBreakerManager) shouldOpen(ctx context.Context, channelID int, model string, bucket int, cfg CircuitBreakerConfig) bool {
+// q 为查询执行器（同步路径传连接池，异步批量路径传事务）：
+// 事务内查询能看到同事务先写入的 request_history 行（H1）。
+func (m *CircuitBreakerManager) shouldOpen(ctx context.Context, q circuitTx, channelID int, model string, bucket int, cfg CircuitBreakerConfig) bool {
 	var totalAttempts, failedAttempts int
-	err := m.db.Pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT
 			COUNT(*) AS total,
 			COALESCE(SUM(CASE WHEN NOT success THEN 1 ELSE 0 END), 0) AS failed
