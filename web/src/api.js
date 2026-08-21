@@ -8,6 +8,20 @@ function base() {
   return store.baseURL || '' // 空 = 同源（开发经 Vite 代理 / 生产由 Gateway 托管）
 }
 
+// F1：认证失效（401/403）统一处理。
+// Key 失效后所有请求都会失败：清空 Key、标记认证失效状态、
+// 提示用户去设置页重填。幂等：重复 401 只提示一次（防轮询刷屏）。
+let authFailureNotified = false
+export function handleAuthFailure() {
+  if (authFailureNotified) return
+  authFailureNotified = true
+  store.apiKey = ''
+  store.authExpired = true
+  toast('API Key 已失效或无权访问，请在设置页重新填写', 'error', 6000)
+}
+
+// 重新填入有效 Key 后由 saveConnection 复位（见 store.js）。
+
 export function authHeaders(extra = {}) {
   return { Authorization: `Bearer ${store.apiKey}`, ...extra }
 }
@@ -36,6 +50,11 @@ async function request(path, { method = 'GET', body, headers = {}, timeout = 150
       const err = new Error(msg)
       err.status = resp.status
       err.data = data
+      // F1：认证失效处理——Key 被撤销/停用后，必须给出可操作的反馈，
+      // 而不是让所有页面静默失败、轮询空转。
+      if (resp.status === 401 || resp.status === 403) {
+        handleAuthFailure()
+      }
       throw err
     }
     store.connected = true
@@ -198,6 +217,8 @@ export const api = {
       const { parseSSEChunk } = await import('./quality')
 
       let buf = ''
+      let gotTerminal = false
+      const TERMINAL_EVENTS = ['task_completed', 'task_failed', 'task_cancelled']
       try {
         while (true) {
           const { done, value } = await reader.read()
@@ -206,6 +227,7 @@ export const api = {
           const parsed = parseSSEChunk('', buf)
           buf = parsed.buffer
           for (const ev of parsed.events) {
+            if (ev && TERMINAL_EVENTS.includes(ev.event)) gotTerminal = true
             if (onEvent) onEvent(ev)
           }
         }
@@ -213,9 +235,13 @@ export const api = {
         if (buf.trim()) {
           const parsed = parseSSEChunk('', buf + '\n\n')
           for (const ev of parsed.events) {
+            if (ev && TERMINAL_EVENTS.includes(ev.event)) gotTerminal = true
             if (onEvent) onEvent(ev)
           }
         }
+        // F3：服务端正常关闭（非异常）但未收到终态事件时，
+        // 同样触发 onDisconnect 退化轮询——否则面板永久停在「运行中」。
+        if (!gotTerminal && !ctrl.signal.aborted && onDisconnect) onDisconnect()
       } catch (e) {
         if (!ctrl.signal.aborted && onDisconnect) onDisconnect()
       } finally {

@@ -68,6 +68,9 @@ export function downloadJSON(filename, obj) {
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = filename
+  document.body.appendChild(a)
   a.click()
-  URL.revokeObjectURL(a.href)
+  a.remove()
+  // 部分浏览器同步 revoke 会使下载竞态失败：延迟释放
+  setTimeout(() => URL.revokeObjectURL(a.href), 0)
 }

@@ -29,17 +29,22 @@ function goHandle(p) {
   router.push(targetRoute(p.id))
 }
 
-// 每条弹窗的自动消失计时器（按 popupId 管理，防止重复/泄漏）
+// 每条弹窗的自动消失计时器（按 popupId 管理，防止重复/泄漏）。
+// F5：watch 标量字符串而非数组型 computed——map 每次求值返回新引用，
+// 会导致每 30s 告警轮询都全量重跑回调；join 成字符串是原始值比较，
+// 队列内容不变时绝不触发，清理分支用 Set 去 O(n²)。
 const timers = new Map()
 const popupIds = computed(() => store.alertPopups.map(p => p.popupId))
-watch(popupIds, (ids) => {
+watch(() => popupIds.value.join(','), () => {
+  const ids = popupIds.value
   for (const p of store.alertPopups) {
     if (!timers.has(p.popupId)) {
       timers.set(p.popupId, setTimeout(() => dismissAlertPopup(p.popupId), ttlMs(p.sev)))
     }
   }
+  const alive = new Set(ids)
   for (const [id, t] of timers) {
-    if (!ids.includes(id)) {
+    if (!alive.has(id)) {
       clearTimeout(t)
       timers.delete(id)
     }

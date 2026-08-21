@@ -174,7 +174,7 @@ function emptyForm() {
     balance_api_token: '',
     balance_login_email: '',
     balance_login_password: '',
-    model_pairs: [{ from: 'gpt-4o', to: 'gpt-4o' }],
+    model_pairs: [newPair('gpt-4o', 'gpt-4o')],
     capabilities: ['tools'],
     group_ids: [],
   }
@@ -217,16 +217,18 @@ function onBaseUrlChange() {
   applyAutoBalanceURL()
 }
 
-const filtered = computed(() =>
-  channels.value.filter(c => {
-    if (search.value && !c.name.toLowerCase().includes(search.value.toLowerCase())) return false
+const filtered = computed(() => {
+  // F6：搜索词小写在循环外计算一次，避免对每行重复 toLowerCase
+  const q = search.value ? search.value.toLowerCase() : ''
+  return channels.value.filter(c => {
+    if (q && !c.name.toLowerCase().includes(q)) return false
     if (groupFilter.value != null && !(c.groups || []).some(g => g.id === groupFilter.value)) return false
     if (filter.value === 'open' && c.circuit_state !== 'open') return false
     if (filter.value === 'closed' && c.circuit_state && c.circuit_state !== 'closed') return false
     if (filter.value === 'disabled' && c.enabled) return false
     return true
   })
-)
+})
 
 const circuitOf = id => circuitStates.value.filter(s => s.channel_id === id)
 
@@ -587,18 +589,22 @@ function openEdit(ch) {
     balance_api_token: '',
     balance_login_email: ch.balance_login_email || '',
     balance_login_password: '',
-    model_pairs: Object.entries(ch.model_mapping || {}).map(([k, v]) => ({ from: k, to: v })),
+    model_pairs: Object.entries(ch.model_mapping || {}).map(([k, v]) => newPair(k, v)),
     capabilities: ch.capabilities || [],
     group_ids: (ch.groups || []).map(g => g.id),
   }
-  if (!form.value.model_pairs.length) form.value.model_pairs.push({ from: '', to: '' })
+  if (!form.value.model_pairs.length) form.value.model_pairs.push(newPair())
   // 记录打开时余额接口对应的 base_url，用于判断后续 base_url 修改时是否跟随重新补全
   autoBalanceBase = (ch.base_url || '').trim().replace(/\/+$/, '')
   testResult.value = null
   showModal.value = true
 }
 
-function addPair() { form.value.model_pairs.push({ from: '', to: '' }) }
+// 每个 pair 带稳定 uid 作 v-for key：删除中间行时按 index 复用 DOM
+// 会让后续输入框状态错位（Vue 按 index 复用）
+let pairSeq = 0
+function newPair(from = '', to = '') { return { _uid: ++pairSeq, from, to } }
+function addPair() { form.value.model_pairs.push(newPair()) }
 function removePair(i) { form.value.model_pairs.splice(i, 1) }
 const caps = ['tools', 'vision', 'audio', 'json_mode', 'function_calling']
 function toggleCap(cap) {
@@ -1313,7 +1319,7 @@ onMounted(() => { load(); loadGroups() })
             <Icon name="download" :size="12" />从上游获取
           </button>
         </div>
-        <div v-for="(pair, i) in form.model_pairs" :key="i" class="row gap-2 mb-2 mt-2">
+        <div v-for="(pair, i) in form.model_pairs" :key="pair._uid ?? i" class="row gap-2 mb-2 mt-2">
           <input v-model="pair.from" class="input mono" placeholder="如 gpt-4o">
           <Icon name="arrow_right" :size="14" style="color:var(--text-3);flex-shrink:0" />
           <input v-model="pair.to" class="input mono" placeholder="上游模型名">

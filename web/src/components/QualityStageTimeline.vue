@@ -10,6 +10,9 @@
 // hover 任意非等待阶段显示详情气泡（状态/错误/指标），不再需要下方的进度条与描述行。
 import { computed } from 'vue'
 import Icon from './Icon.vue'
+// F2：details 展示前必须过凭据字段过滤（纵深防御——
+// 后端 allowlist 之外，前端再拦一道，防止凭据形状字段进入气泡）。
+import { sanitizeQualityDetails } from '../quality'
 
 const props = defineProps({
   stages: { type: Object, default: () => ({}) }, // stage -> {status, error, ...}
@@ -95,7 +98,7 @@ function metricRows(name) {
   if (s.latency_ms != null) rows.push(`耗时 ${s.latency_ms}ms`)
   if (s.actual_model) rows.push(`上游模型 ${s.actual_model}`)
   if (s.prompt_tokens != null) rows.push(`tokens ${s.prompt_tokens}+${s.completion_tokens}`)
-  const d = s.details || {}
+  const d = sanitizeQualityDetails(s.details) || {}
   for (const [k, v] of Object.entries(d)) {
     if (typeof v === 'object' || k === 'http_status') continue
     rows.push(`${DETAIL_LABELS[k] || k}: ${v}`)

@@ -22,6 +22,9 @@ export const store = reactive({
   connected: false,
   lastPingAt: null,
 
+  // 认证失效标记（401/403 后置位；保存新 Key 后复位）
+  authExpired: false,
+
   // 全局告警（供侧边栏徽标使用）
   alerts: [],
 
@@ -73,6 +76,7 @@ export function cycleTheme() {
 export function saveConnection() {
   storage.setItem('sr_apikey', store.apiKey)
   storage.setItem('sr_baseurl', store.baseURL)
+  if (store.apiKey) store.authExpired = false
 }
 
 let toastId = 0

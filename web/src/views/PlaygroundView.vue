@@ -173,9 +173,11 @@ async function send() {
 function copyCurl() {
   const msgs = req.value.messages.filter(m => m.content.trim() !== '')
   const body = JSON.stringify({ model: req.value.model, messages: msgs, stream: req.value.stream })
-  const curl = `curl -X POST ${store.baseURL || location.origin}/v1/chat/completions \\\n  -H "Authorization: Bearer ${store.apiKey}" \\\n  -H "Content-Type: application/json" \\\n  -d '${body}'`
+  // F4：默认不复制明文 Key——用 $SR_API_KEY 占位符，避免完整凭据
+  // 进入系统剪贴板后被粘贴进聊天/工单/公开 issue。
+  const curl = `curl -X POST ${store.baseURL || location.origin}/v1/chat/completions \\\n  -H "Authorization: Bearer $SR_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '${body}'`
   navigator.clipboard.writeText(curl)
-  toast('cURL 已复制', 'success')
+  toast('cURL 已复制（Key 以 $SR_API_KEY 占位，避免凭据外泄）', 'success', 4500)
 }
 
 function openDecision() {

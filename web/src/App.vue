@@ -33,8 +33,9 @@ let alertTimer = null
 // 告警轮询：30s 拉取 /admin/stats 的告警集合，交由 feedAlerts 做
 // 「新出现 / 严重度升级」diff 并弹窗。首次调用仅建立基线、不弹窗；
 // 静默失败（未配置 Key 或网络抖动不打扰用户，连接问题由离线横幅提示）。
+// F1 补充：认证失效时不再静默空转——显示显式状态横幅。
 async function pollAlerts() {
-  if (!store.apiKey) return
+  if (!store.apiKey || store.authExpired) return
   try {
     const g = store.currentGroup
     const s = await api.get('/admin/stats' + (g ? `?group_id=${g}` : ''), { silent: true })
@@ -71,6 +72,16 @@ onUnmounted(() => {
           <div class="spacer" />
           <router-link to="/settings" class="btn btn-ghost btn-sm">连接设置</router-link>
           <button class="btn btn-primary btn-sm" @click="api.ping()">重试</button>
+        </div>
+      </Transition>
+
+      <!-- 认证失效横幅（F1）：Key 被撤销/停用后显式提示，告警监控已停摆 -->
+      <Transition name="banner">
+        <div v-if="store.authExpired" class="offline-bar" role="alert">
+          <Icon name="alert" :size="15" aria-hidden="true" />
+          <span>API Key 已失效或无权访问——告警监控与数据刷新已暂停，请重新填写有效凭据。</span>
+          <div class="spacer" />
+          <router-link to="/settings" class="btn btn-primary btn-sm">前往设置</router-link>
         </div>
       </Transition>
 
