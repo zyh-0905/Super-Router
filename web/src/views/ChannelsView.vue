@@ -10,6 +10,7 @@ import BaseChart from '../components/BaseChart.vue'
 import Icon from '../components/Icon.vue'
 import SelectBox from '../components/SelectBox.vue'
 import QualityCheckPanel from '../components/QualityCheckPanel.vue'
+import RelayStationsPanel from '../components/RelayStationsPanel.vue'
 
 // ---- 下拉选项（统一 SelectBox 组件）----
 const filterOpts = [
@@ -822,6 +823,14 @@ async function doRemoveChannel() {
 }
 
 onMounted(() => { load(); loadGroups() })
+
+// ===== 视图切换：平铺（默认）/ 中转站（按 base_url 归并） =====
+const view = ref('flat') // 'flat' | 'stations'
+
+function openChannelFromStation(channelID) {
+  const ch = channels.value.find(c => c.id === channelID)
+  if (ch) select(ch)
+}
 </script>
 
 <template>
@@ -844,9 +853,17 @@ onMounted(() => { load(); loadGroups() })
       <button v-for="g in groups" :key="g.id" class="seg" :class="{ on: groupFilter === g.id }" @click="groupFilter = g.id">
         {{ g.name }}<span class="seg-count">{{ g.channel_count }}</span>
       </button>
+      <!-- 视图切换：平铺 / 中转站归并 -->
+      <div class="seg-group" style="margin-left:auto">
+        <button class="seg" :class="{ on: view === 'flat' }" @click="view = 'flat'">平铺</button>
+        <button class="seg" :class="{ on: view === 'stations' }" @click="view = 'stations'">中转站</button>
+      </div>
     </div>
 
-    <div class="ch-layout">
+    <!-- 中转站归并视图 -->
+    <RelayStationsPanel v-if="view === 'stations'" @open-channel="openChannelFromStation" />
+
+    <div v-else class="ch-layout">
       <!-- 左侧列表 -->
       <div class="ch-list">
         <div class="row gap-2 mb-2">

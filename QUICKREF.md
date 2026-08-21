@@ -74,6 +74,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | 请求指定分组 | body `"group":"组名"` 或 `X-Group` 头（支持名称/ID） |
 | Key 绑定分组 | Web「设置 → API Keys → 分组」；未指定组时自动限定绑定组并集 |
 | 按组筛选 | `/admin/stats?group_id=` · `/admin/decisions?group_id=` · `/admin/circuit?group_id=` · `/admin/alerts?group_id=` |
+| 中转站视图 | 站点页「平铺 / 中转站」切换；相同 base_url 自动归并，卡片显示账户余额（同账户成员余额一致，取最近检测），展开看成员站点；命名可自定义（编辑按钮，留空 = 恢复自动命名） |
 
 策略查找链：Token×模型 → Token → **分组默认** → 系统默认
 

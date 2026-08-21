@@ -140,6 +140,10 @@ export const api = {
   updateGroup: (id, p) => api.patch(`/admin/groups/${id}`, p),
   deleteGroup: (id) => api.del(`/admin/groups/${id}`),
 
+  // ===== 中转站归并 =====
+  relayStations: () => api.get('/admin/relay-stations'),
+  renameRelayStation: (id, display_name) => api.patch(`/admin/relay-stations/${id}`, { display_name }),
+
   // ===== 统计 / 决策 / 熔断（支持分组筛选） =====
   stats: (groupId) => api.get('/admin/stats' + (groupId ? `?group_id=${groupId}` : '')),
   alerts: (groupId) => api.get('/admin/alerts' + (groupId ? `?group_id=${groupId}` : '')),
