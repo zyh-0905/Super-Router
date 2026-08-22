@@ -42,6 +42,7 @@ const icons = {
   bell: '<path d="M18 9a6 6 0 1 0-12 0c0 6-2.5 7-2.5 7h17S18 15 18 9z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
   send: '<path d="M21 3 3 10.5l7.5 3M21 3 13.5 21l-3-7.5M21 3 10.5 13.5"/>',
   target: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1"/>',
+  shield: '<path d="M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6l-7-3z"/><path d="M9 12l2 2 4-4"/>',
 }
 </script>
 

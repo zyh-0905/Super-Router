@@ -158,6 +158,7 @@ const STAGE_LABELS = {
   stream: '流式响应',
   usage: 'Usage/计费',
   behavior: '模型行为',
+  authenticity: '模型鉴定',
 }
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'expired'])

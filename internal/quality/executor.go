@@ -308,6 +308,7 @@ func (e *Executor) stageRegistry() map[string]Stage {
 		StageStream:       streamStage{executor: e},
 		StageUsage:        usageStage{executor: e},
 		StageBehavior:     behaviorStage{executor: e},
+		StageAuthenticity: authenticityStage{executor: e},
 	}
 }
 

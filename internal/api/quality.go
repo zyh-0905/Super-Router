@@ -312,19 +312,24 @@ func (h *QualityHandler) publicRunSummary(run *quality.Run, results []quality.St
 // 任何未列出的键整体丢弃：上游响应可能回显请求形状（含 Authorization 头等），
 // 必须主动过滤而不是逐字段黑名单。
 var detailAllowlist = map[string]bool{
-	"http_status":       true,
-	"model_count":       true,
-	"code":              true,
-	"reason":            true,
-	"responded":         true,
-	"usage_present":     true,
-	"events_received":   true,
-	"done_received":     true,
-	"text_length":       true,
-	"expected_total":    true,
-	"requested_model":   true,
-	"mapped_model":      true,
-	"evidence":          true,
+	"http_status":        true,
+	"model_count":        true,
+	"code":               true,
+	"reason":             true,
+	"responded":          true,
+	"usage_present":      true,
+	"events_received":    true,
+	"done_received":      true,
+	"text_length":        true,
+	"expected_total":     true,
+	"requested_model":    true,
+	"mapped_model":       true,
+	"evidence":           true,
+	"arithmetic_correct": true,
+	"arithmetic_answer":  true,
+	"recency_correct":    true,
+	"recency_unknown":    true,
+	"recency_answer":     true,
 }
 
 // filterDetails 递归过滤 details（白名单；值仅保留标量/布尔与 evidence 对象）。

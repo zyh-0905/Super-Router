@@ -22,13 +22,14 @@ const props = defineProps({
   reducedMotion: { type: Boolean, default: false },
 })
 
-const ALL_STAGES = ['connectivity', 'protocol', 'stream', 'usage', 'behavior']
+const ALL_STAGES = ['connectivity', 'protocol', 'stream', 'usage', 'behavior', 'authenticity']
 const LABELS = {
   connectivity: '连接性',
   protocol: '协议一致性',
   stream: '流式响应',
   usage: 'Usage/计费',
   behavior: '模型行为',
+  authenticity: '模型鉴定',
 }
 const STATUS_LABELS = {
   waiting: '待检测',
@@ -153,7 +154,8 @@ function metricRows(name) {
   display: flex;
   flex-direction: column;
   align-items: center;
-  width: 20%;
+  flex: 1 1 0;
+  min-width: 0;
   text-align: center;
 }
 .q-stage:hover { z-index: 6; }

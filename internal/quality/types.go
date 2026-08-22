@@ -60,20 +60,22 @@ const (
 	OverallUnknown   OverallStatus = "unknown"
 )
 
-// 阶段常量（执行顺序：basic = 前三阶段，full = 全部五阶段）。
+// 阶段常量（执行顺序：basic = 前三阶段，full = 全部五阶段，
+// authenticity = 连接性 + 模型鉴定）。
 const (
-	StageConnectivity = "connectivity"
-	StageProtocol     = "protocol"
-	StageStream       = "stream"
-	StageUsage        = "usage"
-	StageBehavior     = "behavior"
+	StageConnectivity  = "connectivity"
+	StageProtocol      = "protocol"
+	StageStream        = "stream"
+	StageUsage         = "usage"
+	StageBehavior      = "behavior"
+	StageAuthenticity  = "authenticity"
 )
 
 // BasicStages basic 深度执行的阶段。
 var BasicStages = []string{StageConnectivity, StageProtocol, StageStream}
 
-// FullStages full 深度执行的阶段。
-var FullStages = []string{StageConnectivity, StageProtocol, StageStream, StageUsage, StageBehavior}
+// FullStages full 深度执行的阶段（含模型鉴定）。
+var FullStages = []string{StageConnectivity, StageProtocol, StageStream, StageUsage, StageBehavior, StageAuthenticity}
 
 // 关键阶段（任一 failed → 总体 failed）。
 var criticalStages = map[string]bool{
