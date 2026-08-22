@@ -290,11 +290,7 @@ async function saveTelegram() {
     const payload = {
       enabled: tgConfig.value.enabled,
       report_enabled: tgConfig.value.report_enabled,
-      report_interval_minutes: tgConfig.value.report_interval_minutes,
-      report_minute: tgConfig.value.report_minute,
       timezone: tgConfig.value.timezone,
-      include_recovered: tgConfig.value.include_recovered,
-      include_ongoing: tgConfig.value.include_ongoing,
       web_base_url: (tgConfig.value.web_base_url || '').trim(),
     }
     const tokenPayload = telegramTokenUpdatePayload(tgTokenDraft.value)
@@ -603,7 +599,7 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
             {{ tgConfig.enabled ? '已启用' : '未启用' }}
           </span>
         </div>
-        <p class="set-desc">将告警汇总推送到 Telegram。默认关闭；启用后 checker 进程按小时整点发送汇总并响应查询命令。</p>
+        <p class="set-desc">将告警变化推送到 Telegram。默认关闭；启用后仅在出现新告警、严重度升级或告警恢复时主动推送，其余时间保持沉默，并随时响应查询命令。</p>
         <div v-if="!tgConfig" class="skeleton" style="height:120px" />
         <template v-else>
           <div class="form-grid-2">
@@ -625,28 +621,13 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
               <input v-model="tgConfig.timezone" class="input" placeholder="Asia/Shanghai">
             </div>
             <div class="field">
-              <label class="field-label">汇总频率（分钟）</label>
-              <input v-model.number="tgConfig.report_interval_minutes" type="number" min="1" max="60" class="input" style="width:120px">
-            </div>
-            <div class="field">
-              <label class="field-label">发送分钟（0-59）</label>
-              <input v-model.number="tgConfig.report_minute" type="number" min="0" max="59" class="input" style="width:120px">
-              <div class="field-hint">默认 0 = 每小时整点。</div>
-            </div>
-            <div class="field">
               <label class="field-label">控制台链接（可选）</label>
               <input v-model="tgConfig.web_base_url" class="input" placeholder="https://router.example.com">
             </div>
           </div>
           <div class="row gap-3" style="flex-wrap:wrap;align-items:center">
             <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
-              <input type="checkbox" v-model="tgConfig.include_recovered" class="switch"> 包含已恢复告警
-            </label>
-            <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
-              <input type="checkbox" v-model="tgConfig.include_ongoing" class="switch"> 包含持续中告警
-            </label>
-            <label class="row gap-2" style="align-items:center;font-size:12.5px;color:var(--text-2)">
-              <input type="checkbox" v-model="tgConfig.report_enabled" class="switch"> 每小时整点汇总
+              <input type="checkbox" v-model="tgConfig.report_enabled" class="switch"> 告警变化时主动推送
             </label>
           </div>
           <div class="row gap-2 mt-2">
@@ -657,7 +638,7 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
               <Icon name="plug" :size="13" />{{ tgTesting ? '保存中…' : '保存并验证' }}
             </button>
             <span v-if="tgConfig.last_poll_at" class="text-3" style="font-size:12px">最近轮询 {{ fmtDate(tgConfig.last_poll_at) }}</span>
-            <span v-if="tgConfig.last_report_at" class="text-3" style="font-size:12px">最近汇总 {{ fmtDate(tgConfig.last_report_at) }}</span>
+            <span v-if="tgConfig.last_report_at" class="text-3" style="font-size:12px">最近推送 {{ fmtDate(tgConfig.last_report_at) }}</span>
             <span v-if="tgConfig.last_error" class="text-red" style="font-size:12px" :title="tgConfig.last_error">⚠ 最近错误：{{ tgConfig.last_error.slice(0, 60) }}</span>
           </div>
         </template>
@@ -672,7 +653,7 @@ onMounted(() => { loadKeys(); loadConfig(); loadGroups(); loadChannels(); loadSe
         </div>
         <p class="set-desc">只有录入的 Chat ID 可以接收告警汇总并执行查询命令。不开放 /start 自助绑定，请在后台手动维护。</p>
         <div v-if="tgSubsLoading" class="skeleton" style="height:80px" />
-        <EmptyState v-else-if="!tgSubscribers.length" icon="bell" title="暂无订阅者" desc="添加 Chat ID 后，每小时告警汇总将推送给对应账号" style="padding:26px 0" />
+        <EmptyState v-else-if="!tgSubscribers.length" icon="bell" title="暂无订阅者" desc="添加 Chat ID 后，出现告警变化时将推送给对应账号" style="padding:26px 0" />
         <div v-else class="table-wrap">
           <table>
             <thead><tr><th scope="col">名称</th><th scope="col">Chat ID</th><th scope="col">类型</th><th scope="col">告警推送</th><th scope="col">查询权限</th><th scope="col">分组范围</th><th scope="col">最近发送</th><th scope="col" style="width:235px"><span class="sr-only">操作</span></th></tr></thead>

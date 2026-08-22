@@ -120,6 +120,7 @@ func (f *fakeConfigStore) UpdateLastReportAt(ctx context.Context, t time.Time) e
 	return nil
 }
 func (f *fakeConfigStore) UpdateLastError(ctx context.Context, msg string) error { return nil }
+func (f *fakeConfigStore) ClearLastError(ctx context.Context) error           { return nil }
 func (f *fakeConfigStore) LoadSubscribers(ctx context.Context) ([]Subscriber, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -145,47 +146,6 @@ func (f *fakeConfigStore) MarkSubscriberFailure(ctx context.Context, subID int64
 	return nil
 }
 func (f *fakeConfigStore) MarkSubscriberSuccess(ctx context.Context, subID int64) error { return nil }
-
-func TestShouldSendReport(t *testing.T) {
-	loc, _ := time.LoadLocation("Asia/Shanghai")
-	// 14:00 整点，lastReport 为 nil → 应发送
-	now := time.Date(2026, 8, 19, 14, 0, 0, 0, loc)
-	cfg := Config{ReportEnabled: true, ReportIntervalMinutes: 60, ReportMinute: 0, Timezone: "Asia/Shanghai"}
-	if !ShouldSendReport(now, cfg, time.Time{}) {
-		t.Fatal("first report at 14:00 should send")
-	}
-	// 同一小时已发 → 不再发
-	last := time.Date(2026, 8, 19, 14, 0, 1, 0, loc)
-	if ShouldSendReport(now.Add(time.Minute), cfg, last) {
-		t.Fatal("same hour re-send not allowed")
-	}
-	// 15:00 整点 → 发送
-	if !ShouldSendReport(time.Date(2026, 8, 19, 15, 0, 30, 0, loc), cfg, last) {
-		t.Fatal("15:00 should send")
-	}
-	// report_minute=30：14:30 发送，14:45 不发
-	cfg2 := Config{ReportEnabled: true, ReportIntervalMinutes: 60, ReportMinute: 30, Timezone: "Asia/Shanghai"}
-	if !ShouldSendReport(time.Date(2026, 8, 19, 14, 30, 0, 0, loc), cfg2, time.Time{}) {
-		t.Fatal("14:30 with report_minute=30 should send")
-	}
-	if ShouldSendReport(time.Date(2026, 8, 19, 14, 45, 0, 0, loc), cfg2, time.Time{}) {
-		t.Fatal("14:45 should not send (minute 30 not reached)")
-	}
-	// disabled 不发送
-	cfg3 := Config{ReportEnabled: false}
-	if ShouldSendReport(now, cfg3, time.Time{}) {
-		t.Fatal("disabled report must not send")
-	}
-	// 每 30 分钟间隔
-	cfg4 := Config{ReportEnabled: true, ReportIntervalMinutes: 30, ReportMinute: 0, Timezone: "Asia/Shanghai"}
-	last2 := time.Date(2026, 8, 19, 14, 0, 0, 0, loc)
-	if !ShouldSendReport(time.Date(2026, 8, 19, 14, 30, 0, 0, loc), cfg4, last2) {
-		t.Fatal("30min interval should send at 14:30")
-	}
-	if ShouldSendReport(time.Date(2026, 8, 19, 14, 20, 0, 0, loc), cfg4, last2) {
-		t.Fatal("14:20 before 30min interval must not send")
-	}
-}
 
 func TestWorkerDisabledDoesNothing(t *testing.T) {
 	store := &fakeConfigStore{cfg: Config{Enabled: false}}
@@ -257,9 +217,9 @@ func TestWorkerFailureDoesNotStopOthers(t *testing.T) {
 	}
 }
 
-func TestWorkerReportIdempotentPerWindow(t *testing.T) {
+func TestWorkerAlertPushIdempotentPerWatermark(t *testing.T) {
 	store := &fakeConfigStore{
-		cfg: Config{Enabled: true, ReportEnabled: true, ReportMinute: 0},
+		cfg: Config{Enabled: true, ReportEnabled: true},
 		subscribers: []Subscriber{
 			{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true},
 		},
@@ -267,19 +227,23 @@ func TestWorkerReportIdempotentPerWindow(t *testing.T) {
 	bot := &fakeBotClient{}
 	w := NewWorker(store, bot, nil, zapNop())
 
-	ctx := context.Background()
-	start := time.Now().Add(-time.Hour).Truncate(time.Hour)
-	end := start.Add(time.Hour)
+	since := time.Now().Add(-time.Minute)
 
-	// 第一次发送成功并记录
-	w.sendReportWindow(ctx, start, end)
-	if len(bot.sent[7]) != 1 {
-		t.Fatalf("first window sends = %v", bot.sent[7])
+	// 首次投递成功：写入 success=true 的投递日志
+	if !w.deliverAlertPush(context.Background(), store.subscribers[0], "MSG", since) {
+		t.Fatal("first deliver should succeed")
 	}
-	// 同窗口重试：已有成功记录 → 跳过
-	w.sendReportWindow(ctx, start, end)
 	if len(bot.sent[7]) != 1 {
-		t.Fatalf("duplicate window send detected: %v", bot.sent[7])
+		t.Fatalf("first deliver sends = %v", bot.sent[7])
+	}
+
+	// 幂等判定依据：同 (subscriber, kind, since, since) 已存在成功记录
+	already, err := store.HasDelivery(context.Background(), store.subscribers[0].ID, alertPushKind, since, since)
+	if err != nil {
+		t.Fatalf("HasDelivery: %v", err)
+	}
+	if !already {
+		t.Fatal("expected HasDelivery true after successful push, tryPushAlerts would re-send")
 	}
 }
 

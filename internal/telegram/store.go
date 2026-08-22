@@ -83,12 +83,17 @@ func (s *SQLConfigStore) UpdateLastReportAt(ctx context.Context, t time.Time) er
 	return err
 }
 
-// UpdateLastError 记录最近错误。
+// UpdateLastError 记录最近错误（空串 = 清除，成功处理消息后调用）。
 func (s *SQLConfigStore) UpdateLastError(ctx context.Context, msg string) error {
 	_, err := s.Pool.Exec(ctx, `
 		UPDATE telegram_config SET last_error = $1, updated_at = NOW() WHERE id = 1
 	`, msg)
 	return err
+}
+
+// ClearLastError 清除最近错误（UpdateLastError 空串的语义化别名）。
+func (s *SQLConfigStore) ClearLastError(ctx context.Context) error {
+	return s.UpdateLastError(ctx, "")
 }
 
 // LoadSubscribers 读取启用订阅者（Worker 授权校验）。

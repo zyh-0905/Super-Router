@@ -166,6 +166,27 @@ func (r *SiteTestRunner) loadUpstream(ctx context.Context, channelID int) (*chec
 	return &u, mapping, nil
 }
 
+// ListModels 返回该站点映射中的模型 key 列表（排序后），供向导点选模型。
+// 授权与启用校验与 validate 一致（站点不存在/禁用/无权 → 返回错误）。
+func (r *SiteTestRunner) ListModels(ctx context.Context, channelID int, groupIDs []int) ([]string, error) {
+	upstream, mapping, err := r.loadUpstream(ctx, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("站点不存在")
+	}
+	if !upstream.Enabled {
+		return nil, fmt.Errorf("站点已禁用")
+	}
+	if !r.channelInGroups(ctx, channelID, groupIDs) {
+		return nil, fmt.Errorf("无权测试该站点")
+	}
+	keys := make([]string, 0, len(mapping))
+	for k := range mapping {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
 // channelInGroups 校验站点是否在授权分组内（空 = 全部可见，与 query.go 同语义）。
 func (r *SiteTestRunner) channelInGroups(ctx context.Context, channelID int, groupIDs []int) bool {
 	if len(groupIDs) == 0 {

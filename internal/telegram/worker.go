@@ -25,6 +25,7 @@ type ConfigStore interface {
 	UpdateLastPollAt(ctx context.Context, t time.Time) error
 	UpdateLastReportAt(ctx context.Context, t time.Time) error
 	UpdateLastError(ctx context.Context, msg string) error
+	ClearLastError(ctx context.Context) error
 	LoadSubscribers(ctx context.Context) ([]Subscriber, error)
 	HasDelivery(ctx context.Context, subID int64, kind string, start, end time.Time) (bool, error)
 	LogDelivery(ctx context.Context, l DeliveryLog) error
@@ -174,6 +175,8 @@ func (w *Worker) pollOnce(ctx context.Context) error {
 			return fmt.Errorf("update last_update_id: %w", err)
 		}
 	}
+	// 全部 update 成功处理 → 清除历史错误（防止修复前遗留的 last_error 一直挂在设置页）
+	_ = w.store.ClearLastError(ctx)
 	_ = w.store.UpdateLastPollAt(ctx, time.Now())
 	return nil
 }
@@ -200,11 +203,23 @@ func (w *Worker) handleUpdate(ctx context.Context, u Update) error {
 	if out == "" {
 		return nil // /sitetest 进度消息已由异步通道发送
 	}
+	// 发送拆分后的消息：永久错误（确定性 4xx）终止本组分片但**不返回错误**
+	// —— 返回错误会让 offset 不推进、整条 update 无限重放。永久错误
+	// 重试永远失败，继续推进 offset 保住后续命令（记 last_error 供排查）。
+	permanent := false
 	for _, part := range SplitMessage(out, MaxTelegramMessageLen) {
 		if _, err := w.sendToSubscriber(ctx, u.ChatID, part, kb); err != nil {
 			w.logger.Warn("Reply send failed", zap.Int64("chat_id", u.ChatID), zap.Error(err))
-			return err
+			if isPermanentTelegramError(err) {
+				permanent = true
+				_ = w.store.UpdateLastError(ctx, truncateStr(err.Error(), 500))
+				break // 后续分片同样会失败，不再发送
+			}
+			return err // 可重试错误：保留 offset 重放
 		}
+	}
+	if permanent {
+		return nil // 毒丸消息已跳过（offset 会推进）
 	}
 	return nil
 }
@@ -216,7 +231,7 @@ func (w *Worker) handleCallback(ctx context.Context, u Update) error {
 		w.logger.Debug("Answer callback failed", zap.String("callback_id", u.CallbackID), zap.Error(err))
 	}
 	_ = w.client.SendChatAction(ctx, u.CallbackChatID, ChatActionTyping)
-	out, err := w.cmds.HandleCallback(ctx, u)
+	out, kb, err := w.cmds.HandleCallback(ctx, u)
 	if err != nil {
 		w.logger.Warn("Callback handling failed", zap.Int64("chat_id", u.CallbackChatID), zap.Error(err))
 		return err
@@ -224,11 +239,21 @@ func (w *Worker) handleCallback(ctx context.Context, u Update) error {
 	if out == "" {
 		return nil // 已原位编辑或已通过异步通道处理
 	}
+	// kb 必须随新发消息传递（原位编辑失败回退路径的键盘由 HandleCallback 返回）
+	permanent := false
 	for _, part := range SplitMessage(out, MaxTelegramMessageLen) {
-		if _, err := w.sendToSubscriber(ctx, u.CallbackChatID, part, nil); err != nil {
+		if _, err := w.sendToSubscriber(ctx, u.CallbackChatID, part, kb); err != nil {
 			w.logger.Warn("Callback reply send failed", zap.Int64("chat_id", u.CallbackChatID), zap.Error(err))
+			if isPermanentTelegramError(err) {
+				permanent = true
+				_ = w.store.UpdateLastError(ctx, truncateStr(err.Error(), 500))
+				break
+			}
 			return err
 		}
+	}
+	if permanent {
+		return nil
 	}
 	return nil
 }
@@ -258,6 +283,37 @@ func (w *Worker) sendToSubscriber(ctx context.Context, chatID int64, html string
 func (w *Worker) SendToChat(ctx context.Context, chatID int64, html string) error {
 	_, err := w.sendToSubscriber(ctx, chatID, html, nil)
 	return err
+}
+
+// RunAsync 发送进度消息 → 后台执行 work → 原位编辑为最终结果。
+// work 返回错误时以失败提示推送；编辑失败降级为新发消息（不影响结果送达）。
+// 供 /balance 实时刷新等长任务复用（AsyncSender 接口实现）。
+func (w *Worker) RunAsync(ctx context.Context, chatID int64, progress string, work AsyncWork) error {
+	msgID, err := w.sendToSubscriber(ctx, chatID, progress, nil)
+	if err != nil {
+		return err
+	}
+	go func() {
+		runCtx, cancel := context.WithTimeout(context.Background(), balanceRefreshBudget)
+		defer cancel()
+		result, werr := work(runCtx)
+		if werr != nil {
+			result = "⚠️ " + EscapeHTML(truncateStr(werr.Error(), 200))
+		}
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), siteTestSendBudget)
+		defer sendCancel()
+		if eerr := w.client.EditMessageText(sendCtx, chatID, msgID, result, nil); eerr == nil {
+			return
+		}
+		for _, part := range SplitMessage(result, MaxTelegramMessageLen) {
+			if _, serr := w.sendToSubscriber(sendCtx, chatID, part, nil); serr != nil {
+				w.logger.Warn("RunAsync result delivery failed",
+					zap.Int64("chat_id", chatID), zap.Error(serr))
+				return
+			}
+		}
+	}()
+	return nil
 }
 
 // StartTest 启动一次站点测试的交互流程（AsyncSender 接口实现）：
@@ -352,82 +408,93 @@ func (w *Worker) sendSubscriberChatID(ctx context.Context, chatID string, html s
 	return w.sendToSubscriber(ctx, n, html, nil)
 }
 
-// reportLoop 整点报告循环（30s tick 检查）。
+// reportLoop 告警变化推送循环（15s tick：检测上次推送以来的告警变化，
+// 有「新出现/升级/恢复」才推送，无变化沉默——不再定时整点汇报）。
 func (w *Worker) reportLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			w.tryReport(ctx, now)
+			w.tryPushAlerts(ctx, now)
 		}
 	}
 }
 
-// tryReport 检查是否到达发送窗口（带 advisory lock 选主）。
-func (w *Worker) tryReport(ctx context.Context, now time.Time) {
+// tryPushAlerts 检测自上次推送（水位线）以来的告警变化，有变化则推送。
+// 带 advisory lock 选主；无变化时静默返回，不产生任何消息。
+func (w *Worker) tryPushAlerts(ctx context.Context, now time.Time) {
 	cfg, err := w.store.LoadConfig(ctx)
 	if err != nil {
 		return
 	}
-	if !cfg.ReportEnabled || !ShouldSendReport(now, cfg, cfg.LastReportAtOrDefault()) {
+	if !cfg.ReportEnabled {
 		return
 	}
 	unlock, err := w.acquire(ctx, TelegramReportLock)
 	if err != nil {
-		w.logger.Warn("Telegram report lock acquire failed", zap.Error(err))
+		w.logger.Warn("Telegram alert push lock acquire failed", zap.Error(err))
 		return
 	}
 	defer unlock()
 
-	// 锁内重读配置与窗口（幂等：HasDelivery 已有成功记录则跳过）
+	// 锁内重读配置与水位线
 	cfg, err = w.store.LoadConfig(ctx)
 	if err != nil {
 		return
 	}
-	loc := loadLocation(cfg.Timezone)
-	nowLocal := now.In(loc)
-	windowStart, windowEnd := reportWindow(nowLocal, cfg)
-	if !ShouldSendReport(nowLocal, cfg, cfg.LastReportAtOrDefault()) {
+	since := cfg.LastReportAtOrDefault()
+	if since.IsZero() {
+		// 首次启用：静默初始化水位线，不推送存量告警——
+		// 避免把长期持续的旧告警误报为「新出现」。
+		_ = w.store.UpdateLastReportAt(ctx, now)
 		return
 	}
-	w.sendReportWindow(ctx, windowStart, windowEnd)
-	_ = w.store.UpdateLastReportAt(ctx, now)
-}
 
-// sendReportWindow 向全部 enabled + alert_enabled 订阅者发送窗口报告（幂等）。
-// A2：报告按订阅者的 GroupIDs 分别构建（授权边界）——
-// 分组受限的订阅者只能看到自己分组的数据，系统概况计数同样应用分组过滤。
-func (w *Worker) sendReportWindow(ctx context.Context, start, end time.Time) {
 	subs, err := w.store.LoadSubscribers(ctx)
 	if err != nil {
-		w.logger.Warn("Load subscribers for report failed", zap.Error(err))
+		w.logger.Warn("Load subscribers for alert push failed", zap.Error(err))
 		return
 	}
-	// 按分组集合缓存报告内容（相同分组的订阅者共享一份）
-	reportCache := map[string]string{}
+
+	// 按分组集合缓存变化消息（授权边界：分组受限的订阅者只看自己分组的变化）。
+	// 窗口固定为 [since, since]：since 不变则窗口稳定，配合 HasDelivery 保证
+	// 部分订阅者发送失败后下轮重试不会重复打扰已成功的订阅者。
+	cache := map[string]string{}
+	allOK := true
 	for _, s := range subs {
 		if !s.Enabled || !s.AlertEnabled {
 			continue
 		}
-		already, err := w.store.HasDelivery(ctx, s.ID, "hourly_report", start, end)
+		already, err := w.store.HasDelivery(ctx, s.ID, alertPushKind, since, since)
 		if err != nil {
 			w.logger.Warn("HasDelivery failed", zap.Int64("sub", s.ID), zap.Error(err))
 		}
 		if already {
-			continue // 该订阅者该窗口已成功投递（崩溃后新 owner 不重复发送）
+			continue // 该订阅者该水位线区间已成功投递（崩溃后新 owner 不重复发送）
 		}
-		cacheKey := groupIDsKey(s.GroupIDs)
-		report, ok := reportCache[cacheKey]
+		key := groupIDsKey(s.GroupIDs)
+		msg, ok := cache[key]
 		if !ok {
-			report = w.buildReport(ctx, start, end, s.GroupIDs)
-			reportCache[cacheKey] = report
+			msg = w.buildPush(ctx, since, s.GroupIDs)
+			cache[key] = msg
 		}
-		w.deliverReport(ctx, s, report, start, end)
+		if msg == "" {
+			continue // 该分组无变化
+		}
+		if !w.deliverAlertPush(ctx, s, msg, since) {
+			allOK = false
+		}
+	}
+	if allOK {
+		_ = w.store.UpdateLastReportAt(ctx, now)
 	}
 }
+
+// alertPushKind 事件驱动推送的投递审计类型（区别于旧 hourly_report）。
+const alertPushKind = "alert_push"
 
 // groupIDsKey 把分组集合归一化成缓存键（排序后拼接，空集合 = "all"）。
 func groupIDsKey(ids []int) string {
@@ -439,39 +506,39 @@ func groupIDsKey(ids []int) string {
 	return fmt.Sprintf("%v", sorted)
 }
 
-// buildReport 组装报告内容（ReportBuilder 组装系统概况 + 告警变化；
-// groupIDs 控制查询范围，订阅者的分组授权边界在此生效）。
-func (w *Worker) buildReport(ctx context.Context, start, end time.Time, groupIDs []int) string {
+// buildPush 组装告警变化消息；builder 为空或无变化时返回空字符串（调用方沉默）。
+// groupIDs 控制查询范围，订阅者的分组授权边界在此生效。
+func (w *Worker) buildPush(ctx context.Context, since time.Time, groupIDs []int) string {
 	if w.builder == nil {
-		return "🛰 <b>Smart Router 告警汇总</b>\n━━━━━━━━━━━━━━━━\n时间：" +
-			start.Format("2006-01-02 15:04") + "\n告警服务暂不可用。\n"
+		return ""
 	}
 	cfg, err := w.store.LoadConfig(ctx)
 	if err != nil {
 		cfg = Config{}
 	}
-	msg, err := w.builder.Build(ctx, start, int(end.Sub(start)/time.Hour), cfg, groupIDs)
+	msg, err := w.builder.BuildPush(ctx, since, cfg, groupIDs)
 	if err != nil {
-		w.logger.Warn("Report build failed", zap.Error(err))
-		return "🛰 <b>Smart Router 告警汇总</b>\n时间：" + start.Format("2006-01-02 15:04") + "\n告警查询失败。\n"
+		w.logger.Warn("Alert push build failed", zap.Error(err))
+		return ""
 	}
 	return msg
 }
 
-// deliverReport 发送单订阅者报告并写投递日志。
-func (w *Worker) deliverReport(ctx context.Context, s Subscriber, report string, start, end time.Time) {
+// deliverAlertPush 发送单订阅者告警变化消息并写投递日志；返回是否成功。
+// window 用 [since, since] 承载「本批变化（since 之后）」的幂等标识。
+func (w *Worker) deliverAlertPush(ctx context.Context, s Subscriber, msg string, since time.Time) bool {
 	var msgID int64
 	var sendErr error
-	for _, part := range SplitMessage(report, MaxTelegramMessageLen) {
+	for _, part := range SplitMessage(msg, MaxTelegramMessageLen) {
 		if msgID, sendErr = w.sendSubscriberChatID(ctx, s.ChatID, part); sendErr != nil {
 			break
 		}
 	}
 	lg := DeliveryLog{
 		SubscriberID:      s.ID,
-		MessageKind:       "hourly_report",
-		WindowStart:       &start,
-		WindowEnd:         &end,
+		MessageKind:       alertPushKind,
+		WindowStart:       &since,
+		WindowEnd:         &since,
 		Success:           sendErr == nil,
 		TelegramMessageID: msgID,
 	}
@@ -484,6 +551,7 @@ func (w *Worker) deliverReport(ctx context.Context, s Subscriber, report string,
 	if err := w.store.LogDelivery(ctx, lg); err != nil {
 		w.logger.Warn("LogDelivery failed", zap.Error(err))
 	}
+	return sendErr == nil
 }
 
 // acquire 选主锁；未注入实现时直接成功（单实例）。
@@ -492,66 +560,6 @@ func (w *Worker) acquire(ctx context.Context, key int64) (func(), error) {
 		return func() {}, nil
 	}
 	return w.lock(ctx, key)
-}
-
-// ShouldSendReport 判断 now 是否到达发送窗口且 lastReport 已过期。
-// 窗口分钟 = minute % interval == report_minute（默认 interval=60 即整点）。
-// interval 小于 60 时一小时内有多个窗口（如 30 分钟 → 第 0/30 分钟）。
-func ShouldSendReport(now time.Time, cfg Config, lastReport time.Time) bool {
-	if !cfg.ReportEnabled {
-		return false
-	}
-	interval := cfg.ReportIntervalMinutes
-	if interval <= 0 {
-		interval = 60
-	}
-	if interval > 60 {
-		interval = 60 // 窗口最小粒度按小时内的分钟计算
-	}
-	if cfg.ReportMinute < 0 || cfg.ReportMinute >= 60 {
-		cfg.ReportMinute = 0
-	}
-	loc := loadLocation(cfg.Timezone)
-	local := now.In(loc)
-
-	// 当前是否处于发送分钟（minute % interval == report_minute）
-	if local.Minute()%interval != cfg.ReportMinute {
-		return false
-	}
-	// 间隔检查：距上一个窗口起点是否 >= interval 分钟
-	windowStart := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), local.Minute(), 0, 0, loc)
-	if !lastReport.IsZero() {
-		lastLocal := lastReport.In(loc)
-		lastWindow := time.Date(lastLocal.Year(), lastLocal.Month(), lastLocal.Day(), lastLocal.Hour(), lastLocal.Minute(), 0, 0, loc)
-		if windowStart.Sub(lastWindow) < time.Duration(interval)*time.Minute {
-			return false
-		}
-	}
-	return true
-}
-
-// reportWindow 计算本次报告窗口 [start, end)。
-func reportWindow(now time.Time, cfg Config) (time.Time, time.Time) {
-	interval := cfg.ReportIntervalMinutes
-	if interval <= 0 {
-		interval = 60
-	}
-	loc := loadLocation(cfg.Timezone)
-	local := now.In(loc)
-	start := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), local.Minute(), 0, 0, loc).Add(-time.Duration(interval) * time.Minute)
-	return start, start.Add(time.Duration(interval) * time.Minute)
-}
-
-// loadLocation 解析时区（失败回退 Asia/Shanghai）。
-func loadLocation(name string) *time.Location {
-	if name == "" {
-		name = "Asia/Shanghai"
-	}
-	loc, err := time.LoadLocation(name)
-	if err != nil {
-		loc, _ = time.LoadLocation("Asia/Shanghai")
-	}
-	return loc
 }
 
 // sleepCtx 可取消的等待。

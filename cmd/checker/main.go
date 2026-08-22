@@ -107,7 +107,7 @@ func main() {
 	go alertReconciler.Run(ctx, 30*time.Second)
 
 	// Telegram Worker：默认关闭（telegram_config.enabled=false 时 idle）。
-	// 配置启用后长轮询命令 + 每小时整点汇总；advisory lock 保证多实例只有一个 poller/report owner。
+	// 配置启用后长轮询命令 + 告警变化主动推送；advisory lock 保证多实例只有一个 poller/report owner。
 	// Telegram 失败只记日志，不影响 alive/pricing/probe/balance。
 	tgStore := telegram.NewSQLConfigStore(db)
 	if tgCfg, terr := tgStore.LoadConfig(ctx); terr != nil {
@@ -124,13 +124,15 @@ func main() {
 			cmds.SetSiteTestRunner(telegram.NewSiteTestRunner(db, probeChecker, cfg.Security.EncryptionKey,
 				logger.Named("site-test"),
 				safenet.Options{AllowHTTP: cfg.Server.AllowHTTPUpstream, AllowPrivate: cfg.Server.AllowPrivateUpstream}))
+			// /balance 实时刷新：复用 ProbeChecker 多协议余额探测，异步推送最新余额。
+			cmds.SetBalanceRefresher(telegram.NewBalanceRefresher(db, probeChecker, cfg.Security.EncryptionKey, logger.Named("balance-refresh")))
 			cmds.SetLogger(logger.Named("telegram"))
 			tgWorker := telegram.NewWorker(tgStore, telegram.NewClient(token), cmds, logger.Named("telegram"))
 			cmds.SetAsyncSender(tgWorker) // 异步推送结果（/sitetest 长任务）
 			tgWorker.SetReportBuilder(telegram.NewReportBuilder(db))
 			tgWorker.SetLock(pgAdvisoryLock(db))
 			go tgWorker.Run(ctx)
-			logger.Info("Telegram worker started (long polling + hourly reports)")
+			logger.Info("Telegram worker started (long polling + event-driven alert push)")
 		}
 	}
 

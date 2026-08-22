@@ -36,6 +36,21 @@ func (b *ReportBuilder) Build(ctx context.Context, now time.Time, windowHours in
 	return FormatReport(now, windowHours, overview, changes, cfg.IncludeRecovered, cfg.IncludeOngoing, cfg.WebBaseURL), nil
 }
 
+// BuildPush 组装事件驱动的告警变化推送消息（HTML）。
+// since 为「上次推送时间」水位线：只查询其后的新出现/升级/恢复。
+// 无变化时返回空字符串（调用方据此沉默，不发消息）。
+func (b *ReportBuilder) BuildPush(ctx context.Context, since time.Time, cfg Config, groupIDs []int) (string, error) {
+	svc := alert.NewService(b.DB)
+	changes, err := svc.ChangesSince(ctx, since, groupIDs)
+	if err != nil {
+		return "", fmt.Errorf("alert changes: %w", err)
+	}
+	if changes.Total() == 0 {
+		return "", nil
+	}
+	return FormatAlertPush(time.Now(), changes, cfg.WebBaseURL), nil
+}
+
 // groupMembership 分组过滤片段：$1::int[] 为空/NULL 时不限制；
 // 否则目标列所在站点必须属于任一指定分组。
 const groupMembership = `($1::int[] IS NULL OR cardinality($1::int[]) = 0 OR EXISTS (

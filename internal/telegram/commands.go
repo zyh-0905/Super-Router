@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -29,13 +30,20 @@ type QueryService interface {
 type SiteTestExecutor interface {
 	Preflight(ctx context.Context, channelID int, model string, groupIDs []int) (name, resolvedModel, upstreamModel string, err error)
 	Run(ctx context.Context, channelID int, model string, maxTokens int, groupIDs []int) (string, error)
+	// ListModels 列出站点映射中的模型 key（排序后），供向导点选模型。
+	ListModels(ctx context.Context, channelID int, groupIDs []int) ([]string, error)
 }
 
-// AsyncSender 异步回复发送器：长任务（站点测试）的进度消息与结果推送。
+// AsyncWork 后台异步任务：返回要推送的最终文本（错误时由调用方包装为失败提示）。
+type AsyncWork func(ctx context.Context) (string, error)
+
+// AsyncSender 异步回复发送器：长任务（站点测试/余额刷新）的进度消息与结果推送。
 // 生产实现为 Worker；nil = 命令同步返回结果（测试/退化路径）。
 type AsyncSender interface {
 	SendToChat(ctx context.Context, chatID int64, html string) error
 	StartTest(ctx context.Context, t *StartTestContext) error
+	// RunAsync 发送进度消息 → 后台执行 work → 原位编辑为结果（编辑失败降级新发）。
+	RunAsync(ctx context.Context, chatID int64, progress string, work AsyncWork) error
 }
 
 // CallbackResponder 回调处理期间的原位编辑能力（Worker 实现）。
@@ -77,12 +85,17 @@ func (t *StartTestContext) RetryKeyboard() *InlineKeyboard {
 
 // CommandService 解析命令、校验授权并分发查询。
 type CommandService struct {
-	query       QueryService
-	subscribers map[int64]Subscriber
-	siteTest    SiteTestExecutor
-	sender      AsyncSender
-	responder   CallbackResponder
-	logger      *zap.Logger
+	query            QueryService
+	subscribers      map[int64]Subscriber
+	siteTest         SiteTestExecutor
+	balanceRefresher *BalanceRefresher
+	sender           AsyncSender
+	responder        CallbackResponder
+	logger           *zap.Logger
+
+	// 站点测试向导会话（按 chat_id 隔离；仅 poller owner 单实例处理，内存态即可）
+	wizardMu sync.Mutex
+	wizards  map[int64]*wizardSession
 
 	// 命令菜单（setMyCommands）上次同步的订阅者能力状态
 	menuAlerts bool
@@ -91,7 +104,7 @@ type CommandService struct {
 
 // NewCommandService 创建命令服务。
 func NewCommandService(q QueryService) *CommandService {
-	return &CommandService{query: q, subscribers: map[int64]Subscriber{}, logger: zap.NewNop()}
+	return &CommandService{query: q, subscribers: map[int64]Subscriber{}, logger: zap.NewNop(), wizards: map[int64]*wizardSession{}}
 }
 
 // SetSubscribers 刷新授权订阅者（Worker 每次处理命令前从 DB 重新加载）。
@@ -111,6 +124,10 @@ func (c *CommandService) SetSubscribers(subs []Subscriber) {
 
 // SetSiteTestRunner 注入站点测试执行器（checker 装配时注入；nil = /sitetest 不可用）。
 func (c *CommandService) SetSiteTestRunner(r SiteTestExecutor) { c.siteTest = r }
+
+// SetBalanceRefresher 注入余额实时刷新器（checker 装配时注入；
+// nil 或未注入 sender 时 /balance 退化为只读缓存查询）。
+func (c *CommandService) SetBalanceRefresher(r *BalanceRefresher) { c.balanceRefresher = r }
 
 // SetAsyncSender 注入异步发送器；nil 时 /sitetest 同步返回结果。
 func (c *CommandService) SetAsyncSender(s AsyncSender) { c.sender = s }
@@ -135,7 +152,7 @@ const helpText = `📋 <b>可用命令</b>
 🔍 <code>/alert &lt;key&gt;</code> — 单条告警详情
 🛰 <code>/status</code> — 系统状态摘要
 🧪 <code>/quality &lt;id&gt;</code> — 最近一次质量检测
-🚀 <code>/sitetest &lt;id&gt; [模型] [tokens]</code> — 站点直达测试（少量费用，异步推送）
+🚀 <code>/sitetest</code> — 站点直达测试（点选引导，少量费用，异步推送）
 ━━━━━━━━━━━━
 💡 也可以点下方按钮快速查看`
 
@@ -218,6 +235,16 @@ func (c *CommandService) dispatch(ctx context.Context, chatID int64, sub Subscri
 			out, err := c.query.BalanceDetail(ctx, id, sub.GroupIDs)
 			return out, backToRelayKeyboard(id), err
 		}
+		// 无参数：实时刷新。有 sender 且有刷新器 → 异步探测并原位更新；
+		// 否则退化为只读缓存查询（测试/退化路径）。
+		if c.balanceRefresher != nil && c.sender != nil {
+			if err := c.sender.RunAsync(ctx, chatID, "💰 正在实时刷新中转站余额…", func(wctx context.Context) (string, error) {
+				return c.balanceRefresher.Refresh(wctx, sub.GroupIDs)
+			}); err != nil {
+				return "", nil, err // 发送失败：返回错误让 worker 保留 offset 重试
+			}
+			return "", nil, nil // 结果由 RunAsync 异步推送
+		}
 		out, err := c.query.BalanceList(ctx, sub.GroupIDs)
 		return out, nil, err
 	case "/health":
@@ -264,11 +291,14 @@ func (c *CommandService) dispatch(ctx context.Context, chatID int64, sub Subscri
 // ===== 内联键盘回调 =====
 
 // HandleCallback 处理内联键盘回调。
-// 返回需要新发送的回复文本（空 = 已原位编辑或已通过异步通道处理）。
-func (c *CommandService) HandleCallback(ctx context.Context, u Update) (string, error) {
+// 返回 (需要新发送的回复文本, 内联键盘, error)：
+//   - 文本空 = 已原位编辑或已通过异步通道处理；
+//   - 键盘必须随文本一起返回——replyOrEdit 原位编辑失败回退为新发时，
+//     键盘信息必须穿透到 Worker 发送层（此前丢失键盘导致向导无按钮）。
+func (c *CommandService) HandleCallback(ctx context.Context, u Update) (string, *InlineKeyboard, error) {
 	sub, ok := c.subscribers[u.CallbackChatID]
 	if !ok || !sub.Enabled {
-		return unauthorized, nil
+		return unauthorized, nil, nil
 	}
 	data := u.CallbackData
 
@@ -281,88 +311,325 @@ func (c *CommandService) HandleCallback(ctx context.Context, u Update) (string, 
 		}
 		cmd, args := parseCommand(text)
 		if cmd == "" {
-			return "", nil
+			return "", nil, nil
 		}
 		if cmd != "/start" && cmd != "/help" && !sub.QueryEnabled {
-			return unauthorized, nil
+			return unauthorized, nil, nil
 		}
 		out, kb, err := c.dispatch(ctx, u.CallbackChatID, sub, cmd, args)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		return c.replyOrEdit(ctx, u, out, kb)
 	case strings.HasPrefix(data, "filter:"):
 		if !sub.QueryEnabled {
-			return unauthorized, nil
+			return unauthorized, nil, nil
 		}
 		out, err := c.handleAlerts(ctx, sub, []string{strings.TrimPrefix(data, "filter:")})
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		return c.replyOrEdit(ctx, u, out, alertsKeyboard())
 	case strings.HasPrefix(data, "st:"):
 		if !sub.QueryEnabled {
-			return unauthorized, nil
+			return unauthorized, nil, nil
 		}
 		return c.handleSiteTestCallback(ctx, u, sub, data)
+	case strings.HasPrefix(data, "wiz:"):
+		if !sub.QueryEnabled {
+			return unauthorized, nil, nil
+		}
+		return c.handleWizardCallback(ctx, u, sub, data)
 	default:
-		return "", nil
+		return "", nil, nil
 	}
 }
 
 // replyOrEdit 优先原位编辑原消息（按钮就地响应）；编辑失败（消息过旧/被删）
-// 回退为返回文本由 Worker 新发。
-func (c *CommandService) replyOrEdit(ctx context.Context, u Update, html string, kb *InlineKeyboard) (string, error) {
+// 回退为返回文本与键盘由 Worker 新发——键盘必须穿透，否则按钮丢失。
+func (c *CommandService) replyOrEdit(ctx context.Context, u Update, html string, kb *InlineKeyboard) (string, *InlineKeyboard, error) {
 	if c.responder != nil {
 		if err := c.responder.EditCallbackMessage(ctx, u, html, kb); err == nil {
-			return "", nil
+			return "", nil, nil
 		}
 		c.logger.Debug("Callback edit failed, falling back to new message",
 			zap.Int64("chat_id", u.CallbackChatID))
 	}
-	return html, nil
+	return html, kb, nil
 }
 
 // handleSiteTestCallback st:<id>[:model][:tokens] 回调：
 // 有异步发送器时启动进度流（新消息）；否则同步执行并原位编辑结果。
-func (c *CommandService) handleSiteTestCallback(ctx context.Context, u Update, sub Subscriber, data string) (string, error) {
+func (c *CommandService) handleSiteTestCallback(ctx context.Context, u Update, sub Subscriber, data string) (string, *InlineKeyboard, error) {
 	if c.siteTest == nil {
-		return "⚠️ 站点测试服务暂不可用，请稍后再试。", nil
+		return "⚠️ 站点测试服务暂不可用，请稍后再试。", nil, nil
 	}
 	id, model, maxTokens, usageErr := parseStData(data)
 	if usageErr != "" {
-		return usageErr, nil
+		return usageErr, nil, nil
 	}
 	t, err := c.startTestContext(ctx, u.CallbackChatID, sub, id, model, maxTokens)
 	if err != nil {
-		return "🧪 无法测试：" + err.Error(), nil
+		return "🧪 无法测试：" + err.Error(), nil, nil
 	}
 	if c.sender != nil {
 		if serr := c.sender.StartTest(ctx, t); serr != nil {
-			return "", serr // 发送失败：返回错误让 worker 保留 offset 重试
+			return "", nil, serr // 发送失败：返回错误让 worker 保留 offset 重试
 		}
-		return "", nil // 进度消息由 StartTest 发送
+		return "", nil, nil // 进度消息由 StartTest 发送
 	}
 	msg, rerr := t.Runner.Run(ctx, t.ChannelID, t.Model, t.MaxTokens, sub.GroupIDs)
 	if rerr != nil {
-		return "🧪 站点测试失败：" + rerr.Error(), nil
+		return "🧪 站点测试失败：" + rerr.Error(), nil, nil
 	}
 	return c.replyOrEdit(ctx, u, msg, t.RetryKeyboard())
 }
 
-// handleSiteTest /sitetest <id> [模型] [max_tokens]：
-// 有异步发送器时启动进度流；无发送器（测试路径）同步返回结果。
+// ===== 站点测试引导式向导 =====
+
+// wizardSession 一次引导式站点测试的会话状态（按 chat_id 隔离）。
+type wizardSession struct {
+	chatID    int64
+	groupIDs  []int
+	step      string // "station" → "model" → "tokens"
+	stationID int
+	model     string
+}
+
+// wizardTtl 向导会话超时：长时间不操作自动过期，避免残留状态拦截后续按钮。
+const wizardTtl = 10 * time.Minute
+
+// siteTestTokenChoices 向导可选 max_tokens（含默认 128）。
+var siteTestTokenChoices = []int{64, 128, 256, 512}
+
+// startSiteTestWizard 启动向导第一步：列出站点供点选。
+func (c *CommandService) startSiteTestWizard(ctx context.Context, chatID int64, sub Subscriber) (string, *InlineKeyboard, error) {
+	items, err := c.query.RelaySummaries(ctx, sub.GroupIDs)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(items) == 0 {
+		return "🧪 站点测试\n暂无可用站点，请先添加站点。", nil, nil
+	}
+	kb := wizardStationKeyboard(items)
+	if kb == nil {
+		return "🧪 站点测试\n暂无可选站点。", nil, nil
+	}
+
+	w := &wizardSession{chatID: chatID, groupIDs: sub.GroupIDs, step: "station"}
+	c.wizardMu.Lock()
+	c.wizards[chatID] = w
+	c.wizardMu.Unlock()
+
+	return "🧪 <b>站点测试</b>\n━━━━━━━━━━━━\n请选择要测试的站点：", kb, nil
+}
+
+// handleWizardCallback 处理向导各步骤回调。
+func (c *CommandService) handleWizardCallback(ctx context.Context, u Update, sub Subscriber, data string) (string, *InlineKeyboard, error) {
+	c.wizardMu.Lock()
+	w, ok := c.wizards[u.CallbackChatID]
+	c.wizardMu.Unlock()
+	if !ok || w == nil {
+		return "🧪 向导已过期，请重新发送 /sitetest。", nil, nil
+	}
+	w.groupIDs = sub.GroupIDs // 授权范围随当前订阅者刷新
+
+	parts := strings.Split(data, ":")
+	if len(parts) < 2 {
+		return "🧪 无效的操作。", nil, nil
+	}
+	action := parts[1]
+
+	switch action {
+	case "station":
+		return c.wizardPickStation(ctx, u, sub, w, parts)
+	case "model":
+		return c.wizardPickModel(ctx, u, sub, w, parts)
+	case "tokens":
+		return c.wizardPickTokens(ctx, u, sub, w, parts)
+	case "back":
+		return c.wizardBack(ctx, u, sub, w)
+	case "cancel":
+		c.wizardMu.Lock()
+		delete(c.wizards, u.CallbackChatID)
+		c.wizardMu.Unlock()
+		return "已取消站点测试。", nil, nil
+	default:
+		return "🧪 无效的操作。", nil, nil
+	}
+}
+
+// wizardPickStation 选择站点后，列出该站点模型供点选。
+func (c *CommandService) wizardPickStation(ctx context.Context, u Update, sub Subscriber, w *wizardSession, parts []string) (string, *InlineKeyboard, error) {
+	if len(parts) < 3 {
+		return "🧪 无效的站点。", nil, nil
+	}
+	id, err := parseID(parts[2])
+	if err != nil {
+		return "🧪 无效的站点。", nil, nil
+	}
+	models, err := c.siteTest.ListModels(ctx, id, w.groupIDs)
+	if err != nil {
+		return "🧪 无法测试该站点：" + err.Error(), nil, nil
+	}
+	if len(models) == 0 {
+		return "🧪 该站点没有已映射模型，无法测试。", nil, nil
+	}
+	w.stationID = id
+	w.step = "model"
+
+	name := ""
+	if items, _ := c.query.RelaySummaries(ctx, w.groupIDs); items != nil {
+		for _, it := range items {
+			if it.ID == id {
+				name = it.Name
+				break
+			}
+		}
+	}
+	if name == "" {
+		name = strconv.Itoa(id)
+	}
+
+	out := "🧪 <b>站点测试</b>\n站点：" + EscapeHTML(name) + "\n━━━━━━━━━━━━\n请选择测试模型："
+	return c.replyOrEdit(ctx, u, out, wizardModelKeyboard(models))
+}
+
+// wizardPickModel 选择模型后，列出 tokens 供点选。
+func (c *CommandService) wizardPickModel(ctx context.Context, u Update, sub Subscriber, w *wizardSession, parts []string) (string, *InlineKeyboard, error) {
+	if len(parts) < 3 || parts[2] == "" {
+		return "🧪 无效的模型。", nil, nil
+	}
+	w.model = parts[2]
+	w.step = "tokens"
+
+	out := "🧪 <b>站点测试</b>\n模型：" + EscapeHTML(w.model) + "\n━━━━━━━━━━━━\n请选择 max_tokens（生成长度）："
+	return c.replyOrEdit(ctx, u, out, wizardTokenKeyboard())
+}
+
+// wizardPickTokens 选择 tokens 后，启动测试并结束向导。
+func (c *CommandService) wizardPickTokens(ctx context.Context, u Update, sub Subscriber, w *wizardSession, parts []string) (string, *InlineKeyboard, error) {
+	if len(parts) < 3 {
+		return "🧪 无效的 tokens。", nil, nil
+	}
+	maxTokens, err := parseID(parts[2])
+	if err != nil || maxTokens <= 0 {
+		return "🧪 无效的 tokens。", nil, nil
+	}
+
+	c.wizardMu.Lock()
+	delete(c.wizards, u.CallbackChatID)
+	c.wizardMu.Unlock()
+
+	t, err := c.startTestContext(ctx, u.CallbackChatID, sub, w.stationID, w.model, maxTokens)
+	if err != nil {
+		return "🧪 无法测试：" + err.Error(), nil, nil
+	}
+	if c.sender != nil {
+		if serr := c.sender.StartTest(ctx, t); serr != nil {
+			return "", nil, serr
+		}
+		return "", nil, nil
+	}
+	msg, rerr := t.Runner.Run(ctx, t.ChannelID, t.Model, t.MaxTokens, sub.GroupIDs)
+	if rerr != nil {
+		return "🧪 站点测试失败：" + rerr.Error(), nil, nil
+	}
+	return msg, nil, nil
+}
+
+// wizardBack 返回上一步（model 步返回站点列表，tokens 步返回模型列表）。
+func (c *CommandService) wizardBack(ctx context.Context, u Update, sub Subscriber, w *wizardSession) (string, *InlineKeyboard, error) {
+	switch w.step {
+	case "model", "tokens":
+		if w.step == "model" {
+			// 返回站点选择
+			items, err := c.query.RelaySummaries(ctx, w.groupIDs)
+			if err != nil {
+				return "", nil, err
+			}
+			w.step = "station"
+			out := "🧪 <b>站点测试</b>\n━━━━━━━━━━━━\n请选择要测试的站点："
+			return c.replyOrEdit(ctx, u, out, wizardStationKeyboard(items))
+		}
+		// 返回模型选择
+		models, err := c.siteTest.ListModels(ctx, w.stationID, w.groupIDs)
+		if err != nil {
+			return "🧪 无法测试该站点：" + err.Error(), nil, nil
+		}
+		w.step = "model"
+		out := "🧪 <b>站点测试</b>\n━━━━━━━━━━━━\n请选择测试模型："
+		return c.replyOrEdit(ctx, u, out, wizardModelKeyboard(models))
+	default:
+		return "🧪 无效的操作。", nil, nil
+	}
+}
+
+// wizardStationKeyboard 站点列表键盘（wiz:station 回调，每行 2 个）。
+func wizardStationKeyboard(items []RelaySummary) *InlineKeyboard {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) > 24 {
+		items = items[:24]
+	}
+	rows := make([][]InlineButton, 0, (len(items)+1)/2)
+	row := make([]InlineButton, 0, 2)
+	for _, it := range items {
+		row = append(row, InlineButton{Text: truncateButtonText(it.Name), Data: "wiz:station:" + strconv.Itoa(it.ID)})
+		if len(row) == 2 {
+			rows = append(rows, row)
+			row = make([]InlineButton, 0, 2)
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+	rows = append(rows, InlineRow(InlineButton{Text: "❌ 取消", Data: "wiz:cancel"}))
+	return &InlineKeyboard{Rows: rows}
+}
+
+// wizardModelKeyboard 模型列表键盘（wiz:model 回调，每行 2 个）。
+func wizardModelKeyboard(models []string) *InlineKeyboard {
+	rows := make([][]InlineButton, 0, (len(models)+1)/2)
+	row := make([]InlineButton, 0, 2)
+	for _, m := range models {
+		row = append(row, InlineButton{Text: truncateButtonText(m), Data: "wiz:model:" + m})
+		if len(row) == 2 {
+			rows = append(rows, row)
+			row = make([]InlineButton, 0, 2)
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+	rows = append(rows, InlineRow(InlineButton{Text: "← 返回站点", Data: "wiz:back"}, InlineButton{Text: "❌ 取消", Data: "wiz:cancel"}))
+	return &InlineKeyboard{Rows: rows}
+}
+
+// wizardTokenKeyboard tokens 列表键盘（wiz:tokens 回调）。
+func wizardTokenKeyboard() *InlineKeyboard {
+	var row []InlineButton
+	for _, n := range siteTestTokenChoices {
+		row = append(row, InlineButton{Text: strconv.Itoa(n), Data: "wiz:tokens:" + strconv.Itoa(n)})
+	}
+	rows := [][]InlineButton{row, InlineRow(InlineButton{Text: "← 返回模型", Data: "wiz:back"}, InlineButton{Text: "❌ 取消", Data: "wiz:cancel"})}
+	return &InlineKeyboard{Rows: rows}
+}
+
+// handleSiteTest /sitetest [id] [模型] [max_tokens]：
+//   - 无参数：启动引导式向导（点选站点 → 模型 → tokens），不再让用户手打 ID；
+//   - 带参数：兼容旧的手动调用路径（保留 /sitetest <id> ... 直接测试）。
 func (c *CommandService) handleSiteTest(ctx context.Context, chatID int64, sub Subscriber, args []string) (string, *InlineKeyboard, error) {
 	if c.siteTest == nil {
 		return "⚠️ 站点测试服务暂不可用，请稍后再试。", nil, nil
 	}
 	if len(args) == 0 {
-		return "用法：/sitetest &lt;channel_id&gt; [模型] [max_tokens]\n模型默认站点 test_model，max_tokens 默认 " +
-			strconv.Itoa(siteTestDefaultTokens) + "。", nil, nil
+		return c.startSiteTestWizard(ctx, chatID, sub)
 	}
 	id, err := parseID(args[0])
 	if err != nil {
-		return "用法：/sitetest &lt;channel_id&gt; [模型] [max_tokens]", nil, nil
+		return "用法：/sitetest &lt;channel_id&gt; [模型] [max_tokens]\n也可直接输入 /sitetest 走引导式选择。", nil, nil
 	}
 	model, maxTokens, usageErr := parseSiteTestArgs(args[1:])
 	if usageErr != "" {
@@ -593,7 +860,7 @@ func (c *CommandService) SyncBotMenu(ctx context.Context, client BotClient, subs
 			BotCommand{Command: "/health", Description: "站点健康"},
 			BotCommand{Command: "/ratio", Description: "站点倍率"},
 			BotCommand{Command: "/quality", Description: "质量检测结果"},
-			BotCommand{Command: "/sitetest", Description: "站点直达测试"},
+			BotCommand{Command: "/sitetest", Description: "站点直达测试（引导式）"},
 		)
 	}
 	if err := client.SetMyCommands(ctx, cmds); err != nil {

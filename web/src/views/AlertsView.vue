@@ -103,7 +103,7 @@ onUnmounted(() => clearInterval(pollTimer))
         <span class="badge" :class="tgStatus.enabled ? 'badge-green' : 'badge-gray'">
           Telegram：{{ tgStatus.enabled ? '已启用' : '未启用' }}
         </span>
-        <span v-if="tgStatus.last_report_at" class="text-3" style="font-size:12px">最近汇总：{{ tgStatus.last_report_at }}</span>
+        <span v-if="tgStatus.last_report_at" class="text-3" style="font-size:12px">最近推送：{{ tgStatus.last_report_at }}</span>
         <span v-if="tgStatus.last_error" class="text-red" style="font-size:12px" :title="tgStatus.last_error">⚠ {{ tgStatus.last_error.slice(0, 50) }}</span>
         <button class="btn btn-ghost btn-sm" style="margin-left:auto" :disabled="tgSending || !tgStatus.bot_configured"
           :title="tgStatus.bot_configured ? '向全部订阅者发送当前告警汇总' : '请先在设置页配置 Bot Token'" @click="sendNow">

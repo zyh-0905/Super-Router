@@ -64,6 +64,7 @@ type fakeSiteTestRunner struct {
 	preflightErr error
 	runMsg       string
 	runErr       error
+	models       []string
 
 	lastID        int
 	lastModel     string
@@ -89,6 +90,10 @@ func (f *fakeSiteTestRunner) Run(ctx context.Context, channelID int, model strin
 		return "", f.runErr
 	}
 	return f.runMsg, nil
+}
+
+func (f *fakeSiteTestRunner) ListModels(ctx context.Context, channelID int, groupIDs []int) ([]string, error) {
+	return f.models, nil
 }
 
 // fakeAsyncSender 记录异步发送内容；StartTest 同步执行 Run（模拟 Worker 流程）。
@@ -117,6 +122,21 @@ func (f *fakeAsyncSender) StartTest(ctx context.Context, t *StartTestContext) er
 	msg, err := t.Runner.Run(ctx, t.ChannelID, t.Model, t.MaxTokens, t.Sub.GroupIDs)
 	if err != nil {
 		msg = "🧪 站点测试失败：" + err.Error()
+	}
+	f.mu.Lock()
+	f.msgs = append(f.msgs, msg)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeAsyncSender) RunAsync(ctx context.Context, chatID int64, progress string, work AsyncWork) error {
+	f.mu.Lock()
+	f.msgs = append(f.msgs, progress)
+	f.mu.Unlock()
+	// 测试路径同步执行，避免真实 goroutine 时序
+	msg, err := work(ctx)
+	if err != nil {
+		msg = "⚠️ " + err.Error()
 	}
 	f.mu.Lock()
 	f.msgs = append(f.msgs, msg)
@@ -174,12 +194,69 @@ func TestSiteTestNotConfigured(t *testing.T) {
 }
 
 func TestSiteTestUsage(t *testing.T) {
-	svc := NewCommandService(&fakeQueryService{results: map[string]string{}})
+	// 无参数 → 引导式向导（列出站点）；无站点时提示先添加站点
+	svc := NewCommandService(&fakeQueryService{results: map[string]string{}, summaries: []RelaySummary{}})
 	svc.SetSiteTestRunner(&fakeSiteTestRunner{})
 	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
 	out, _ := svc.Handle(context.Background(), 7, "/sitetest")
-	if !strings.Contains(out, "用法") {
+	if !strings.Contains(out, "站点测试") {
 		t.Fatalf("out = %q", out)
+	}
+}
+
+func TestSiteTestWizardFlow(t *testing.T) {
+	q := &fakeQueryService{
+		results:   map[string]string{},
+		summaries: []RelaySummary{{ID: 19, Name: "测试站", Host: "api.example.com"}},
+	}
+	runner := &fakeSiteTestRunner{models: []string{"claude-opus-4-8", "gpt-5.5"}}
+	svc := NewCommandService(q)
+	svc.SetSiteTestRunner(runner)
+	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
+
+	// 第一步：无参数 → 列出站点
+	out, kb, err := svc.HandleWithKeyboard(context.Background(), 7, "/sitetest")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(out, "请选择要测试的站点") || kb == nil {
+		t.Fatalf("step1 out=%q kb=%v", out, kb)
+	}
+
+	// 第二步：选站点 → 列模型
+	out, _, err = svc.HandleCallback(context.Background(), Update{
+		HasCallback: true, CallbackID: "cb1", CallbackChatID: 7, CallbackMessageID: 1,
+		CallbackData: "wiz:station:19",
+	})
+	if err != nil {
+		t.Fatalf("step2 err = %v", err)
+	}
+	if !strings.Contains(out, "请选择测试模型") {
+		t.Fatalf("step2 out=%q", out)
+	}
+
+	// 第三步：选模型 → 列 tokens
+	out, _, err = svc.HandleCallback(context.Background(), Update{
+		HasCallback: true, CallbackID: "cb2", CallbackChatID: 7, CallbackMessageID: 1,
+		CallbackData: "wiz:model:claude-opus-4-8",
+	})
+	if err != nil {
+		t.Fatalf("step3 err = %v", err)
+	}
+	if !strings.Contains(out, "请选择 max_tokens") {
+		t.Fatalf("step3 out=%q", out)
+	}
+
+	// 第四步：选 tokens → 启动测试（无 sender，同步返回结果）
+	out, _, err = svc.HandleCallback(context.Background(), Update{
+		HasCallback: true, CallbackID: "cb3", CallbackChatID: 7, CallbackMessageID: 1,
+		CallbackData: "wiz:tokens:128",
+	})
+	if err != nil {
+		t.Fatalf("step4 err = %v", err)
+	}
+	if runner.lastID != 19 || runner.lastModel != "claude-opus-4-8" || runner.lastMaxTokens != 128 {
+		t.Fatalf("runner = %d/%s/%d, want 19/claude-opus-4-8/128", runner.lastID, runner.lastModel, runner.lastMaxTokens)
 	}
 }
 
@@ -319,7 +396,7 @@ func TestCallbackCmdRelayDispatches(t *testing.T) {
 	q := &fakeQueryService{results: map[string]string{"relay_detail": "DETAIL"}}
 	svc := NewCommandService(q)
 	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
-	out, err := svc.HandleCallback(context.Background(), Update{
+	out, _, err := svc.HandleCallback(context.Background(), Update{
 		HasCallback:       true,
 		CallbackData:      "cmd:/relay:19",
 		CallbackChatID:    7,
@@ -342,7 +419,7 @@ func TestCallbackCmdRelayInPlaceEdit(t *testing.T) {
 	resp := &fakeResponder{}
 	svc.SetCallbackResponder(resp)
 	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
-	out, err := svc.HandleCallback(context.Background(), Update{
+	out, _, err := svc.HandleCallback(context.Background(), Update{
 		HasCallback:       true,
 		CallbackData:      "cmd:/relay:19",
 		CallbackChatID:    7,
@@ -367,7 +444,7 @@ func TestCallbackEditFailureFallsBackToNewMessage(t *testing.T) {
 	svc := NewCommandService(q)
 	svc.SetCallbackResponder(&fakeResponder{editErr: context.DeadlineExceeded})
 	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
-	out, err := svc.HandleCallback(context.Background(), Update{
+	out, _, err := svc.HandleCallback(context.Background(), Update{
 		HasCallback: true, CallbackData: "cmd:/relay:19", CallbackChatID: 7,
 	})
 	if err != nil {
@@ -375,6 +452,46 @@ func TestCallbackEditFailureFallsBackToNewMessage(t *testing.T) {
 	}
 	if out != "DETAIL" {
 		t.Fatalf("out = %q, want fallback new message", out)
+	}
+}
+
+// TestCallbackEditFailureKeyboardSurvives 原位编辑失败回退为新发时，
+// 键盘必须随文本一起返回（此前丢失键盘导致向导无按钮）。
+func TestCallbackEditFailureKeyboardSurvives(t *testing.T) {
+	q := &fakeQueryService{
+		results:   map[string]string{},
+		summaries: []RelaySummary{{ID: 19, Name: "测试站"}},
+	}
+	runner := &fakeSiteTestRunner{models: []string{"claude-opus-4-8"}}
+	svc := NewCommandService(q)
+	svc.SetSiteTestRunner(runner)
+	svc.SetCallbackResponder(&fakeResponder{editErr: context.DeadlineExceeded}) // 强制走 fallback
+	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
+
+	// 从 help 按钮触发向导（cmd:/sitetest 回调）
+	out, kb, err := svc.HandleCallback(context.Background(), Update{
+		HasCallback: true, CallbackData: "cmd:/sitetest", CallbackChatID: 7, CallbackMessageID: 9,
+	})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(out, "请选择要测试的站点") {
+		t.Fatalf("out = %q", out)
+	}
+	if kb == nil || len(kb.Rows) == 0 {
+		t.Fatal("keyboard lost in fallback path — wizard would show no buttons")
+	}
+	// 键盘应含站点按钮 + 取消按钮
+	hasStation := false
+	for _, row := range kb.Rows {
+		for _, b := range row {
+			if strings.HasPrefix(b.Data, "wiz:station:") {
+				hasStation = true
+			}
+		}
+	}
+	if !hasStation {
+		t.Fatalf("keyboard missing station buttons: %+v", kb)
 	}
 }
 
@@ -396,7 +513,7 @@ func TestCallbackFilterCritical(t *testing.T) {
 	})
 	defer SetAlertsQuery(nil)
 
-	out, err := svc.HandleCallback(context.Background(), Update{
+	out, _, err := svc.HandleCallback(context.Background(), Update{
 		HasCallback: true, CallbackData: "filter:critical", CallbackChatID: 7,
 	})
 	if err != nil {
@@ -405,7 +522,7 @@ func TestCallbackFilterCritical(t *testing.T) {
 	if out != "ALERTS" || captured != "critical" {
 		t.Fatalf("out = %q captured = %q", out, captured)
 	}
-	_, _ = svc.HandleCallback(context.Background(), Update{
+	_, _, _ = svc.HandleCallback(context.Background(), Update{
 		HasCallback: true, CallbackData: "filter:all", CallbackChatID: 7,
 	})
 	if captured != "all" {
@@ -422,7 +539,7 @@ func TestCallbackStStartsTest(t *testing.T) {
 	svc.SetAsyncSender(sender)
 	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
 
-	out, err := svc.HandleCallback(context.Background(), Update{
+	out, _, err := svc.HandleCallback(context.Background(), Update{
 		HasCallback: true, CallbackData: "st:19:claude-opus-4-8:64", CallbackChatID: 7,
 	})
 	if err != nil {
@@ -447,7 +564,7 @@ func TestCallbackUnauthorizedChat(t *testing.T) {
 	q := &fakeQueryService{results: map[string]string{}}
 	svc := NewCommandService(q)
 	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
-	out, err := svc.HandleCallback(context.Background(), Update{
+	out, _, err := svc.HandleCallback(context.Background(), Update{
 		HasCallback: true, CallbackData: "cmd:/relay", CallbackChatID: 999,
 	})
 	if err != nil {
@@ -722,5 +839,61 @@ func TestAlertCommandRequiresAlertEnabled(t *testing.T) {
 	out, _ := svc.Handle(context.Background(), 7, "/alerts")
 	if out != unauthorizedText {
 		t.Fatalf("out = %q", out)
+	}
+}
+
+// TestBalanceCommandNoRefresherFallsBackToCache 未注入 refresher 时，
+// /balance 无参数退化为只读缓存查询（保持旧行为）。
+func TestBalanceCommandNoRefresherFallsBackToCache(t *testing.T) {
+	q := &fakeQueryService{results: map[string]string{"balance_list": "CACHED-BALANCE"}}
+	svc := NewCommandService(q)
+	svc.SetSubscribers([]Subscriber{
+		{ID: 1, ChatID: "7", Enabled: true, AlertEnabled: true, QueryEnabled: true, GroupIDs: []int{3}},
+	})
+	out, _ := svc.Handle(context.Background(), 7, "/balance")
+	if out != "CACHED-BALANCE" {
+		t.Fatalf("out = %q, want cached balance", out)
+	}
+	if q.lastMethod != "balance_list" || len(q.lastGroups) != 1 || q.lastGroups[0] != 3 {
+		t.Fatalf("method=%s groups=%v, want balance_list/[3]", q.lastMethod, q.lastGroups)
+	}
+}
+
+// TestBalanceCommandDetailStillReadsCache /balance <id> 明细仍是只读缓存查询，
+// 不触发异步刷新。
+func TestBalanceCommandDetailStillReadsCache(t *testing.T) {
+	q := &fakeQueryService{results: map[string]string{"balance_detail": "DETAIL"}}
+	svc := NewCommandService(q)
+	svc.SetBalanceRefresher(&BalanceRefresher{}) // 注入非 nil 也不影响明细路径
+	svc.SetAsyncSender(&fakeAsyncSender{})
+	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
+	out, _ := svc.Handle(context.Background(), 7, "/balance 19")
+	if out != "DETAIL" {
+		t.Fatalf("out = %q, want detail", out)
+	}
+	if q.lastID != 19 {
+		t.Fatalf("id = %d, want 19", q.lastID)
+	}
+}
+
+// TestBalanceCommandAsyncRefresh 注入 refresher + sender 时，
+// /balance 无参数走异步刷新（无直接回复，结果经 RunAsync 推送）。
+func TestBalanceCommandAsyncRefresh(t *testing.T) {
+	q := &fakeQueryService{results: map[string]string{"balance_list": "SHOULD-NOT-USE"}}
+	svc := NewCommandService(q)
+	svc.SetBalanceRefresher(&BalanceRefresher{}) // Refresh 未初始化会报错，但验证分发不碰缓存即可
+	svc.SetAsyncSender(&fakeAsyncSender{})
+	svc.SetSubscribers([]Subscriber{authorizedSub("7")})
+
+	out, kb, err := svc.HandleWithKeyboard(context.Background(), 7, "/balance")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if out != "" || kb != nil {
+		t.Fatalf("out=%q kb=%v, want empty（异步通道处理）", out, kb)
+	}
+	// 不应调用只读缓存查询
+	if q.lastMethod == "balance_list" {
+		t.Fatal("async path must not fall back to cached BalanceList")
 	}
 }

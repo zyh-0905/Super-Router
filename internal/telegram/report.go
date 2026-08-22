@@ -24,7 +24,7 @@ type SystemOverview struct {
 func FormatReport(now time.Time, windowHours int, overview SystemOverview, changes alert.AlertChanges, includeRecovered, includeOngoing bool, webBaseURL string) string {
 	var b strings.Builder
 	b.WriteString("🛰 <b>Smart Router 告警汇总</b>\n")
-	b.WriteString("🕐 " + now.Format("2006-01-02 15:04") + " ｜ " + FormatWindow(windowHours) + "\n")
+	b.WriteString("🕐 " + now.In(displayLoc).Format("2006-01-02 15:04") + " ｜ " + FormatWindow(windowHours) + "\n")
 	b.WriteString("━━━━━━━━━━━━\n")
 
 	b.WriteString("📊 <b>系统概况</b>\n")
@@ -106,6 +106,51 @@ func writeAlertDetail(b *strings.Builder, a alert.Alert, now time.Time) {
 		b.WriteString("💡 建议：" + EscapeHTML(a.Recommendation) + "\n")
 	}
 	b.WriteString("\n")
+}
+
+// FormatAlertPush 组装事件驱动的告警变化推送消息（HTML）。
+// 只包含「新出现 / 严重度升级 / 已恢复」三块；持续中不推送，避免刷屏。
+// 与 FormatReport 不同：无系统概况、无心跳摘要、无「持续中」区块。
+func FormatAlertPush(now time.Time, changes alert.AlertChanges, webBaseURL string) string {
+	var b strings.Builder
+	b.WriteString("🚨 <b>告警变化通知</b>\n")
+	b.WriteString("🕐 " + now.In(displayLoc).Format("2006-01-02 15:04") + "\n")
+	b.WriteString("━━━━━━━━━━━━\n")
+
+	if len(changes.New) > 0 {
+		b.WriteString("🆕 <b>新出现</b>\n")
+		for _, a := range changes.New {
+			writeAlertDetail(&b, a, now)
+		}
+	}
+	if len(changes.Escalated) > 0 {
+		b.WriteString("━━━━━━━━━━━━\n⬆️ <b>严重度升级</b>\n")
+		for _, a := range changes.Escalated {
+			b.WriteString("🟠 → 🔴 " + EscapeHTML(a.ChannelName))
+			if a.Model != "" {
+				b.WriteString(" ｜ 🤖 " + EscapeHTML(a.Model))
+			}
+			b.WriteString("\n   类型：" + typeLabel(a.Type) + "\n\n")
+		}
+	}
+	if len(changes.Recovered) > 0 {
+		b.WriteString("━━━━━━━━━━━━\n✅ <b>已恢复</b>\n")
+		for _, a := range changes.Recovered {
+			b.WriteString("🟢 " + EscapeHTML(a.ChannelName) + " ｜ " + typeLabel(a.Type) + "\n")
+			if a.RecoveredAt != nil && !a.FirstSeenAt.IsZero() {
+				b.WriteString(fmt.Sprintf("⏳ 故障持续：%s\n", alert.FormatDuration(a.RecoveredAt.Sub(a.FirstSeenAt))))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString("━━━━━━━━━━━━\n")
+	b.WriteString("💡 查询：/alerts ｜ /status")
+	if webBaseURL != "" {
+		b.WriteString("\n🌐 控制台：" + EscapeHTML(webBaseURL))
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 func writeFooter(b *strings.Builder, webBaseURL string) {
