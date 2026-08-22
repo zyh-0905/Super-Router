@@ -113,3 +113,22 @@ func TestFormatBalanceHealthRatioLists(t *testing.T) {
 }
 
 func f64(v float64) *float64 { return &v }
+
+// TestFormatCheckedAtTimezone 容器 UTC 时区下，展示时间必须是北京时间——
+// UTC 09:48 应显示为 17:48（此前直接格式化导致用户看到 8 小时前的数据）。
+func TestFormatCheckedAtTimezone(t *testing.T) {
+	utc := time.Date(2026, 8, 22, 9, 48, 0, 0, time.UTC)
+	got := formatCheckedAt(&utc)
+	if !strings.Contains(got, "17:48") {
+		t.Fatalf("got %q, want Beijing time 17:48 (UTC 09:48)", got)
+	}
+}
+
+// TestFmtTimeTimezone 完整时间戳同样走北京时间。
+func TestFmtTimeTimezone(t *testing.T) {
+	utc := time.Date(2026, 8, 22, 9, 38, 0, 0, time.UTC)
+	got := fmtTime(&utc)
+	if !strings.Contains(got, "17:38") {
+		t.Fatalf("got %q, want 17:38", got)
+	}
+}

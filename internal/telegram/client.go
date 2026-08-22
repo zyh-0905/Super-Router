@@ -204,7 +204,12 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 }
 
 // SendMessage 发送 HTML 消息（可携带内联键盘），返回 Telegram message_id。
+// 空文本直接拒绝：Telegram 对空 text 返回确定性 400，会卡死 poll offset
+// （表现为机器人「只发一半」或彻底失语）。
 func (c *Client) SendMessage(ctx context.Context, chatID int64, html string, kb *InlineKeyboard) (int64, error) {
+	if strings.TrimSpace(html) == "" {
+		return 0, fmt.Errorf("refusing to send empty telegram message")
+	}
 	params := url.Values{}
 	params.Set("chat_id", strconv.FormatInt(chatID, 10))
 	params.Set("text", html)

@@ -52,3 +52,44 @@ func TestSplitMessageChinese(t *testing.T) {
 		t.Fatalf("suffix missing: %q / %q", parts[0], parts[1])
 	}
 }
+
+// TestSplitMessageHTMLSafe HTML 消息拆分绝不切断标签——
+// 每个分片内的 <b>/<i> 等标签必须配平（旧实现按 rune 硬切会截断标签，
+// Telegram 返回确定性 400，导致机器人只发一半）。
+func TestSplitMessageHTMLSafe(t *testing.T) {
+	// 构造超长 HTML：开头 <b>、中间夹 <i>、末尾 </b>
+	line := "<b>加粗内容</b> ｜ 普通文本 ｜ <i>斜体</i> ｜ "
+	msg := line + strings.Repeat("填充文字", 900)
+	msg += "\n结尾</b>"
+	parts := SplitMessage(msg, 512)
+
+	// 每个分片的标签必须平衡（不含残缺标签）
+	for i, p := range parts {
+		if hasDanglingTag(p) {
+			t.Fatalf("part %d has dangling tag: %q…", i, p[:min(60, len(p))])
+		}
+		if !tagsBalanced(p) {
+			t.Fatalf("part %d unbalanced tags: %q…", i, p[:min(60, len(p))])
+		}
+	}
+	// 每片不超过上限（含后缀）
+	for i, p := range parts {
+		if len(p) > 512 {
+			t.Fatalf("part %d length %d exceeds 512", i, len(p))
+		}
+	}
+}
+
+// TestSplitMessageEmpty 空串与纯空格边界。
+func TestSplitMessageEmpty(t *testing.T) {
+	if got := SplitMessage("", 100); len(got) != 1 || got[0] != "" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

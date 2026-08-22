@@ -14,6 +14,16 @@ import (
 	"time"
 )
 
+// displayLoc Telegram 消息的展示时区（固定北京时间）。
+// 容器运行时是 UTC——直接 time.Now()/t.Format 会把北京时间 17:48
+// 显示成 09:48（用户看到「还是 9 点的数据」，实为时区渲染 bug）。
+var displayLoc = func() *time.Location {
+	if l, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+		return l
+	}
+	return time.UTC
+}()
+
 // hostOnly 只显示 Base URL 域名（不泄露完整地址）。
 func hostOnly(raw string) string {
 	u, err := url.Parse(raw)
@@ -26,12 +36,12 @@ func hostOnly(raw string) string {
 	return u.Host
 }
 
-// fmtTime 统一时间格式（完整时间戳场景）。
+// fmtTime 统一时间格式（完整时间戳场景，北京时间展示）。
 func fmtTime(t *time.Time) string {
 	if t == nil || t.IsZero() {
 		return "—"
 	}
-	return t.Format("2006-01-02 15:04")
+	return t.In(displayLoc).Format("2006-01-02 15:04")
 }
 
 // fmtBalance 余额展示（nil = 无数据）。
@@ -196,16 +206,17 @@ func FormatBalanceDetail(name string, balance *float64, checkedAt *time.Time, me
 	return b.String()
 }
 
-// formatCheckedAt 检测时间紧凑展示：今天只显示时分，跨天显示月日时分。
+// formatCheckedAt 检测时间紧凑展示（北京时间）：今天只显示时分，跨天显示月日时分。
 func formatCheckedAt(t *time.Time) string {
 	if t == nil {
 		return "—"
 	}
-	now := time.Now()
-	if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
-		return t.Format("15:04")
+	lt := t.In(displayLoc)
+	now := time.Now().In(displayLoc)
+	if lt.Year() == now.Year() && lt.YearDay() == now.YearDay() {
+		return lt.Format("15:04")
 	}
-	return t.Format("01-02 15:04")
+	return lt.Format("01-02 15:04")
 }
 
 // FormatHealthList /health 全量列表（紧凑）。

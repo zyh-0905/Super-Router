@@ -119,10 +119,10 @@ func (a *AlertQueries) Detail(ctx context.Context, key string, groupIDs []int) (
 		b.WriteString("💡 建议：" + EscapeHTML(al.Recommendation) + "\n")
 	}
 	if !al.FirstSeenAt.IsZero() {
-		b.WriteString("🕐 首次出现：" + al.FirstSeenAt.Format("2006-01-02 15:04") + "\n")
+		b.WriteString("🕐 首次出现：" + al.FirstSeenAt.In(displayLoc).Format("2006-01-02 15:04") + "\n")
 	}
 	if al.RecoveredAt != nil {
-		b.WriteString("✅ 恢复时间：" + al.RecoveredAt.Format("2006-01-02 15:04") + "\n")
+		b.WriteString("✅ 恢复时间：" + al.RecoveredAt.In(displayLoc).Format("2006-01-02 15:04") + "\n")
 	} else {
 		b.WriteString("⏳ 持续：" + alert.FormatDuration(time.Since(al.FirstSeenAt)) + "\n")
 	}

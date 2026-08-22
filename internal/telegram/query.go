@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	"smart-router/internal/station"
 	"smart-router/internal/store"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // SQLQueryService 中转站只读查询的 PostgreSQL 实现。
@@ -122,6 +125,9 @@ func (q *SQLQueryService) RelayDetail(ctx context.Context, id int, groupIDs []in
 	`, id).Scan(&it.ID, &it.Name, &it.Host, &it.Healthy, &it.Protocol, &it.RelayType,
 		&it.Requests24h, &it.SuccessRate, &it.AverageMS, &it.P95MS)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "🔍 站点不存在，请检查 ID（见 /relay 列表）。", nil
+		}
 		return "", fmt.Errorf("query relay detail: %w", err)
 	}
 	it.Host = hostOf(it.Host)

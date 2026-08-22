@@ -2,9 +2,12 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // qualityRunView 最近一次质量任务的只读视图。
@@ -35,6 +38,9 @@ func (q *SQLQueryService) QualityLatest(ctx context.Context, channelID int, grou
 	if err := q.DB.Pool.QueryRow(ctx, `
 		SELECT name FROM upstreams WHERE id = $1
 	`, channelID).Scan(&name); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "🔍 站点不存在，请检查 ID（见 /relay 列表）。", nil
+		}
 		return "", fmt.Errorf("query channel name: %w", err)
 	}
 
